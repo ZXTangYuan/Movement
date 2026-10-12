@@ -1,0 +1,4 @@
+[gd_scene format=3 uid="uid://probenoise01"]
+[ext_resource type="Script" path="res://tests/probe_noise_match.gd" id="1"]
+[node name="NoiseMatch" type="Node"]
+script = ExtResource("1")

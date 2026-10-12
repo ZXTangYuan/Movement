@@ -1,0 +1,11 @@
+[gd_scene load_steps=2 format=3 uid="uid://bootstrap0001"]
+
+[ext_resource type="Script" path="res://scenes/levels/bootstrap.gd" id="1_boot"]
+
+[node name="Bootstrap" type="Node3D"]
+script = ExtResource("1_boot")
+
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]
+transform = Transform3D(0.866, -0.25, 0.433, 0, 0.866, 0.5, -0.5, -0.433, 0.75, 0, 200, 0)
+light_energy = 1.2

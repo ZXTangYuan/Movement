@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://selftest0001"]
+
+[ext_resource type="Script" path="res://tests/headless_selftest.gd" id="1_t"]
+
+[node name="SelfTest" type="Node"]
+script = ExtResource("1_t")

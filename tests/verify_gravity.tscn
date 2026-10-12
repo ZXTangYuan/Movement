@@ -1,0 +1,4 @@
+[gd_scene format=3 uid="uid://verifygrav1"]
+[ext_resource type="Script" path="res://tests/verify_gravity.gd" id="1"]
+[node name="VerifyGravity" type="Node"]
+script = ExtResource("1")
