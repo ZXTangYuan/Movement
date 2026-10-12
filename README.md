@@ -216,7 +216,9 @@ dotnet build
 
 ## 文档
 
-- [`docs/design/BLOCKERS.md`](docs/design/BLOCKERS.md) —— 待决/阻塞项
-- [`docs/design/raymarch-implementation.md`](docs/design/raymarch-implementation.md) —— raymarch 实现 + Godot 陷阱
-- [`docs/design/universe-engine-design.md`](docs/design/universe-engine-design.md) —— 总体设计
-- [`docs/reference/astroneer-reverse-engineering.md`](docs/reference/astroneer-reverse-engineering.md) —— 逆向报告
+- [`docs/design/DEV-STAGE-1-SUMMARY.md`](docs/design/DEV-STAGE-1-SUMMARY.md) —— **阶段一开发总结**（先看这个）
+- [`docs/design/BLOCKERS.md`](docs/design/BLOCKERS.md) —— 待决/阻塞项（需用户拍板）
+- [`docs/design/raymarch-implementation.md`](docs/design/raymarch-implementation.md) —— 地形实现 + Godot 陷阱
+- [`docs/design/universe-engine-design.md`](docs/design/universe-engine-design.md) —— 总体设计蓝图
+- [`docs/reference/astroneer-reverse-engineering.md`](docs/reference/astroneer-reverse-engineering.md) —— Astroneer 逆向报告
+- 插件侧文档见 [UnrealWorld 仓库](https://github.com/ZXTangYuan/UnrealWorld) 的 README

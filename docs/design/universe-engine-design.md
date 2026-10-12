@@ -4,6 +4,11 @@
 > **程序化生成的星球 + 完全可破坏可建造地形 + 可扩展多人**。
 > 逆向依据见 [`../reference/astroneer-reverse-engineering.md`](../reference/astroneer-reverse-engineering.md)。
 
+> 📌 **阅读提示**：本文是**设计蓝图**（含早期规划）。**已实现的架构与实测数据**请以
+> [`DEV-STAGE-1-SUMMARY.md`](DEV-STAGE-1-SUMMARY.md)（阶段总结）与
+> [`raymarch-implementation.md`](raymarch-implementation.md)（地形实现细节）为准。
+> 文中 §3.2 / §4 的运行时结构是**早期方案**，实现时已演进（例如体积改为解析基线 + delta 窗口）。
+
 ---
 
 ## 0. 硬约束（来自用户）
@@ -288,51 +293,61 @@ SaveFile
 
 ---
 
-## 8. 实施路线（分阶段，每阶段可运行验证）
+## 8. 实施路线与进度（阶段一已完成）
 
-| 阶段 | 交付 | 验证 |
+| 阶段 | 交付 | 状态 |
 |---|---|---|
-| **P0** | C# 工程可构建；`NetworkCore` 骨架（模式/传输/消息） | `dotnet build` + headless 启动无错 |
-| **P1** | 一颗球形行星 + 体素流式加载 + Surface Nets 网格 | 能在行星上看到起伏地形 |
-| **P2** | 玩家 + 球形重力 + 挖/填 | 能挖洞、能堆土 |
-| **P3** | SDF 表达式树 + 生物群系 + 多行星星系 | 程序化多样化 |
-| **P4** | 网络：编辑同步 + 兴趣网格 + 两种权威模式 | 双开互挖可见 |
-| **P5** | 存档差分 + JIP + 建造物 + 土罐闭环 | 存读档一致 |
+| **P0** | C# 工程 + `NetworkCore`（模式/传输/消息） | ✅ |
+| **P1** | 球形行星 + 体素流式 + Surface Nets（现为 MESH 回退） | ✅ |
+| **P1.5** | **GPU raymarch 无限地形**（解析基线 + delta 窗口） | ✅ |
+| **P2** | 玩家 + 球面重力 + 挖/填（SDF 碰撞） | ✅ |
+| **P2.5** | **太阳系**：恒星 + 八大行星 + 每行星重力场 + 镜头双模式 | ✅ |
+| **P3** | SDF 表达式树 + 生物群系 + 多行星**可着陆** | ⬜ 部分（多行星为远景代理） |
+| **P4** | 网络编辑同步 + 兴趣网格 + 双权威模式 | ⬜ 代码就绪，未双机实测 |
+| **P5** | 差分存档 + JIP + 建造物 | ⬜ 存档往返已实现，其余未做 |
+
+阶段一总结见 [`DEV-STAGE-1-SUMMARY.md`](DEV-STAGE-1-SUMMARY.md)。
 
 ---
 
 ## 9. 与原版的取舍（诚实说明）
 
-| 原版 | 本设计 | 原因 |
+| 原版 | 本项目 | 说明 |
 |---|---|---|
-| GPU raymarch 虚拟 SDF | **见下方 §10：已实测可行，推荐切换** | 实测 raymarch 3.54ms/帧 vs CPU meshing 111ms/块 |
-| 服务器权威 | **双模式可切换** | 用户要求好友低延迟 + 大型防作弊 |
+| GPU raymarch 虚拟分页 SDF | **GPU raymarch（解析基线 + delta 窗口）** | 已实现；未做稀疏分页（稠密窗口够用） |
+| 服务器权威 | **双模式可切换**（客户端权威 / 服务器权威） | 好友低延迟 + 大型防作弊 |
 | 自研 Replication Graph | **自建 3D 兴趣网格** | Godot 无对应设施 |
-| 单行星 600m | 同量级 | 玩法一致 |
+| 行星半径 ~600m | 半径 320~1050（八行星按比例缩放） | 玩法一致 |
+| 无网格碰撞（查 SDF） | SDF 梯度推挤（近似） | 高速下落可能穿透，待改连续碰撞 |
 
 **可以达到的**：球形可挖行星、程序化宇宙、多人共建、无限（程序化）世界、差分存档。
-**放弃的**：原版的 GPU raymarch 视觉质感（改用网格渲染，观感更"实体"，性能更好）。
+**与原版的差距**：未做稀疏分页（内存/带宽）、碰撞是近似而非精确、无音频/美术资产。
 
 ---
 
-## 10. 渲染路线决策（已落地，2026-10-13 更新）
+## 10. 渲染路线决策（已落地）
 
 最初判断"Godot 无 raymarch，只能退回 Surface Nets"。**该判断已被实测推翻并完成实现**。
-详见 [`raymarch-implementation.md`](raymarch-implementation.md) 与
-[`gpu-raymarch-feasibility.md`](gpu-raymarch-feasibility.md)。
+实现细节见 [`raymarch-implementation.md`](raymarch-implementation.md)。
+
+**插件调研结论**：**没有**现成可用的 Godot 4 raymarch 插件。
+[Zylann/godot_voxel](https://github.com/Zylann/godot_voxel) 是成熟的**网格**体素库（Transvoxel），
+但**不是 raymarch**（与 Astroneer 观感不同）；Godot 4 的 SDF raymarch 插件为空缺。
+→ 因此**自研** raymarch，未引入第三方插件。
 
 **已实现**：
-- `VoxelDensity.cs` —— C# 密度内核，`Parallel.For` **动态多核**（实测 96³ 24 ms，比 GDScript 快 30×）
-- `voxel_volume.gd` —— 体积生命周期 + `RenderingDevice.texture_update` 上传 3D 纹理（R32F）
-- `raymarch_terrain.gdshader` —— `sampler3D` 光线步进，命中写 `DEPTH` 参与深度缓冲
-- `Planet` 三模式：`RAYMARCH`（默认）/ `MESH`（Surface Nets 回退）/ `PROXY_ONLY`
-- 编辑全链路：`TerrainEdit` → C# `ApplyEdit` → 纹理上传，**零网格重建**
+- `voxel/VoxelTerrainCore.cs` —— C# 权威数据 + `Parallel.For` **动态多核**（实测 96³ 24 ms，比 GDScript 快 30×）
+- `voxel/voxel_volume.gd` —— delta 窗口 + `RenderingDevice.texture_update` 上传 3D 纹理（R32F）
+- `shaders/raymarch_terrain.gdshader` —— 解析基线 + `sampler3D` delta，光线步进写 `DEPTH`
+- `planet/Planet` 三模式：`RAYMARCH`（默认）/ `MESH`（Surface Nets 回退）/ `PROXY_ONLY`
+- 编辑全链路：`TerrainEdit` → C# `RasterizeDeltaWindow` → 纹理上传，**零网格重建**
 
-**实测**：主场景 1280×720 帧时 0.67 ms（~1488 fps），1 个 draw call；单次挖掘 2.5–13 ms。
+**实测**：玩家场景 1280×720 约 12 ms（83 fps），1 个 draw call；单次挖掘 2.5 ms。
 
-**关键发现**：主 RenderingDevice **不允许手动 submit/sync**，所以 compute-shader 写纹理这条路走不通；
+**关键发现**：主 RenderingDevice **不允许手动 submit/sync**，compute 写纹理这条路走不通；
 改用「CPU 多核计算 + `texture_update` 上传」，反而更契合「动态多核分配」的需求。
 
-**剩余工作**：① 体积跟随玩家（消除有限 AABB 边界）；② SDF 碰撞（无网格）；③ 稀疏分页局部更新。
+**剩余工作**：① 连续碰撞（当前为 SDF 梯度推挤）；② 稀疏分页局部更新；③ 星际旅行。
 
-原 P1 的 CPU Surface Nets 管线（`surface_nets.gd` / `voxel_world.gd` / `voxel_chunk.gd`）**保留为 MESH 回退模式**。
+> 以上世界系统代码现位于 **`UnrealWorld` 插件**（submodule 于 `addons/unreal_world/`）。
+> 原 P1 的 CPU Surface Nets 管线保留为 `MESH` 回退模式。
