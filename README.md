@@ -92,11 +92,64 @@ scenes/levels/bootstrap.{gd,tscn}   ← 本仓库：主场景（装配太阳系 
 - **`TerrainEdit` 归插件**（世界数据的一部分），网络层 `using UnrealWorld.Net;` 引用它。
 - 插件仅支持 **Godot .NET 项目**（含 C# 内核）。
 
-### 更新插件
+### Submodule 工作流（重要）
+
+`addons/unreal_world/` 是**独立仓库**的 submodule。在它里面改动**不会被主仓库自动跟踪**，
+必须分两步提交。**最容易犯的错**：只提交主仓库、忘了推插件，或反过来。
+
+**改世界系统（插件代码）时**——两步走：
 
 ```bash
-git submodule update --remote addons/unreal_world
+# ① 先在插件仓库里提交并推送
+cd addons/unreal_world
+git add -A
+git commit -m "描述这次改了什么"
+git push                      # 推到 UnrealWorld 的 main 分支
+cd ../..
+
+# ② 回到主仓库，提交更新后的 submodule 指针
+git add addons/unreal_world   # 只记录"指针指向哪个 commit"
+git commit -m "chore: 更新 UnrealWorld 插件到 <短哈希>"
+git push
 ```
+
+> ② 里 `git add addons/unreal_world` 记录的是一个 **commit 哈希**，不是文件内容。
+> 如果跳过 ①，别人（或未来的你）克隆时拉不到你的改动。
+
+**改应用层（玩家/网络/场景）时**——照常：
+
+```bash
+git add -A && git commit -m "..." && git push
+```
+
+**克隆本仓库后**（必做）：
+
+```bash
+git submodule update --init --recursive
+```
+
+**拉取别人的更新**（含插件最新版）：
+
+```bash
+git pull
+git submodule update --remote --merge addons/unreal_world
+```
+
+**查看 submodule 状态**：
+
+```bash
+git submodule status          # 前面的 '-' 表示还没 init
+```
+
+**常见问题**：
+
+| 现象 | 原因 / 处理 |
+|---|---|
+| `addons/unreal_world/` 是空的 | 没 init → `git submodule update --init --recursive` |
+| 插件里改了但主仓库 `git status` 没显示 | 正常：submodule 内部改动不冒泡，需进插件目录单独提交 |
+| 主仓库显示 `addons/unreal_world (modified content)` | 插件里有**未提交**改动；进插件目录提交或 `git checkout` 丢弃 |
+| 主仓库显示 `(new commits)` | 插件指针指向了新 commit，`git add addons/unreal_world` 后提交 |
+| 报 `Detected another project.godot ... ignored` | 插件仓库根混入了 `project.godot` → 删掉（插件根**不能**有它） |
 
 ## 如何验证
 
