@@ -47,6 +47,9 @@ func _ready() -> void:
 	# 略微俯视（-10°）以便看清地面，但主要是水平看远方
 	player.look_towards((tangent - up * 0.18).normalized())
 
+	# 网络桥接：世界系统只发信号，由本场景（ProjectA）决定是否广播。
+	if planet.has_signal("edit_created"):
+		planet.edit_created.connect(_on_planet_edit_created)
 	NetworkCore.EditReceived.connect(_on_remote_edit)
 
 	# 打印星系概览
@@ -108,6 +111,11 @@ func _teleport_to_next_planet() -> void:
 func _on_remote_edit(planet_id: int, edit) -> void:
 	if solar_system != null and solar_system.detail_planet != null:
 		solar_system.detail_planet.apply_edit(edit)
+
+
+## 世界系统产生本地编辑 → 交给网络层广播（解耦桥接）。
+func _on_planet_edit_created(edit) -> void:
+	NetworkCore.BroadcastEdit(edit)
 
 
 ## 从行星外沿 -X 向质心打射线，命中表面后抬高作为出生点。

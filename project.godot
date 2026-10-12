@@ -93,6 +93,10 @@ build={
 ]
 }
 
+[editor_plugins]
+
+enabled=PackedStringArray("res://addons/unreal_world/plugin.cfg")
+
 [physics]
 
 3d/physics_engine="Jolt Physics"

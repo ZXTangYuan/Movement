@@ -65,36 +65,45 @@
 
 ## 架构
 
+**世界系统已拆分为独立插件** [`UnrealWorld`](https://github.com/ZXTangYuan/UnrealWorld)，
+通过 git submodule 挂在 `addons/unreal_world/`。本仓库只保留**应用层**（玩家 + 网络 + 场景）。
+
 ```
-scripts/net/                        ← C# 网络核心（不含玩法）
-  NetworkCore.cs / AuthorityMode.cs / TerrainEdit.cs / InterestGrid.cs
+addons/unreal_world/                ← git submodule（世界系统插件）
+  planet/    Planet / SolarSystem / Star / PlanetDefinition
+  voxel/     VoxelTerrainCore.cs / TerrainNoise.cs（C# 多核）
+             VoxelVolume / RaymarchTerrain / SurfaceNets 等
+  shaders/   raymarch_terrain.gdshader / terrain_noise.gdshaderinc
+  net/       TerrainEdit.cs（世界编辑消息，网络层引用它）
 
-scripts/voxel/                      ← 体素（GPU raymarch 路径）
-  TerrainNoise.cs          ★ 基线噪声（C# 版，与 GLSL 逐位一致）
-  VoxelTerrainCore.cs      ★ 权威数据 + 稀疏编辑 + 窗口光栅化 + 精确查询
-  voxel_volume.gd            窗口跟随玩家 + 上传 delta 纹理
-  raymarch_terrain.gd        raymarch 渲染节点
-  surface_nets.gd / voxel_world.gd / voxel_chunk.gd / procedural_field.gd
-                             MESH 回退模式（无 RenderingDevice 时）
+scripts/net/                        ← 本仓库：C# 网络核心
+  NetworkCore.cs / AuthorityMode.cs / InterestGrid.cs
 
-scripts/player/
-  first_person_player.gd      WASD + 球面重力 + 飞行 + SDF 碰撞 + 挖掘
+scripts/player/                     ← 本仓库：第一人称
+  first_person_player.gd            WASD + 球面重力 + 飞行 + SDF 碰撞 + 挖掘
 
-scripts/planet/
-  planet_definition.gd        行星纯数据
-  planet.gd                   RAYMARCH / MESH / PROXY_ONLY 三模式 + 球面重力
-  solar_system.gd             4 行星 + 轨道 + 活动行星
+scenes/levels/bootstrap.{gd,tscn}   ← 本仓库：主场景（装配太阳系 + 玩家 + 网络桥接）
+```
 
-assets/shaders/
-  terrain_noise.gdshaderinc   ★ 基线噪声（GLSL 版，与 C# 逐位一致）
-  raymarch_terrain.gdshader   ★ 无限地形光线步进（解析基线 + delta 窗口 + 写 DEPTH）
+### 边界约定
 
-scenes/levels/bootstrap.{gd,tscn}   主场景
+- **世界系统不依赖网络**：本地编辑通过 `Planet.edit_created` 信号暴露，
+  由 `bootstrap.gd` 决定是否调用 `NetworkCore.BroadcastEdit` 广播。
+- **`TerrainEdit` 归插件**（世界数据的一部分），网络层 `using UnrealWorld.Net;` 引用它。
+- 插件仅支持 **Godot .NET 项目**（含 C# 内核）。
+
+### 更新插件
+
+```bash
+git submodule update --remote addons/unreal_world
 ```
 
 ## 如何验证
 
 Godot（mono 版）：`D:\Godot\Godot_4.7_stable_mono\Godot_v4.7-stable_mono_win64_console.exe`
+
+> 首次克隆本仓库后，先拉取插件 submodule：
+> `git submodule update --init --recursive`
 
 ```bash
 # 1) 编译 C#

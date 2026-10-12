@@ -1,6 +1,7 @@
 using Godot;
 using System;
 using System.Collections.Generic;
+using UnrealWorld.Net;   // TerrainEdit（世界编辑消息）由 UnrealWorld 插件提供
 
 namespace ProjectA.Net;
 
