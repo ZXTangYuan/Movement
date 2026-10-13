@@ -208,6 +208,45 @@ public partial class ApexMoveConfig : Resource
     /// <summary>贴墙向上的额外加成（对应 wallrunUpWallBoost）。</summary>
     [Export] public float WallrunUpWallBoost { get; set; } = 1.0f;
 
+    // ───────────────────────── 攀爬 / 翻越（mantle / climb） ─────────────────────────
+    // 参数名对照 Apex 的 mantle* / climb* 符号族。
+
+    /// <summary>是否启用自动翻越/攀爬（对应 mantle / climbEnabled）。</summary>
+    [Export] public bool MantleEnabled { get; set; } = true;
+
+    /// <summary>可直接**翻越**（mantle，快速上-翻）的最大障碍高度（m，对应 mantleHeight）。</summary>
+    [Export] public float MantleHeight { get; set; } = 1.7f;
+
+    /// <summary>可**攀爬**（climb，沿墙上升）的最大高度（m，对应 climbHeight / climbHighJumpMaxHeight）。</summary>
+    [Export] public float ClimbHeight { get; set; } = 3.4f;
+
+    /// <summary>低于此高度的障碍视为台阶，直接走上去，不触发翻越（m）。</summary>
+    [Export] public float StepHeight { get; set; } = 0.35f;
+
+    /// <summary>翻越时长：低位（对应 mantleDurationLevel）。</summary>
+    [Export] public float MantleDurationLevel { get; set; } = 0.32f;
+
+    /// <summary>翻越时长：高位（对应 mantleDurationHigh）。</summary>
+    [Export] public float MantleDurationHigh { get; set; } = 0.58f;
+
+    /// <summary>攀爬上升速度（m/s，对应 climbSpeedStart / climbSpeedEnd）。</summary>
+    [Export] public float ClimbSpeed { get; set; } = 4.2f;
+
+    /// <summary>翻越/攀爬所需的朝向阈值：输入方向需大致指向障碍（对应 mantleAngleScale）。</summary>
+    [Export] public float MantleMinFacingDot { get; set; } = 0.2f;
+
+    /// <summary>翻越到顶后向障碍内侧推进的距离（m，由探测层并入目标点）。</summary>
+    [Export] public float MantleForwardOffset { get; set; } = 0.45f;
+
+    /// <summary>翻越结束后的前向速度（m/s，对应 mantleBoostSprintSpeedMultiplier 的简化）。</summary>
+    [Export] public float MantleExitSpeed { get; set; } = 2.5f;
+
+    /// <summary>翻越过程中按跳跃键「跳离」的向上速度（m/s，对应 automantle_jumpoff / mantleBoostJumpHeight）。</summary>
+    [Export] public float MantleJumpOffSpeed { get; set; } = 5.5f;
+
+    /// <summary>翻越过程中按跳跃键「跳离」的向前速度（m/s，对应 mantleJumpOff 的前向分量）。</summary>
+    [Export] public float MantleJumpOffForward { get; set; } = 3.0f;
+
     // ───────────────────────── 工厂 ─────────────────────────
 
     /// <summary>默认 Apex 手感配置。</summary>

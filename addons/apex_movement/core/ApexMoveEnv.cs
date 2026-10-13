@@ -42,4 +42,18 @@ public partial class ApexMoveEnv : RefCounted
 
     /// <summary>墙面是否足够“竖直”可蹬（法线与 up 近似垂直）。</summary>
     public bool WallIsRunable { get; set; }
+
+    // ── 攀爬 / 翻越探测（mantle / climb） ──
+
+    /// <summary>前方是否探测到可翻越/攀爬的障碍（挡路、且有可站立的顶面）。</summary>
+    public bool ObstacleAhead { get; set; }
+
+    /// <summary>障碍顶面相对脚底的高度（m）。</summary>
+    public float ObstacleHeight { get; set; }
+
+    /// <summary>障碍（可站立顶面）的法线（世界空间）。</summary>
+    public Vector3 ObstacleTopNormal { get; set; } = Vector3.Up;
+
+    /// <summary>翻越目标点（世界坐标）：障碍顶面内侧、可站立处。</summary>
+    public Vector3 MantleTargetPoint { get; set; } = Vector3.Zero;
 }

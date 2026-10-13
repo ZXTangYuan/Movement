@@ -58,6 +58,20 @@ public partial class ApexMoveState : RefCounted
     public float TimeSinceWallrun { get; set; } = 999f;
     public Vector3 LastWallNormal { get; set; } = Vector3.Zero;
 
+    // ── 攀爬 / 翻越（mantle / climb） ──
+    /// <summary>是否正在翻越/攀爬。</summary>
+    public bool Mantling { get; set; }
+    /// <summary>翻越进度 0..1。</summary>
+    public float MantleProgress { get; set; }
+    /// <summary>翻越总时长（s）。</summary>
+    public float MantleDuration { get; set; }
+    /// <summary>翻越起点（世界坐标）。</summary>
+    public Vector3 MantleStart { get; set; }
+    /// <summary>翻越目标（世界坐标，障碍顶内侧）。</summary>
+    public Vector3 MantleTarget { get; set; }
+    /// <summary>翻越中途是否走「攀爬」分支（更高，时间更长）。</summary>
+    public bool MantleIsClimb { get; set; }
+
     /// <summary>深拷贝（回滚 / 预测用）。</summary>
     public ApexMoveState Clone()
     {
@@ -83,6 +97,12 @@ public partial class ApexMoveState : RefCounted
             WallrunTime = WallrunTime,
             TimeSinceWallrun = TimeSinceWallrun,
             LastWallNormal = LastWallNormal,
+            Mantling = Mantling,
+            MantleProgress = MantleProgress,
+            MantleDuration = MantleDuration,
+            MantleStart = MantleStart,
+            MantleTarget = MantleTarget,
+            MantleIsClimb = MantleIsClimb,
         };
     }
 
@@ -109,6 +129,12 @@ public partial class ApexMoveState : RefCounted
         dst.WallrunTime = WallrunTime;
         dst.TimeSinceWallrun = TimeSinceWallrun;
         dst.LastWallNormal = LastWallNormal;
+        dst.Mantling = Mantling;
+        dst.MantleProgress = MantleProgress;
+        dst.MantleDuration = MantleDuration;
+        dst.MantleStart = MantleStart;
+        dst.MantleTarget = MantleTarget;
+        dst.MantleIsClimb = MantleIsClimb;
     }
 
     /// <summary>紧凑序列化（18 个 float）。用于网络同步 / 存档。</summary>
@@ -134,6 +160,12 @@ public partial class ApexMoveState : RefCounted
             JumpBufferTimer,
             CoyoteTimer,
             JumpLockTimer,
+            Mantling ? 1f : 0f,
+            MantleProgress,
+            MantleDuration,
+            MantleStart.X, MantleStart.Y, MantleStart.Z,
+            MantleTarget.X, MantleTarget.Y, MantleTarget.Z,
+            MantleIsClimb ? 1f : 0f,
         };
     }
 
@@ -157,5 +189,11 @@ public partial class ApexMoveState : RefCounted
         JumpBufferTimer = s[25];
         CoyoteTimer = s[26];
         JumpLockTimer = s[27];
+        Mantling = s[28] > 0.5f;
+        MantleProgress = s[29];
+        MantleDuration = s[30];
+        MantleStart = new Vector3(s[31], s[32], s[33]);
+        MantleTarget = new Vector3(s[34], s[35], s[36]);
+        MantleIsClimb = s[37] > 0.5f;
     }
 }

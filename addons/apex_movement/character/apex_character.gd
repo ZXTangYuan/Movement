@@ -53,8 +53,23 @@ var gravity_up: Callable = Callable()
 ## 用密度梯度求法线，而不是物理射线。未设置时回退到物理射线（适用于有碰撞体的场景）。
 var sdf_density: Callable = Callable()
 
+## 是否做横向碰撞解算（collide-and-slide）。有碰撞体的场景应为 true。
+## 纯 SDF 地形（raymarch）下由玩法层的推挤负责，可设 false。
+@export var horizontal_collision: bool = true
+## 碰撞解算的最大迭代（每次滑动一个平面）。
+@export var collision_max_slides: int = 4
+## 调试：打印碰撞解算细节。
+@export var debug_collision: bool = false
+
 var _sprinting: bool = false
 var _jump_was_down: bool = false
+## 视角 yaw/pitch（相对当前 up 参考系；球面重力下自动随局部 up 变化）。
+var yaw: float = 0.0
+var pitch: float = 0.0
+## 鼠标灵敏度。
+@export var mouse_sensitivity: float = 0.0025
+## 眼睛相对脚底的高度比例（决定相机位置）。
+@export var eye_height_ratio: float = 0.85
 ## 本帧调试信息（供 HUD / 测试读取）。
 var debug_info: Dictionary = {}
 
@@ -107,12 +122,21 @@ func _step(dt: float) -> void:
 	if autonomous_input:
 		_build_input()
 
-	# 3) 核心推进
+	# 3) 核心推进（记录推进前位置，供横向碰撞解算）
+	var pre_pos: Vector3 = state.Position
+	var was_mantling: bool = state.Mantling
 	core.Step(state, input_frame, env, config, dt)
+
+	# 3.5) 横向碰撞解算（collide-and-slide）——有碰撞体的场景必需。
+	#      翻越/攀爬是脚本化位移：本帧「曾处于」翻越状态也要跳过解算，
+	#      否则翻越完成的那一帧（Mantling 已置 false）会被当成穿墙而弹回墙前。
+	if horizontal_collision and not state.Mantling and not was_mantling:
+		_resolve_horizontal_collision(pre_pos)
 
 	# 4) 写回 transform
 	global_position = state.Position
 	_update_orientation(dt)
+	_apply_look()
 
 	debug_info = {
 		"speed": state.Velocity.length(),
@@ -120,7 +144,107 @@ func _step(dt: float) -> void:
 		"sliding": state.Sliding,
 		"wallrunning": state.Wallrunning,
 		"crouching": state.Crouching,
+		"mantling": state.Mantling,
+		"climbing": state.MantleIsClimb,
+		"obstacle_ahead": env.ObstacleAhead,
+		"obstacle_height": env.ObstacleHeight,
 	}
+
+
+## 横向碰撞解算：collide-and-slide + 台阶上抬（对应 Source 的 StepMove）。
+## 用胶囊体做 shape cast（cast_motion + get_rest_info），最多迭代 collision_max_slides 次。
+func _resolve_horizontal_collision(pre_pos: Vector3) -> void:
+	var target: Vector3 = state.Position
+	var motion: Vector3 = target - pre_pos
+	if motion.length_squared() < 1e-10:
+		return
+	var space := get_world_3d().direct_space_state
+	var up: Vector3 = state.Up
+
+	var capsule := _make_capsule()
+	var cur: Vector3 = pre_pos
+	for i in collision_max_slides:
+		var q := PhysicsShapeQueryParameters3D.new()
+		q.shape = capsule
+		q.transform = Transform3D(_up_basis(up), cur)
+		q.motion = motion
+		q.margin = 0.001
+		var res: PackedFloat32Array = space.cast_motion(q)
+		if res.size() < 2:
+			break
+		var safe: float = res[0]
+		cur += motion * safe
+		if safe >= 0.999:
+			break
+
+		var rest := space.get_rest_info(q)
+		var n: Vector3 = rest["normal"] if rest.has("normal") else -motion.normalized()
+
+		if debug_collision:
+			print("      [collide] i=%d safe=%.3f n=%s n·up=%.3f" % [
+				i, safe, n.snapped(Vector3(0.01, 0.01, 0.01)), n.dot(up)])
+
+		# 台阶上抬（Source StepMove）：撞到近竖直障碍时，尝试抬高 StepHeight 再前进。
+		# 不依赖 rest normal 的具体值——只要被挡住就试抬升，抬升后能过就走台阶。
+		if n.dot(up) < 0.7:
+			var horiz: Vector3 = motion - up * motion.dot(up)
+			var stepped := false
+			# 从 StepHeight 往下试几个高度，取能通过的最高抬升（避免小台阶被大抬升顶飞）
+			var try_h := config.StepHeight
+			while try_h > 0.01:
+				var lifted: Vector3 = cur + up * (try_h + 0.02)
+				var lifted_target: Vector3 = lifted + horiz
+				if _is_free(space, capsule, lifted, up) and _is_free(space, capsule, lifted_target, up):
+					cur = lifted_target
+					stepped = true
+					break
+				try_h -= 0.05
+			if stepped:
+				continue
+
+		# 沿墙滑动：去掉剩余位移与速度的法向分量
+		motion = motion - n * motion.dot(n)
+		var vn: float = state.Velocity.dot(n)
+		if vn < 0.0:
+			state.Velocity -= n * vn
+		if motion.length_squared() < 1e-10:
+			break
+
+	state.Position = cur
+	if debug_collision:
+		print("      [collide-exit] pre=%s motion=%s cur=%s" % [
+			pre_pos.snapped(Vector3(0.01,0.01,0.01)), (target - pre_pos).snapped(Vector3(0.01,0.01,0.01)),
+			cur.snapped(Vector3(0.01,0.01,0.01))])
+
+
+## 胶囊体（沿 up 对齐，中心在角色原点）。
+## 注意：**内缩一个 skin**——角色脚底正好贴地时，若不内缩，胶囊底面与地面持续接触，
+## cast_motion 会返回 safe_fraction=0，导致每帧位移被清零、角色无法横向移动。
+func _make_capsule() -> CapsuleShape3D:
+	var c := CapsuleShape3D.new()
+	var skin := 0.05
+	c.radius = maxf(radius - skin, 0.05)
+	c.height = maxf(stand_height - skin * 2.0, c.radius * 2.0 + 0.01)
+	return c
+
+
+## 该位置放置胶囊是否不重叠任何碰撞体。
+func _is_free(space: PhysicsDirectSpaceState3D, capsule: CapsuleShape3D,
+		pos: Vector3, up: Vector3) -> bool:
+	var q := PhysicsShapeQueryParameters3D.new()
+	q.shape = capsule
+	q.transform = Transform3D(_up_basis(up), pos)
+	q.margin = 0.001
+	return space.intersect_shape(q, 1).is_empty()
+
+
+## 构造 Y 轴对齐到 up 的基（胶囊朝向用）。
+func _up_basis(up: Vector3) -> Basis:
+	var y: Vector3 = up.normalized()
+	var ref: Vector3 = Vector3.FORWARD if absf(y.dot(Vector3.FORWARD)) < 0.99 else Vector3.RIGHT
+	var x: Vector3 = ref.cross(y).normalized()
+	var z: Vector3 = x.cross(y).normalized()
+	return Basis(x, y, z)
 
 
 # ───────────────────────── 环境探测 ─────────────────────────
@@ -165,8 +289,71 @@ func _probe_environment_sdf(up: Vector3) -> void:
 	env.HasWall = false
 	env.WallIsRunable = false
 	env.WallDistance = 999.0
+	env.ObstacleAhead = false
 	if config.WallrunEnabled and not env.Grounded:
 		_probe_walls_sdf(up)
+	# 障碍探测（攀爬/翻越）
+	_probe_obstacle_sdf(up)
+
+
+## 障碍探测（SDF）：沿移动方向步进找「前方有竖直挡面 + 上方有可站立顶面」。
+func _probe_obstacle_sdf(up: Vector3) -> void:
+	var move_dir: Vector3 = input_frame.WishDir
+	move_dir -= up * move_dir.dot(up)
+	if move_dir.length_squared() < 0.01:
+		return
+	move_dir = move_dir.normalized()
+
+	var foot: Vector3 = state.Position - up * (stand_height * 0.5)
+	var probe_h: float = minf(config.MantleHeight, stand_height * 0.6)
+	var base: Vector3 = foot + up * probe_h
+
+	# 1) 前方步进找表面（密度由 >0 变 <0）
+	var wall_hit := false
+	var hit_pos := Vector3.ZERO
+	var dist := 0.0
+	var step := 0.2
+	var max_d := radius + config.MantleForwardOffset + 0.35
+	while dist < max_d:
+		dist += step
+		var p: Vector3 = base + move_dir * dist
+		if sdf_density.call(p) < 0.0:
+			wall_hit = true
+			hit_pos = p
+			break
+	if not wall_hit:
+		return
+	# 表面必须竖直（法线近水平）
+	var wall_n := _sdf_normal(hit_pos, up)
+	if absf(wall_n.dot(up)) > 0.4:
+		return
+
+	# 2) 从命中点内侧向上找顶面（密度由 <0 变 >0）
+	var inside: Vector3 = hit_pos + move_dir * 0.25
+	var up_dist := 0.0
+	var top_hit := false
+	var top_pos := Vector3.ZERO
+	var max_up: float = config.ClimbHeight + 0.5
+	while up_dist < max_up:
+		up_dist += step
+		var p: Vector3 = inside + up * up_dist
+		if sdf_density.call(p) > 0.0:
+			top_hit = true
+			top_pos = p
+			break
+	if not top_hit:
+		return
+	var top_n := _sdf_normal(top_pos, up)
+	if top_n.dot(up) < 0.7:
+		return
+	var obstacle_h: float = top_pos.dot(up) - foot.dot(up)
+	if obstacle_h <= config.StepHeight or obstacle_h > config.ClimbHeight:
+		return
+
+	env.ObstacleAhead = true
+	env.ObstacleHeight = obstacle_h
+	env.ObstacleTopNormal = top_n
+	env.MantleTargetPoint = top_pos + up * (stand_height * 0.5 + 0.05) + move_dir * config.MantleForwardOffset
 
 
 ## 把点沿密度梯度投影到 density=0 的等值面（牛顿步，2 次迭代足够收敛）。
@@ -239,11 +426,64 @@ func _probe_environment_raycast(up: Vector3) -> void:
 		env.Grounded = false
 		env.GroundNormal = up
 
+	# 地面吸附：接地时把脚底对齐到命中面（射线路径下也用，保证上下坡稳定）
+	if env.Grounded and hit:
+		env.GroundSnap = hit.position - foot
+	else:
+		env.GroundSnap = Vector3.ZERO
+
 	env.HasWall = false
 	env.WallIsRunable = false
 	env.WallDistance = 999.0
+	env.ObstacleAhead = false
 	if config.WallrunEnabled and not env.Grounded:
 		_probe_walls_raycast(space, up)
+	# 障碍探测（攀爬/翻越）：始终探测（地面走近障碍也要能翻）
+	_probe_obstacle_raycast(space, up)
+
+
+## 障碍探测（射线）：前方竖直挡面 → 从墙上方**向下**打射线找可站立顶面。
+## （不用「从墙内向上打」——Godot 对起点在实体内部的射线不可靠。）
+func _probe_obstacle_raycast(space: PhysicsDirectSpaceState3D, up: Vector3) -> void:
+	var move_dir: Vector3 = input_frame.WishDir
+	move_dir -= up * move_dir.dot(up)
+	if move_dir.length_squared() < 0.01:
+		return
+	move_dir = move_dir.normalized()
+
+	var foot: Vector3 = state.Position - up * (stand_height * 0.5)
+
+	# 1) 前方（胸口高度）找竖直挡面
+	var probe_h: float = minf(config.MantleHeight, stand_height * 0.6)
+	var from: Vector3 = foot + up * probe_h
+	var to: Vector3 = from + move_dir * (radius + config.MantleForwardOffset + 0.5)
+	var hit := space.intersect_ray(PhysicsRayQueryParameters3D.create(from, to))
+	if not hit:
+		return
+	var wall_n: Vector3 = hit.normal
+	if absf(wall_n.dot(up)) > 0.4:      # 必须是竖直面
+		return
+	var wall_pos: Vector3 = hit.position
+
+	# 2) 从墙面上方内侧**向下**打射线 → 找顶面
+	var over: Vector3 = wall_pos + move_dir * 0.15        # 越过墙面一点点（在墙顶上方）
+	var down_from: Vector3 = over + up * (config.ClimbHeight + 0.6)
+	var down_to: Vector3 = over - up * 0.3
+	var top_hit := space.intersect_ray(PhysicsRayQueryParameters3D.create(down_from, down_to))
+	if not top_hit:
+		return
+	var top_n: Vector3 = top_hit.normal
+	if top_n.dot(up) < 0.7:             # 顶面必须接近水平（可站立）
+		return
+	var top_point: Vector3 = top_hit.position
+	var obstacle_h: float = top_point.dot(up) - foot.dot(up)
+	if obstacle_h <= config.StepHeight or obstacle_h > config.ClimbHeight:
+		return
+
+	env.ObstacleAhead = true
+	env.ObstacleHeight = obstacle_h
+	env.ObstacleTopNormal = top_n
+	env.MantleTargetPoint = top_point + up * (stand_height * 0.5 + 0.05) + move_dir * config.MantleForwardOffset
 
 
 func _probe_walls_raycast(space: PhysicsDirectSpaceState3D, up: Vector3) -> void:
@@ -298,6 +538,36 @@ func _build_input() -> void:
 	_jump_was_down = jump_down
 
 
+# ───────────────────────── 视角 ─────────────────────────
+
+## 鼠标视角输入（由外部/场景调用，或 autonomous 模式下自动接管）。
+func add_look(dx: float, dy: float) -> void:
+	yaw -= dx * mouse_sensitivity
+	pitch = clampf(pitch - dy * mouse_sensitivity, -PI * 0.5 + 0.01, PI * 0.5 - 0.01)
+	_apply_look()
+
+
+## 把 yaw/pitch 写入相机（以当前 up 为参考，球面重力下自动正确）。
+func _apply_look() -> void:
+	if camera == null:
+		return
+	var up: Vector3 = state.Up if state != null else Vector3.UP
+	# 参考系：Y=up，再叠加 yaw（绕 up）与 pitch（绕 yaw 后的 right）
+	var ref: Vector3 = Vector3.FORWARD
+	if absf(ref.dot(up)) > 0.99:
+		ref = Vector3.RIGHT
+	var right: Vector3 = ref.cross(up).normalized()
+	var fwd: Vector3 = up.cross(right).normalized()
+	var base := Basis(right, up, -fwd)
+	var q_yaw := Quaternion(up, yaw)
+	var right2 := (q_yaw * right).normalized()
+	var q_pitch := Quaternion(right2, pitch)
+	var b := (Basis(q_pitch) * Basis(q_yaw) * base).orthonormalized()
+	# 相机本地朝向（相机是角色子节点，角色基已对齐 up）
+	camera.global_transform.basis = b
+	camera.global_position = global_position + up * (stand_height * eye_height_ratio)
+
+
 # ───────────────────────── 朝向 ─────────────────────────
 
 func _update_orientation(dt: float) -> void:
@@ -342,6 +612,8 @@ func teleport_to(pos: Vector3, keep_velocity: bool = false) -> void:
 		state.Velocity = Vector3.ZERO
 	state.Sliding = false
 	state.Wallrunning = false
+	state.Mantling = false
+	state.MantleProgress = 0.0
 	state.AirJumpsUsed = 0
 	global_position = pos
 

@@ -89,9 +89,25 @@ char.sdf_density  = func(pos): return density                        # 地形密
 | 冲刺 | 速度上限切换 | `sprintspeed` |
 | 滑铲 | 起滑速度门槛 + 坡向重力缩放（下坡更快）+ 一次性加速 + 滑铲跳 | `slide*` |
 | 蹬墙跑 | 速度/角度门槛 + 水平垂直加速 + 重力压制 + 蹬墙跳 + 同墙冷却 | `wallrun*` |
+| **翻越 / 攀爬** | 自动上-翻：低障碍快速翻越、高障碍沿墙攀爬；过程可跳离 | `mantle*` `climb*` |
+| **台阶上抬** | 近竖直小障碍自动上抬（Source `StepMove`） | — |
+| **横向碰撞** | collide-and-slide（胶囊 shape cast），可开关 | — |
 
-**未实现**（诚实标注）：攀爬/翻越（`mantle`/`climb`）、抓钩（`grapple`）、滑索（`zipline`）、
-载具/悬浮板。这些是独立的动作系统，建议后续按需追加。
+**未实现**（诚实标注）：抓钩（`grapple`）、滑索（`zipline`）、载具/悬浮板。
+这些是独立的动作系统，建议后续按需追加。
+
+### 攀爬 / 翻越细节
+
+- **触发**：探测层沿移动方向找到「前方竖直挡面 + 上方可站立顶面」，高度落在
+  `StepHeight < h ≤ ClimbHeight` 区间即触发。无输入时也允许（模拟自动翻越）。
+- **分档**：`h ≤ MantleHeight` → 翻越（快，`MantleDurationLevel`）；
+  `h ≤ ClimbHeight` → 攀爬（慢，`MantleDurationHigh`）。
+- **过程**：脚本化位移（起点→目标点缓动），期间忽略重力与输入；按跳跃键可「跳离」。
+- **关键实现约束**（实测踩坑）：
+  1. 顶面探测必须**从墙上方往下**打射线，不能从墙内往上（Godot 对起点在实体内的射线不可靠）。
+  2. 目标点是**胶囊中心**（脚站在墙顶 = 中心抬高半个身高），不是脚底。
+  3. 翻越完成的那一帧必须**跳过横向碰撞解算**，否则会被当成穿墙弹回墙前。
+
 
 ---
 
@@ -106,13 +122,38 @@ dotnet build
 
 # 集成（在 ProjectA 真实球面 raymarch 行星上行走）
 "<godot>" --path . --rendering-driver vulkan res://tests/apex_move_integration.tscn  # 期望 PASS
+
+# 独立测试关卡（平地/斜坡/台阶/翻越/攀爬/地洞/蹬墙/滑铲）——自动化验证
+"<godot>" --headless --path . res://tests/apex_test_level/apex_level_test.tscn  # 期望 APEX LEVEL TEST PASS
+
+# 独立测试关卡（可实际游玩，有窗口）
+"<godot>" --path . --rendering-driver vulkan res://tests/apex_test_level/apex_playground.tscn
 ```
 
 实测结果（本机 RTX 4070 / Godot 4.7 mono）：
 
 - `apex_move_selftest`：**14 项全过**（含确定性、跳跃高度 1.55m ≈ 配置 1.6m、双跳不无限）
 - `apex_move_integration`：**6 项全过**（球面 up 对齐 1.0000、行走接地 100%、不穿地）
-- ProjectA 原有 6 项测试**零回归**（noise_match / selftest / selftest_gpu / gravity / solar / camera）
+- `apex_level_test`：**17 项全过**（平地/上下坡/台阶/翻越 2.10m/攀爬 3.50m/地洞/蹬墙/滑铲）
+- ProjectA 原有 7 项测试**零回归**
+
+### 独立测试关卡（`tests/apex_test_level/`）
+
+为**避免虚拟世界（raymarch）干扰**，移动测试用**独立关卡**（`test_level.gd` 纯代码构建，
+全部 Godot 原生 StaticBody3D 碰撞体）：
+
+| 设施 | 位置 | 用途 |
+|---|---|---|
+| 大平地 | 原点 | 行走/加速/摩擦 |
+| 上坡 15° | x=-30, z=-4→-18 | 爬坡接地 |
+| 下坡 | x=-30, z=4→18 | 下坡不穿地 |
+| 台阶 0.18/0.32/0.5m | x=10, z=-20 | 台阶上抬 |
+| 翻越墙 1.2m | x=10, z=0 | mantle |
+| 攀爬墙 2.6m | x=10, z=10 | climb |
+| 地洞 6×6×6m | (30, 0) | 跌落 + 不穿透 |
+| 蹬墙跑走廊（间距 3m） | z=-40 | wallrun |
+| 滑铲长坡 22° | x=30, z=18→40 | slide |
+
 
 ---
 

@@ -50,6 +50,11 @@ public partial class ApexMovementCore : RefCounted
         state.TimeSinceWallrun += dt;
         if (input.JumpPressed) state.JumpBufferTimer = cfg.JumpBufferTime;
 
+        // ── 1.5 攀爬 / 翻越（mantle / climb）：脚本化位移，优先级最高 ──
+        // 一旦触发即接管本帧移动（忽略重力/输入），直到完成或被「跳离」打断。
+        if (UpdateMantle(state, input, env, cfg, dt))
+            return;
+
         // ── 2. 蹲伏状态（输入 → 目标 → 平滑） ──
         bool wantCrouch = input.IsDown(ApexMoveButton.Crouch);
         state.Crouching = wantCrouch;
@@ -156,6 +161,83 @@ public partial class ApexMovementCore : RefCounted
         }
         state.Sliding = sliding && state.OnGround;
         state.Wallrunning = wallrunning;
+    }
+
+    // ───────────────────────── 攀爬 / 翻越（mantle / climb） ─────────────────────────
+
+    /// <summary>
+    /// 攀爬/翻越状态机。返回 true 表示本帧移动已被接管（调用方应跳过常规移动）。
+    ///
+    /// 对应 Apex 的 auto-mantle：贴到可站立障碍时自动上-翻，分两档——
+    ///   - 低于 <see cref="ApexMoveConfig.MantleHeight"/> → 翻越（快，mantle）
+    ///   - 低于 <see cref="ApexMoveConfig.ClimbHeight"/> → 攀爬（慢，climb）
+    /// 过程中按跳跃键可「跳离」（mantle jump-off）。
+    /// </summary>
+    private static bool UpdateMantle(ApexMoveState s, ApexMoveInput input,
+        ApexMoveEnv env, ApexMoveConfig cfg, float dt)
+    {
+        // 进行中：推进进度
+        if (s.Mantling)
+        {
+            // 跳离：进度过半后允许跳出
+            if (input.JumpPressed && s.MantleProgress > 0.25f)
+            {
+                Vector3 fwd = SafeNormalize(s.MantleTarget - s.MantleStart, Vector3.Zero);
+                fwd -= s.Up * fwd.Dot(s.Up);
+                fwd = SafeNormalize(fwd, Vector3.Zero);
+                s.Velocity = s.Up * cfg.MantleJumpOffSpeed + fwd * cfg.MantleJumpOffForward;
+                s.Mantling = false;
+                s.OnGround = false;
+                s.JumpLockTimer = cfg.JumpLockTime;
+                return true;
+            }
+
+            s.MantleProgress += dt / Mathf.Max(s.MantleDuration, 0.01f);
+            float t = Mathf.Clamp(s.MantleProgress, 0f, 1f);
+            // 缓动：先竖直上升，后水平推进（更接近 Apex 的「先爬后翻」观感）
+            float ease = t * t * (3f - 2f * t);
+            s.Position = s.MantleStart.Lerp(s.MantleTarget, ease);
+            s.Velocity = Vector3.Zero;
+
+            if (t >= 1f)
+            {
+                // 完成：落在障碍顶面内侧，给一点前向速度
+                Vector3 fwd = SafeNormalize(s.MantleTarget - s.MantleStart, Vector3.Zero);
+                fwd -= s.Up * fwd.Dot(s.Up);
+                fwd = SafeNormalize(fwd, Vector3.Zero);
+                s.Velocity = fwd * cfg.MantleExitSpeed;
+                s.Mantling = false;
+                s.OnGround = true;
+                s.AirJumpsUsed = 0;
+            }
+            return true;
+        }
+
+        // 未进行中：尝试触发
+        if (!cfg.MantleEnabled || !env.ObstacleAhead) return false;
+        // 只在地面或滞空下落时触发（不打断蹬墙跑/滑铲）
+        float h = env.ObstacleHeight;
+        if (h <= cfg.StepHeight || h > cfg.ClimbHeight) return false;
+
+        // 朝向判定：输入需大致指向障碍（无输入时也允许，模拟自动翻越）
+        Vector3 toTarget = env.MantleTargetPoint - s.Position;
+        toTarget -= s.Up * toTarget.Dot(s.Up);
+        if (input.WishDir.LengthSquared() > Epsilon && toTarget.LengthSquared() > Epsilon)
+        {
+            float facing = input.WishDir.Normalized().Dot(toTarget.Normalized());
+            if (facing < cfg.MantleMinFacingDot) return false;
+        }
+
+        s.Mantling = true;
+        s.MantleProgress = 0f;
+        s.MantleIsClimb = h > cfg.MantleHeight;
+        s.MantleDuration = s.MantleIsClimb ? cfg.MantleDurationHigh : cfg.MantleDurationLevel;
+        s.MantleStart = s.Position;
+        s.MantleTarget = env.MantleTargetPoint;
+        s.Velocity = Vector3.Zero;
+        s.Sliding = false;
+        s.Wallrunning = false;
+        return true;
     }
 
     // ───────────────────────── 地面 ─────────────────────────
