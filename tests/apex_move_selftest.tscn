@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://pexmove0001"]
+
+[ext_resource type="Script" path="res://tests/apex_move_selftest.gd" id="1_apex"]
+
+[node name="ApexMoveSelfTest" type="Node"]
+script = ExtResource("1_apex")
