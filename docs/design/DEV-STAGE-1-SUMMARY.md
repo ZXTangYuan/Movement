@@ -13,7 +13,7 @@
 | 能力 | 状态 | 验证方式 |
 |---|---|---|
 | 无限可破坏地形（GPU raymarch） | ✅ | 渲染截图 + 挖掘测试 + 自检 |
-| 恒星（真实方向光照） | ✅ | 实测改目标光照方向转 90° |
+| 恒星（真实方向光照） | ✅ | 实测改目标光照方向转 90°（**注**：方向光只作用于代理球/网格；raymarch 地形光照方向仍硬编码，见 IMPROVEMENT-BACKLOG I1） |
 | 八大行星（比例缩放） | ✅ | 清单 + 渲染截图 |
 | 每颗行星独立球面重力场 | ✅ | 8 行星 × 5 方向全部对齐 |
 | 姿态随重力平滑修正 | ✅ | 60 帧内单帧最大变化 < 20° |
@@ -130,6 +130,9 @@ dotnet build
 
 # 玩家物理
 "<godot>" --path . --rendering-driver vulkan res://tests/sim_player.tscn
+
+# 挖填可见性（shader 与碰撞共用同一 delta 密度场）
+"<godot>" --path . --rendering-driver vulkan res://tests/verify_dig_visible.tscn
 ```
 
 ---

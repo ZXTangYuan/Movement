@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://b2p5hoq8mu407"]
+
+[ext_resource type="Script" path="res://tests/verify_dig_visible.gd" id="1"]
+
+[node name="VerifyDigVisible" type="Node"]
+script = ExtResource("1")

@@ -40,7 +40,6 @@ var bound_planet: Planet = null
 var _velocity: Vector3 = Vector3.ZERO
 ## 平滑后的“上”方向（重力反方向）。所有姿态计算都基于它，**绝不用世界坐标硬编码**。
 var _up: Vector3 = Vector3.UP
-var _up_target: Vector3 = Vector3.UP
 ## 当前重力强度（由所在重力场给出）。
 var _gravity_strength: float = 0.0
 
@@ -77,7 +76,6 @@ func _ready() -> void:
 			var d := global_position - pl.global_position
 			if d.length_squared() > 1e-6:
 				_up = d.normalized()
-				_up_target = _up
 			_gravity_strength = pl.definition.gravity_strength
 			_surface_weight = 1.0
 			view_mode = ViewMode.SURFACE
@@ -274,7 +272,6 @@ func bind_to_planet(p: Planet) -> void:
 	var d := global_position - p.global_position
 	if d.length_squared() > 1e-6:
 		_up = d.normalized()
-		_up_target = _up
 	_gravity_strength = p.definition.gravity_strength
 	_surface_weight = 1.0
 	view_mode = ViewMode.SURFACE

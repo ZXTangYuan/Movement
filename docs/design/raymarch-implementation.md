@@ -153,6 +153,7 @@ SomeCSharp.Method(arr, ...)   # C# 内部 arr[i] = ... 全部丢失
 | 稠密 delta 窗口 | 整窗口上传；Astroneer 用分页只传改动页 | 稀疏分页 + 局部 `texture_update` |
 | 材质单一 | 按高度/坡度 4 色混合，无群系贴图 | 群系权重着色 |
 | 只有 1 颗行星可着陆 | 其余为远景代理球 | 星际旅行（切换细节行星） |
+| **两套密度实现** | RAYMARCH 用自研 `TerrainNoise`（CPU/GPU 逐位一致）；**MESH 回退**的 `procedural_field.gd` 用 `FastNoiseLite`（第三套、数值不同）→「渲染与碰撞共用同一密度场」**仅在 RAYMARCH 路径成立** | 见 IMPROVEMENT-BACKLOG I3（文档澄清 or 统一实现） |
 
 ---
 

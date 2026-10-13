@@ -17,7 +17,8 @@
 | P0 | ✅ | C# 工程 + `NetworkCore`（两种权威模式 / 兴趣网格 / 编辑消息） |
 | GPU raymarch | ✅ | C# 多核密度内核 + 3D 纹理 + 光线步进渲染 |
 | 无限地形 | ✅ | 解析基线（GLSL 复刻 C#，逐位一致）+ delta 窗口 |
-| **太阳系** | ✅ | **恒星（真实方向光）+ 八大行星**（水星…海王星，比例缩放） |
+| **太阳系** | ✅ | **恒星 + 八大行星**（水星…海王星，比例缩放） |
+| 恒星光照 | 🟡 | 方向光已驱动代理球/网格；**raymarch 地形光照方向仍硬编码**（见 BACKLOG I1） |
 | **重力场** | ✅ | **每颗行星独立球面重力场** + 姿态平滑修正（无跳变） |
 | **镜头** | ✅ | **宇宙自由三维旋转 / 星球重力场内 ±90° 夹紧**（按局部重力计算） |
 | 第一人称 | ✅ | WASD + 鼠标 + Space/Ctrl 升降 + F 飞行 + 左键挖/右键填 |
@@ -186,7 +187,10 @@ dotnet build
 # 9) 重力场精确验证（8 行星 × 5 方向）
 "<godot>" --path . --rendering-driver vulkan res://tests/verify_gravity.tscn
 
-# 10) 实际游玩（有窗口）
+# 10) 挖填可见性回归（shader 与碰撞共用同一 delta 密度场）
+"<godot>" --path . --rendering-driver vulkan res://tests/verify_dig_visible.tscn  # 期望 DIG VISIBLE PASS
+
+# 11) 实际游玩（有窗口）
 "<godot>" --path . --rendering-driver vulkan res://scenes/levels/bootstrap.tscn
 ```
 
@@ -218,7 +222,9 @@ dotnet build
 
 - [`docs/design/DEV-STAGE-1-SUMMARY.md`](docs/design/DEV-STAGE-1-SUMMARY.md) —— **阶段一开发总结**（先看这个）
 - [`docs/design/BLOCKERS.md`](docs/design/BLOCKERS.md) —— 待决/阻塞项（需用户拍板）
+- [`docs/design/IMPROVEMENT-BACKLOG.md`](docs/design/IMPROVEMENT-BACKLOG.md) —— **已确认的改进清单/技术债**（可直接开工）
 - [`docs/design/raymarch-implementation.md`](docs/design/raymarch-implementation.md) —— 地形实现 + Godot 陷阱
 - [`docs/design/universe-engine-design.md`](docs/design/universe-engine-design.md) —— 总体设计蓝图
 - [`docs/reference/astroneer-reverse-engineering.md`](docs/reference/astroneer-reverse-engineering.md) —— Astroneer 逆向报告
-- 插件侧文档见 [UnrealWorld 仓库](https://github.com/ZXTangYuan/UnrealWorld) 的 README
+- 插件侧说明见 [UnrealWorld 仓库](https://github.com/ZXTangYuan/UnrealWorld)；
+  源码即文档（每个类文件顶部都有中文说明），代码在 `addons/unreal_world/` 下
