@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://apexinteract_test"]
+
+[ext_resource type="Script" path="res://tests/apex_interactable_test.gd" id="1_it"]
+
+[node name="ApexInteractableTest" type="Node"]
+script = ExtResource("1_it")
