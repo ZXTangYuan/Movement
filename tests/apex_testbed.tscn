@@ -1,0 +1,10 @@
+[gd_scene load_steps=2 format=3 uid="uid://apextestbed_launcher"]
+
+; 薄启动器：把插件自带的测试场挂进来。
+; 保持极薄是为了让「可玩入口」稳定，插件的测试场本身可独立演进。
+
+[ext_resource type="PackedScene" path="res://addons/apex_movement/testbed/apex_testbed.tscn" id="1_testbed"]
+
+[node name="ApexTestbedLauncher" type="Node3D"]
+
+[node name="Testbed" parent="." instance=ExtResource("1_testbed")]

@@ -32,7 +32,7 @@ project/assembly_name="ProjectA"
 
 [editor_plugins]
 
-enabled=PackedStringArray("res://addons/unreal_world/plugin.cfg")
+enabled=PackedStringArray("res://addons/unreal_world/plugin.cfg", "res://addons/apex_movement/plugin.cfg")
 
 [input]
 

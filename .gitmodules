@@ -1,3 +1,6 @@
 [submodule "addons/unreal_world"]
 	path = addons/unreal_world
 	url = https://github.com/ZXTangYuan/UnrealWorld.git
+[submodule "addons/apex_movement"]
+	path = addons/apex_movement
+	url = https://github.com/ZXTangYuan/ApexMovement.git

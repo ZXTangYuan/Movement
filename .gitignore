@@ -36,3 +36,6 @@ Thumbs.db
 
 # Apex 逆向工作目录（临时产物不入库；结论会提炼进插件 docs/）
 .re-apex/
+
+# Ghidra 分析工程（逆向产物，不入库）
+_re_apex_ghidra/
