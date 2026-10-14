@@ -30,3 +30,9 @@ obj/
 *.swp
 .DS_Store
 Thumbs.db
+
+# Agent / tooling scratch
+.zcode/
+
+# Apex 逆向工作目录（临时产物不入库；结论会提炼进插件 docs/）
+.re-apex/
