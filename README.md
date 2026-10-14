@@ -69,6 +69,9 @@
 **世界系统已拆分为独立插件** [`UnrealWorld`](https://github.com/ZXTangYuan/UnrealWorld)，
 通过 git submodule 挂在 `addons/unreal_world/`。本仓库只保留**应用层**（玩家 + 网络 + 场景）。
 
+**Apex 移动系统也是独立插件** [`ApexMovement`](https://github.com/ZXTangYuan/ApexMovement)，
+挂在 `addons/apex_movement/`（同样是 submodule）。逆向自 Apex Legends v3.0.3.65 的真实游戏文件。
+
 ```
 addons/unreal_world/                ← git submodule（世界系统插件）
   planet/    Planet / SolarSystem / Star / PlanetDefinition
@@ -77,6 +80,15 @@ addons/unreal_world/                ← git submodule（世界系统插件）
   shaders/   raymarch_terrain.gdshader / terrain_noise.gdshaderinc
   net/       TerrainEdit.cs（世界编辑消息，网络层引用它）
 
+addons/apex_movement/               ← git submodule（Apex 移动插件，逆向自 r5apex_dx12.exe）
+  core/       C# 固定 tick 确定性求解器（ApexTickClock / ApexMovementCore / ...）
+  abilities/  C# 技能（钩爪 / 瓦尔基里 / 艾许 dash / 二段跳）
+  view/       C# 镜头晃动 + FOV 形变；GDScript 第一人称视模型
+  interactables/  GDScript 场地互动物（喷泉 / 跳板 / 弹射台 / 跳伞塔 / 三类滑索）
+  ui/         测试菜单（能力 / FOV / 视角）
+  testbed/    测试场（平地 / 可调斜坡 / 可调立柱 / 靶场 / 物品区）
+  docs/       逆向结论（证据分级）+ 参数全表
+
 scripts/net/                        ← 本仓库：C# 网络核心
   NetworkCore.cs / AuthorityMode.cs / InterestGrid.cs
 
@@ -84,6 +96,7 @@ scripts/player/                     ← 本仓库：第一人称
   first_person_player.gd            WASD + 球面重力 + 飞行 + SDF 碰撞 + 挖掘
 
 scenes/levels/bootstrap.{gd,tscn}   ← 本仓库：主场景（装配太阳系 + 玩家 + 网络桥接）
+tests/apex_*.{gd,tscn}              ← 本仓库：ApexMovement 的可玩入口与自检
 ```
 
 ### 边界约定
@@ -92,6 +105,8 @@ scenes/levels/bootstrap.{gd,tscn}   ← 本仓库：主场景（装配太阳系 
   由 `bootstrap.gd` 决定是否调用 `NetworkCore.BroadcastEdit` 广播。
 - **`TerrainEdit` 归插件**（世界数据的一部分），网络层 `using UnrealWorld.Net;` 引用它。
 - 插件仅支持 **Godot .NET 项目**（含 C# 内核）。
+- **ApexMovement 独立于 ProjectA**：不依赖球面重力/raymarch，任何 Godot .NET 3D 项目都能用。
+  它**不接入主场景**（`run/main_scene` 仍是 bootstrap），通过独立测试场独立可玩。
 
 ### Submodule 工作流（重要）
 
@@ -193,6 +208,41 @@ dotnet build
 # 11) 实际游玩（有窗口）
 "<godot>" --path . --rendering-driver vulkan res://scenes/levels/bootstrap.tscn
 ```
+
+## ApexMovement 插件（Apex 移动系统）
+
+逆向自 Apex Legends **v3.0.3.65** 的真实游戏文件，重建移动系统。
+**独立可玩，不依赖本项目的虚拟世界。**
+
+```bash
+# 自检（三套，共 50 项断言）
+"<godot>" --headless --path . res://tests/apex_move_selftest.tscn        # 9 项
+"<godot>" --headless --path . res://tests/apex_interactable_test.tscn   # 8 项
+"<godot>" --headless --path . res://tests/apex_ability_test.tscn        # 33 项
+
+# 可玩测试场（有窗口）
+"<godot>" --path . --rendering-driver vulkan res://tests/apex_testbed.tscn
+```
+
+**操作**：`WASD` 移动 / `Space` 跳 / `Ctrl` 蹲·滑铲 / `Shift` 冲刺 /
+`Q` 主动技能 / `E` 交互（斜坡·立柱·跳伞塔） / `Tab` 测试菜单 / `Esc` 释放鼠标。
+
+**核心设计（相对 Apex 原版的唯一有意偏离）**：移动改为**固定 tick 积分**，
+而非原版的按渲染帧积分。有界追赶 + 超限丢弃并计数 ⇒
+**同样输入序列在任何帧率下产生同样轨迹**；0 fps 时角色不动、也不累计动量。
+
+**逆向产物**（临时目录，已 gitignore，可复现）：
+
+```bash
+cd .re-apex/tools
+python extract_scripts.py     # → .re-apex/scripts/   （996 个 Squirrel 脚本）
+python extract_settings.py    # → .re-apex/settings/ （784 字段布局 + 30 传奇参数）
+python gen_param_doc.py       # → .re-apex/docs/parameters.md
+```
+
+**只读游戏文件，绝不修改安装目录。** 逆向结论见
+[ApexMovement/docs/reverse-engineering.md](addons/apex_movement/docs/reverse-engineering.md)
+（每条标注证据等级 A 观测 / B 脚本 / C 推断 / D 未知）。
 
 > **注意**：`--headless` 用 dummy 渲染器，**没有 RenderingDevice**，raymarch 路径会回退到 MESH。
 
