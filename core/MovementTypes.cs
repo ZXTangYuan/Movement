@@ -154,6 +154,14 @@ public struct MovementSnapshot
     public MantlePhase MantlePhase;
     public float TraversalProgress;   // 0..1；不在翻越时为 -1
 
+    // ── 贴墙爬 / 扒墙（v0.3） ──
+    /// <summary>松 W 后剩余宽限时间 (s)；按住 W 时为满值。</summary>
+    public float ClimbNoInputRemaining;
+    /// <summary>是否处于"即将扒墙，正在补爬最后一小段"。</summary>
+    public bool ClimbApproaching;
+    /// <summary>是否挂在沿上（Mantle hang / 扒墙）。</summary>
+    public bool Hanging;
+
     // ── 落地事件（供相机晃动） ──
     public LandingTier LandingTier;       // 本 tick 是否发生落地
     public float LandingFallDistance;     // 本次落地的下落高度（米）

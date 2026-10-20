@@ -66,7 +66,12 @@ public partial class ApexPlayer : Node3D
     [Export] public bool InvertY = false;
 
     [ExportGroup("Tick")]
-    [Export] public int TickRate = 60;
+    /// <summary>
+    /// 移动 tick 频率。**v0.3 起固定为 60**（<see cref="MovementConfig.PinnedTickRate"/>）：
+    /// 这个值只作为 Inspector 可见的"确认项"，运行时会被强制钳到 60 并给一次提示。
+    /// 需要降低昂贵子系统的开销请改 <see cref="MovementConfig.TraversalProbeInterval"/>。
+    /// </summary>
+    [Export] public int TickRate = MovementConfig.PinnedTickRate;
 
     [ExportGroup("Safety")]
     /// <summary>掉到这个世界 Y 值以下就原地复活（防"掉入虚空"后无法继续测试）。</summary>
@@ -77,6 +82,15 @@ public partial class ApexPlayer : Node3D
     private GodotMovementWorld _world = null!;
     private Camera3D _camera = null!;
     private Label _hud = null!;
+
+    /// <summary>
+    /// 固定 tick 累加器：把物理帧时间折算成 60Hz 的求解器 tick。
+    /// 这是"移动 tick 固定 60/s 不随工程物理频率漂移"的实现点。
+    /// </summary>
+    private ApexTickClock _clock = null!;
+
+    /// <summary>上一物理帧实际跑了几个 tick（HUD/自检观察用）。</summary>
+    private int _lastFrameTicks;
 
     private Vector3 _spawnPoint;
     private bool _spawnCaptured;
@@ -164,31 +178,54 @@ public partial class ApexPlayer : Node3D
     public void DebugSetFov(float deg) => _rig.SetBaseFov(deg);
 
     /// <summary>
-    /// 把 <see cref="TickRate"/> 对齐到工程的物理频率。
+    /// **不再**把 <see cref="TickRate"/> 对齐到工程物理频率。
     ///
-    /// <para>
-    /// <see cref="_PhysicsProcess"/> 每帧**只推进一个 tick**，用的是
-    /// <c>1/TickRate</c> 的固定 dt。如果工程把 <c>physics/common/physics_ticks_per_second</c>
-    /// 改成 120 而这里仍是 60，那么每帧推进 1/60 秒、但一秒钟有 120 帧 ⇒
-    /// 角色以**两倍速**移动。这类"改了工程设置角色速度就变了"的隐性 bug
-    /// 很难在自检里发现，所以直接在运行时对齐。
-    /// </para>
+    /// ## 为什么 v0.3 反过来做
+    /// v0.2 是"物理帧 = 移动 tick"，于是工程把 <c>physics_ticks_per_second</c>
+    /// 改成 30 或 144，移动的时间轴就跟着变（`SyncTickRateWithEngine` 只能
+    /// 强行把 TickRate 改成同样的值来遮住速度失真，代价是**求解器时间轴完全
+    /// 由工程设置决定** —— 同一份输入在不同工程设置下轨迹不同）。
+    ///
+    /// 需求要的是"移动 tick 固定 60 /s 为基准"。所以 v0.3 改成：
+    ///   · 求解器 tick **恒为 60 Hz**（<see cref="MovementConfig.TickRate"/>）
+    ///   · 物理帧只负责"把这一帧的时间交给累加器"
+    ///   · <see cref="ApexTickClock"/> 决定这帧该跑 0/1/2… 个 tick
+    ///
+    /// 于是工程物理频率设 30 也不影响轨迹（一帧跑 2 个 tick），设 144 也不影响
+    /// （多数帧跑 0 个 tick）。速度永远正确，不需要"自动对齐"这种补偿。
+    ///
+    /// 性能开销：单帧要追赶的 tick 数受 <see cref="MovementConfig.MaxCatchUpTicks"/>
+    /// 限制；而求解器里最贵的翻越/窗口探针在配置层就降到 30 Hz
+    /// （<see cref="MovementConfig.TraversalProbeInterval"/> = 2），
+    /// 这就是需求里"开销大的地方可以降到 30 tick/s"。
     /// </summary>
-    private void SyncTickRateWithEngine()
+    private void SetupTickClock()
     {
         int engineTick = (int)Engine.PhysicsTicksPerSecond;
-        if (engineTick > 0 && engineTick != TickRate)
+
+        if (TickRate != MovementConfig.PinnedTickRate)
         {
             GD.PushWarning(
-                $"[ApexPlayer] TickRate={TickRate} 与工程物理频率 {engineTick}Hz 不一致，" +
-                $"已自动对齐到 {engineTick}Hz（否则移动速度会按 {engineTick / (float)TickRate:0.##}× 失真）。");
-            TickRate = engineTick;
+                $"[ApexPlayer] TickRate 被设为 {TickRate}，v0.3 起移动求解器固定为 " +
+                $"{MovementConfig.PinnedTickRate}Hz 基准，已强制使用 {MovementConfig.PinnedTickRate}。" +
+                "需要降档请改 MovementConfig.TraversalProbeInterval（昂贵探针），不要改 TickRate。");
+            TickRate = MovementConfig.PinnedTickRate;
         }
+
+        if (engineTick > 0 && engineTick != TickRate)
+        {
+            // 只是提示，不做任何补偿 —— 累加器保证速度正确。
+            GD.Print(
+                $"[ApexPlayer] 工程物理频率 {engineTick}Hz ≠ 移动 tick {TickRate}Hz，" +
+                $"由 ApexTickClock 折算（每帧平均 {TickRate / (float)engineTick:0.##} 个 tick）。");
+        }
+
+        _clock = new ApexTickClock(1f / TickRate, MovementConfig.PinnedMaxCatchUpTicks);
     }
 
     public override void _Ready()
     {
-        SyncTickRateWithEngine();
+        SetupTickClock();
 
         MovementConfig cfg = ConfigPreset == Preset.Legacy
             ? MovementConfig.Legacy()
@@ -248,7 +285,7 @@ public partial class ApexPlayer : Node3D
         {
             Name = "DebugHud",
             Position = new Vector2(16, 16),
-            Text = "ApexMovement v0.2",
+            Text = "ApexMovement v0.3",
         };
         _hud.AddThemeColorOverride("font_color", new Color(0.9f, 1f, 0.9f));
         _hud.AddThemeColorOverride("font_outline_color", new Color(0, 0, 0, 1));
@@ -303,50 +340,69 @@ public partial class ApexPlayer : Node3D
         bool jumpHeld = Input.IsActionPressed("apex_jump");
         if (jumpPressed) _jumpQueued = true;
 
-        // 2) 物理空间（每 tick 取一次，保证查询与 tick 对齐）
+        // 2) 物理空间（每次查询前取一次；求解器的所有射线都在 tick 内部完成）
         PhysicsDirectSpaceState3D space = GetWorld3D().DirectSpaceState;
         if (_world == null) { _world = new GodotMovementWorld(space); _core.BindWorld(_world); }
 
-        // 3) 组装本 tick 输入：鼠标增量**整份消费**
-        var input = new MovementInput
-        {
-            MoveX = _moveX,
-            MoveZ = _moveZ,
-            JumpPressed = _jumpQueued,
-            JumpHeld = jumpHeld,
-            CrouchHeld = _crouchHeld,
-            SprintHeld = _sprintHeld,
-            Holstered = _holstered,
-            Yaw = _core.Yaw,
-            Pitch = _core.Pitch,
-            MouseDeltaYaw = _pendingMouseX,
-            MouseDeltaPitch = InvertY ? _pendingMouseY : -_pendingMouseY,
-        };
-        _pendingMouseX = 0f;
-        _pendingMouseY = 0f;
-        _jumpQueued = false;
+        // 3) 把本帧时间交给累加器，然后**跑够 60Hz 该跑的 tick 数**
+        //
+        //    · 工程物理 60Hz ⇒ 每帧 1 个 tick（和 v0.2 一样）
+        //    · 工程物理 30Hz ⇒ 每帧 2 个 tick
+        //    · 工程物理 144Hz ⇒ 多数帧 0 个、少数帧 1 个
+        //    三种情况下移动的时间轴完全一样 —— 这就是"固定 60 tick/s"。
+        _clock.Accumulate((float)delta);
+        _lastFrameTicks = 0;
 
-        // 4) 固定 tick 推进（dt 恒为 FixedDelta）
-        _core.Step(input, _core.Config.FixedDelta);
-
-        // 5) 掉出世界兜底：直接复活，避免"掉入虚空后无法继续测试"
-        if (_core.Position.Y < KillPlaneY)
+        while (_clock.TryConsumeTick(out float tickDt))
         {
-            Respawn();
-            return;
+            // 鼠标增量**整份只消费一次**（一帧跑两个 tick 时，第二个 tick 不能再转一次视角，
+            // 否则视角转速会随帧率翻倍）。
+            float mdx = _pendingMouseX, mdy = _pendingMouseY;
+            _pendingMouseX = 0f;
+            _pendingMouseY = 0f;
+
+            // 跳跃上升沿同理：一帧只应触发一次。
+            bool jumpEdge = _jumpQueued;
+            _jumpQueued = false;
+
+            var input = new MovementInput
+            {
+                MoveX = _moveX,
+                MoveZ = _moveZ,
+                JumpPressed = jumpEdge,
+                JumpHeld = jumpHeld,
+                CrouchHeld = _crouchHeld,
+                SprintHeld = _sprintHeld,
+                Holstered = _holstered,
+                Yaw = _core.Yaw,
+                Pitch = _core.Pitch,
+                MouseDeltaYaw = mdx,
+                MouseDeltaPitch = InvertY ? mdy : -mdy,
+            };
+
+            // 4) 固定 tick 推进（dt 恒为 FixedDelta = 1/60）
+            _core.Step(input, tickDt);
+            _lastFrameTicks++;
+
+            // 5) 掉出世界兜底：直接复活，避免"掉入虚空后无法继续测试"
+            if (_core.Position.Y < KillPlaneY)
+            {
+                Respawn();
+                return;
+            }
+
+            // 6) 抓取落地事件（本 tick 只出现一次，交给渲染帧的相机消费）
+            _snapshot = _core.Snapshot;
+            if (_snapshot.LandingTier != LandingTier.None)
+            {
+                _pendingLandingTier = _snapshot.LandingTier;
+                _pendingFallDistance = _snapshot.LandingFallDistance;
+                _pendingImpact = _snapshot.LandingImpactSpeed;
+                _pendingLandingTick = _snapshot.TickCount;
+            }
         }
 
-        // 6) 抓取落地事件（本 tick 只出现一次，交给渲染帧的相机消费）
-        _snapshot = _core.Snapshot;
-        if (_snapshot.LandingTier != LandingTier.None)
-        {
-            _pendingLandingTier = _snapshot.LandingTier;
-            _pendingFallDistance = _snapshot.LandingFallDistance;
-            _pendingImpact = _snapshot.LandingImpactSpeed;
-            _pendingLandingTick = _snapshot.TickCount;
-        }
-
-        // 7) 同步到场景
+        // 7) 同步到场景（一帧内已跑完所有 tick，只写一次变换）
         GlobalPosition = _core.Position.ToGodot();
     }
 

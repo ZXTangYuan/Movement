@@ -1,4 +1,4 @@
-# ApexMovement 插件 v0.2
+# ApexMovement 插件 v0.3
 
 Apex 风格移动系统（**固定 tick 确定性**）+ **相机子系统** + 可玩测试场地。
 逆向自 Apex Legends **v3.0.3.65** 的可执行文件（只读分析，未修改游戏安装目录），
@@ -13,6 +13,8 @@ Apex 风格移动系统（**固定 tick 确定性**）+ **相机子系统** + �
 但把**画面帧判定改成游戏 tick 判定** —— 同样的输入序列在 30 / 60 / 144 / 240 fps 下
 产生**逐位相同**的轨迹。
 
+v0.3 的两个主打变化：**攀爬不再是被动吸入**（必须同时满足“面向墙 + 在空中 + 有朝墙速度”，进去以后是一个状态：按住 W 才上爬，松手就掉下来），**移动 tick 固定 60/s 为基准**（昂贵的探测按 30/s 抽样）。落地镜头晃动幅度同时大幅收敛（峰值 10.3° → 2.49°）。
+
 ---
 
 ## 2. 操作
@@ -20,15 +22,17 @@ Apex 风格移动系统（**固定 tick 确定性**）+ **相机子系统** + �
 | 按键 | 动作 |
 |---|---|
 | `W A S D` | 移动 |
-| `Space` | 跳跃 / 抓住边缘（空中朝墙按住 W 触发攀爬） |
+| `Space` | 跳跃（**攀爬不靠 Space**，见下两行） |
 | `Ctrl` | 蹲下 |
 | `Shift` | 冲刺 |
 | `Shift + Ctrl` | 滑铲（需要速度 ≥ 200 hu/s = 5.08 m/s） |
 | `Shift + Ctrl + Space` | 滑铲跳 |
 | 反复「滑铲 → 跳 → 落地 → 滑铲」 | 连续滑铲跳 |
-| 撞向台面（自动） | 四档翻越：Below / Level / Above / High |
-| 撞向窗口（自动） | 窗口翻越 |
-| 空中朝墙按住 W | 贴墙爬 |
+| 撞向台面 + 按住 `W` | 四档翻越：Below / Level / Above / High |
+| 撞向窗口 + 按住 `W` | 窗口翻越 |
+| **面向墙 + 在空中 + 有朝墙速度** | **挂上墙（`Climb` 状态）**：视角夹角 ≤ 45.57°、朝墙速度 ≥ 0.5 m/s、且必须在空中 |
+| 挂墙后按住 `W` | 以 2 m/s 上爬；**松开 0.22s 就取消攀爬、开始下落** |
+| 爬到墙顶（有台面） | 补爬 0.35m 进入 `Hang` 扒墙，再按 `W` 上墙 |
 | `H` | 收枪 / 持枪切换（收枪 = ×1.15 速度） |
 | `[` / `]` | FOV −2° / +2° |
 | `R` | 回到出生点 |
@@ -80,21 +84,23 @@ GODOT="D:/Godot/Godot_4.7_stable_mono/Godot_v4.7-stable_mono_win64_console.exe"
 # 有窗口，可玩
 "$GODOT" --path . --rendering-driver vulkan res://addons/apex_movement/testbed/apex_testbed.tscn
 
-# 自检 A：跨帧率确定性 + 36 项功能断言 + 20 项相机断言（纯数学，无引擎）
+# 自检 A：跨帧率确定性 + 36 项功能 + 23 项相机 + 29 项攀爬/tick（纯数学，无引擎）
+#         = 88 项断言
 "$GODOT" --headless --path . res://addons/apex_movement/tests/determinism_test.tscn
 # 期望：=== APEX MOVEMENT SELFTEST PASS ===
 
-# 自检 B：39 项真实物理集成断言（跑真实 Godot 物理 + 真实场地）
+# 自检 B：44 项真实物理集成断言（跑真实 Godot 物理 + 真实场地）
 "$GODOT" --headless --path . res://addons/apex_movement/tests/integration_test.tscn
-# 期望：=== INTEGRATION PASS（39 项断言） ===
+# 期望：=== INTEGRATION PASS（44 项断言） ===
 
 # 截图（需要窗口/真实渲染）
 "$GODOT" --path . --rendering-driver vulkan --resolution 1920x1080 \
          res://addons/apex_movement/testbed/shot_testbed.tscn
-# 出 14 张图到 user://shot_*.png：
+# 出 17 张图到 user://shot_*.png：
 #   8 张自由机位（overview / ramps / mantle_steps / vault_walls /
 #                  window_frames / climb_wall / slide_lane / drop_plats）
-#   6 张玩家第一人称（fp / fov110 / fov70 / walking / slide / mantle）
+#   9 张玩家第一人称（fp / fov110 / fov70 / walking / slide / mantle /
+#                    climb / hang / climb_top ← 后三张是 v0.3 新增）
 #   HUD 会打印当时的 fov / roll / state —— 这是相机效果的视觉证据
 ```
 
@@ -134,9 +140,10 @@ tests/
   AnalyticWorld.cs            纯数学碰撞世界（测试替身，契约与 Godot 桥接层一致）
   DeterminismTest.cs          跨帧率确定性
   FeatureTest.cs              36 项功能断言（纯数学）
-  CameraTest.cs               20 项相机断言（纯数学）
+  CameraTest.cs               23 项相机断言（纯数学）
+  ClimbTest.cs                29 项攀爬/tick/探针断言（纯数学）
   determinism_test.tscn       自检 A 入口
-  integration_test.gd/.tscn   39 项真实物理集成断言（自检 B）
+  integration_test.gd/.tscn   44 项真实物理集成断言（自检 B）
 ```
 
 ### 关键设计：帧率无关
@@ -156,7 +163,59 @@ tests/
 
 ---
 
-## 6. v0.2 相比 v0.1 的机制变化
+## 6. 版本变化史
+
+### 6.1 v0.3 相比 v0.2
+
+**① 攀爬：从"被动吸入"改成"有条件的攀爬状态"（本轮主线）**
+
+v0.2 的攀爬是"只要在空中按着 W 贴着墙就被吸上去，吸上就一股劲爬到顶再抛出去" ——
+玩家没有任何拒绝的余地，贴墙跳一下就会被拽走。v0.3 把它改成**真正可进入 / 可退出**的状态：
+
+| 项 | v0.2 | v0.3 |
+|---|---|---|
+| 触发条件 | 空中 + `MoveZ > 0.3`（按着 W 贴墙就吸） | **四条同时满足**：① 在空中（地面 / 滑铲不触发）② 面向墙，视角夹角 ≤ **45.57°** = arccos 0.7（wiki attach 容差）③ **朝墙速度 ≥ 0.5 m/s** ④ 同一面墙不重复附着（除非低于上次附着点，或新面与旧面夹角 ≥ 25.842°） |
+| 吸附后 | 直接一路爬到顶 → End boost 抛出去 | **进入 `Climb` 状态**，竖直速度先归零（挂住，不自己上升） |
+| 上爬 | 无条件 | **必须按住 `W`**：`ClimbSpeed` 2.0 m/s（78.7 hu/s），实测 0.5 s 正好 +1.000 m |
+| 松手 | 无 | `ClimbNoInputGrace` **0.22 s** 后取消攀爬并下落（实测宽限 13 tick 内仍 Climb，超时转 Air，vy=-7.28）；侧向输入持续 1 s 也取消 |
+| 到顶 | 统一 End boost | 有台面可挂 ⇒ **补爬 0.35 m 进入 `Hang`（扒墙）**，再按 `W` 上墙；无台面 ⇒ 保持 End boost 上抛 |
+| 探测频率 | 每 tick 无条件 | `ClimbProbeInterval`（默认 1，可降到 2） |
+| 爬墙真的会动吗 | **不会** —— `Step()` 在 Climb 分支提前 `return`，跳过位移步骤，v0.2 只赋速度不位移 | 会（运动学位移 + 每 tick 贴墙钳制） |
+
+顺带把**翻越**也加了输入门槛：`TryTraversal` 现在要求 `MoveZ > 0.3`（wiki：mantle grab 需要
+移动输入指向墙面）。原先站在墙边**完全不操作**也会被 6 m 墙翻上去。
+
+**② 移动 tick 固定 60/s 基准，昂贵探测降到 30/s**
+
+| 项 | v0.2 | v0.3 |
+|---|---|---|
+| tick 基准 | `SyncTickRateWithEngine()` 用 `Engine.PhysicsTicksPerSecond` 覆盖 `TickRate` | **固定 60/s**（`MovementConfig.PinnedTickRate`）；工程物理频率不是 60 时由 `ApexTickClock` 累加器折算 |
+| 卡顿补帧 | 无上限 | 单帧最多补 **4** tick，其余丢弃并计入 `DroppedTicks` |
+| 翻越探针 | 每 tick | `TraversalProbeInterval = 2`（60 Hz tick → 30 Hz 探针） |
+| 攀爬探针 | 每 tick | `ClimbProbeInterval = 1`（可配） |
+
+实测：30 fps 每帧消费 2 tick；144 fps 跑 10 秒（1440 帧）得 **599** tick，无累积漂移。
+
+**③ 落地镜头晃动大幅收敛（对应需求"晃动过于剧烈"）**
+
+| 项 | v0.2 | v0.3 |
+|---|---|---|
+| `LandingPitchImpulse` | `{0, 0.9, 2.2, 4.0, 6.5}` → 峰值 5.9° / 10.8° / 14.6°，后两档**全部撞上** `MaxKickAngle`(10.3°) ⇒ 所有大落地都是同一次 10° 甩头 | `{0, 0.25, 0.55, 0.90, 1.33}` → 峰值 **0.47° / 1.04° / 1.69° / 2.49°** |
+| `MaxKickAngle` | 0.18 rad（10.3°，实际工作点） | **0.075 rad（4.3°），只作保险丝**（实测峰值 0.0435 < 0.075 × 0.9） |
+| 走路 bob | 0.035 m / 0.022 m / 0.35° / 0.30° | 0.026 m / 0.016 m / 0.24° / 0.20°（实测移动峰值 0.0281 m） |
+| `KickScale` | 无 | 新增总倍率（0 = 关掉所有视角踢；落地踢与手动踢都受它控制） |
+
+**④ v0.3 逆向补充**
+
+- 攀爬常量与 wiki 对齐：attach offset **100 hu**、climb 空间 cutoff **147 hu**、end boost **28 hu**、
+  attach 视角容差 **45.57°** = arccos(0.7)、可攀墙面角度 > **45.572°**。
+- 逆向新发现、但**本轮未实现**的两套机制（v0.4 候选）：打滑态
+  `slipSpeed` / `IsSlipping` / `m_slipAirRestrictTime` / `m_slipAirRestrictDirection`；
+  以及独立扒墙（dangle）状态机
+  `wallhang` / `m_wallHanging` / `IsWallHanging` / `automantle_disable_hang` / `ACT_MP_WALLHANG_*` / `sound_wallHang*`。
+  注意：v0.3 的 `Hang` 是"攀爬到顶后的过渡态"，**不是**这套 dangle 机器。
+
+### 6.2 v0.2 相比 v0.1 的机制变化
 
 | 机制 | v0.1 | v0.2 |
 |---|---|---|
@@ -181,6 +240,32 @@ tests/
 ---
 
 ## 7. 本轮修掉的真实 bug（根因均已实测确认）
+
+### v0.3 新增：⑧ ⑨ ⑩
+
+#### ⑧ 攀爬贴墙代码从未生效 —— 点积符号写反
+
+`float dist = Dot(hitPoint - _pos, normal)` 在玩家位于墙外时是**负数**，而 `want = 半径 + 0.02` 是正数，
+`if (dist > want)` 永不成立 ⇒ 玩家停在离墙 1 m 处；下一 tick 的到顶探针（射程 0.7 m）必然打空，
+于是 `wallGone = true` → 立刻 `DetachClimbAtTop()` 给 End boost。逐 tick 轨迹判据：第 1 tick 就
+`state=Air, vy=5.437`，而 `sqrt(2 × 20.78 × 0.7112) = 5.4366` —— 精确等于 End boost 的抛体初速。
+修法：`dist = Dot(_pos - hitPoint, normal)`，位移 `_pos += normal * (want - dist)`
+（同一个式子既处理"贴太远"也处理"已经陷进去"）。
+
+#### ⑨ 攀爬状态跳过了位移步骤 —— "按住 W 爬墙"原地不动
+
+`Step()` 第 4 步 `if (_state == Climb) { StepClimb(input, dt); return; }` **提前 return**，
+第 8 步 `MoveWithCollision` 与第 9 步 `UpdateGroundContact` 在攀爬时从不执行；而 v0.2 的
+`StepClimb` 只赋 `_vel` 不位移 ⇒ 爬墙在原地抖动。修法：攀爬改运动学位移（照抄 `StepTraversal`），
+每 tick 再贴墙钳制一次。
+
+#### ⑩ 测试替身把"刚好贴住盒顶"当成没撞到 —— 上墙后失重、钻进墙里
+
+`AnalyticWorld.Sweep` 的盒顶 / 盒底分支用 `f >= 0f` 判命中，而贴面时 `f` 因 float 舍入得 **-5e-7**，
+被判成未命中（地面分支早有容差，盒子分支漏了）。于是翻越 / 攀爬把胶囊**恰好**放到台面上之后
+`onGround` 立刻变 false，角色一边"空中加速"一边钻进墙体（实测终点 `y=0.976, z=-3.244` 在墙里）。
+修法：`contactEps = 1e-4` + `if (f < 0f) f = 0f`，并新增"台面上站得住 / 走出边缘会掉到地面 /
+不会卡进墙体内部"三条断言锁死。
 
 ### ① 站着却完全走不动 —— 贴地吸附把胶囊压进地面
 
@@ -259,7 +344,7 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
 
 ## 8. 自检结果（实测）
 
-### A. 确定性 + 功能 + 相机（`determinism_test.tscn`，56 项断言）
+### A. 确定性 + 功能 + 相机 + 攀爬/tick/探针（`determinism_test.tscn`，88 项断言）
 
 ```
 === 跨帧率确定性 ===
@@ -279,19 +364,31 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
   四档翻越 Below/Level/Above/High、6m 攀爬、7.5m 超限拒绝、窗口翻越
   Fallstun、落地四档分档、重力与 wiki 双数据自洽（g=20.7801 vs 20.7802）
 
-=== 相机子系统（20 项，全 PASS）===
+=== 相机子系统（23 项，全 PASS）===
   FOV 90 基准 / 冲刺 93 / 滑铲 96 / 夹紧 120 / 玩家可调 ±2°
   tan 空间插值 vs 线性：中途差 1.599°，终值差 0.0001°
-  落地踢：瞬间低头 −0.0888 rad，1.5s 后回正；按档位单调（0.029 < 0.072 < 0.131 < 0.180）
-  滑铲侧倾随速度增大（5m/s→3.12°，10m/s→5.00° 满值）、冲刺侧倾 2.17°
-  走路摇晃：静止 0 / 移动 0.0378m / 空中 0
-  翻越相机脱开→回贴（0.997 → 0.000）、高度上限压低 0.65m
+  落地踢：瞬间低头 −0.0182 rad，1.5s 后回正
+  v0.3 收敛：Hard 2.49° / Low 0.47°（设计带 1°–5°）；MaxKickAngle 未成为工作点（0.0435 < 0.075×0.9）
+  落地踢按档位单调（0.0082 < 0.0180 < 0.0294 < 0.0435）
+  滑铲侧倾随速度增大（5m/s→3.12°，10m/s→5.00° 满值）、冲刺侧倾 1.95°
+  走路摇晃：静止 0 / 移动 0.0281 m / 空中 0
+  翻越相机脱开→回贴（0.997 → 0.000）、高度上限压低 0.65 m
   FOV 收敛与帧率无关（60/144/240fps 差 < 0.0005°）
+
+=== v0.3 攀爬 / tick / 探针（29 项，全 PASS）===
+  非强制：地面贴墙按 W 120 tick 不进 Climb；空中但朝墙速度 0 → 不攀爬
+  成立则进 Climb（朝墙速度 6.0），挂上瞬间 vy=0；按 W 0.5s → +1.000 m（ClimbSpeed 2.0）
+  松手宽限 13 tick 内仍 Climb，超时转 Air（vy=-7.28）
+  到顶先进「补爬」（ClimbApproaching），再进 Hang（挂姿脚底 1.750，墙顶 2.00）
+  Hang 里按 W 上墙 → 脚底 2.000；台面上站得住 / 走出边缘掉到地面 / 不卡进墙体
+  同一面墙爬过后不能在同一高度以上立刻重附着
+  tick：TickRate=60 / FixedDelta=1/60 / 30fps 每帧 2 tick / 144fps 10s=599 tick / 卡顿最多补 4
+  探针：TraversalProbeInterval=2（60 tick 只探 30 次）/ ClimbProbeInterval=1
 
 === APEX MOVEMENT SELFTEST PASS ===
 ```
 
-### B. 真实物理集成（`integration_test.tscn`，39 项断言）
+### B. 真实物理集成（`integration_test.tscn`，44 项断言）
 
 ```
   [PASS] 落地 / 脚底贴地 0.001 / 站立身高 1.950 / 相机高度 1.850 / 基础 FOV 90.000
@@ -302,11 +399,15 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
   [PASS] 连续滑铲跳 3 次
   [PASS] 翻越分档 Below(0.9m) / Level(1.7m) / Above(3.0m) / High(6.0m)
   [PASS] 6m 攀爬 6.000 / 爬上 15° 斜坡 / 翻越 0.8m 矮墙
+  [PASS] 攀爬不强制：地面顶墙按 W 不进 Climb（x=48.594 被挡在墙面外）
+  [PASS] 跑向墙 + 空中按 W → 挂上 Climb（x=48.574）
+  [PASS] 按住 W 0.75s → Δfeet 1.500 m（ClimbSpeed 2.0）
+  [PASS] 松开 W → 取消攀爬并下落（state=Air, vy=-5.895）
   [PASS] 窗口翻越（state=Window）/ 穿过开口
   [PASS] 低天花板下无法站起 / 离开后站起
   [PASS] FOV 可调 100°/90° / 视角踢可触发 / 掉出世界自动复活
 
-=== INTEGRATION PASS（39 项断言） ===
+=== INTEGRATION PASS（44 项断言） ===
 ```
 
 ---
@@ -341,6 +442,9 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
 | Fallstun 精确公式 | wiki 自己标注"不确定"，本实现用二次曲线 |
 | 7 种 MANTLE 分类 | 二进制里有 **10 个** `ACT_VM_MANTLE_*`（4 主档 × 蹲姿变体 + IDLE + JUMPOFF）。本插件实现 4 档 + grab/pull 两段 + 可选挂边，**蹲姿变体未实现** |
 | Superglide / Wallbounce / Wallrun / 滑索 / 钩爪 / Tap strafe / Lurch | **未实现**（不在本次需求内）。逆向字段（`superjump*`、`wallrun_*`、`zipline*`、`grapple*`）已记录在 `docs/reverse-engineering-v0.2.md`，v0.3 可直接接 |
+| `ClimbNoInputGrace = 0.22s` / `ClimbHangApproachDistance = 0.35m` | **自研手感参数**（C 级）。wiki 只说"向上爬 untimed、静止 1s 才脱离"，没给松手宽限；0.22 s 是为了"点一下 W 也能爬一小段"而不至于一松手就掉 |
+| 打滑态（`slipSpeed` / `IsSlipping` / `m_slipAirRestrictTime`） | **逆向已确认但本轮未实现**（v0.4 候选） |
+| 独立扒墙 / dangle 状态机（`wallhang` / `IsWallHanging` / `ACT_MP_WALLHANG_*`） | **逆向已确认但本轮未实现**；v0.3 的 `Hang` 只是攀爬到顶的过渡态 |
 | 移动平台速度继承 | **未实现**（需求范围外） |
 | 动画 | 无（纯物理位移 + 相机效果） |
 
@@ -348,8 +452,8 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
 
 ## 11. 截图（逐张视觉复核过）
 
-14 张 1920×1080，全部位于 [`../../docs/reference/apex_movement/`](../../docs/reference/apex_movement/)。
-每张第一人称图的 HUD 会打印当时的 `fov / roll / state / xBlend`，可对着数字核验。
+**17 张 1920×1080**，全部位于 [`../../docs/reference/apex_movement/`](../../docs/reference/apex_movement/)。
+每张第一人称图的 HUD 会打印当时的 `fov / roll / state / vy / xBlend`，可对着数字核验。
 
 | 文件 | 内容 | 图上可核验的数字 |
 |---|---|---|
@@ -358,15 +462,21 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
 | `shot_mantle_steps.png` | 攀爬台阶梯 8 档，颜色分 4 档 | — |
 | `shot_vault_walls.png` | 翻越低墙 0.4/0.8/1.0m | — |
 | `shot_window_frames.png` | 窗口框架（窗台 + 窗楣） | — |
-| `shot_climb_wall.png` | 贴墙爬墙（8m，带刻度线） | — |
+| `shot_climb_wall.png` | 装墙（8m，带刻度线） | — |
 | `shot_slide_lane.png` | 滑铲长道（80m，10m 刻度） | — |
 | `shot_drop_plats.png` | 落差平台 3/6/10/22m | — |
 | `shot_player_fp.png` | 站立第一人称基准 | `fov=90.0°`、`roll=0.0°`、`bobPhase=0.00` |
 | `shot_player_fov110.png` | FOV 拉宽 | `fov=109.9°` |
-| `shot_player_fov70.png` | FOV 收窄 | `fov=70.5°` |
-| `shot_player_walking.png` | 走路摇晃 + 无侧倾 | `speed=5.07`、`roll=0.5°`、`bobPhase=5.26` |
-| `shot_player_slide.png` | 滑铲：侧倾 + 抬 FOV + 蹲高 | `state=Slide`、`speed=9.89`、`h=0.98`、`fov=94.9°`、`roll=5.5°` |
-| `shot_player_mantle.png` | 翻越途中：相机滞后 + 高度上限 | `state=Mantle`、`mantle=High/Grab`、`xBlend=0.97`、`fov=87.2°` |
+| `shot_player_fov70.png` | FOV 收窄 | 视野显著变窄（目标 70°） |
+| `shot_player_walking.png` | 走路摇晃 + 无侧倾 | `speed=5.07`、`roll=0.2°`、`bobPhase=5.26` |
+| `shot_player_slide.png` | 滑铲：侧倾 + 抬 FOV + 蹲高 | `state=Slide`、`speed=9.89`、`h=0.98`、`fov=95.1°`、`roll=5.4°` |
+| `shot_player_mantle.png` | 翻越途中：相机滞后 + 高度上限 | `state=Mantle`、`mantle=High/Grab`、`xBlend=1.00`、`fov=86.4°` |
+| `shot_player_climb.png` | **v0.3 攀爬状态**（3m 台阶，Above 档） | `state=Climb`、`speed=0.00`、`vy=2.00` —— 静止水平 + 只有按 W 才 2 m/s 上爬 |
+| `shot_player_hang.png` | **v0.3 扒墙**（补爬结束挂边） | `state=Hang`、`speed=0.00`、`vy=0.00` —— 挂住不自己动 |
+| `shot_player_climb_top.png` | **v0.3 挂边上墙**（站到 3m 台面） | `state=Ground`，控制台同时打印 `CLIMB TOP feet=3.00` |
+
+> 三张 v0.3 新图是同一条链路的三个阶段：**挂墙 → 爬 → 补爬 → Hang → 按 W 上墙**。
+> 全部由 `testbed/shot_testbed.gd` 自动驱动按键与相机，不是摆拍。
 
 ---
 

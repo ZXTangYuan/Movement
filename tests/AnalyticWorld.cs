@@ -94,17 +94,25 @@ public sealed class AnalyticWorld : IMovementWorld
             // 顶面（可站立）：用"脚底外扩盒"判断水平重叠
             bool overXZ = pos.X > bx0 - 1e-6f && pos.X < bx1 + 1e-6f &&
                           pos.Z > bz0 - 1e-6f && pos.Z < bz1 + 1e-6f;
-            if (delta.Y < -1e-9f && overXZ && feet >= by1 - 1e-6f)
+            // 顶点/底面同样必须容忍"刚好贴住"：
+            // `f = (by1 - feet) / delta.Y` 在胶囊**恰好**停在台面上时会因为 float
+            // 舍入算出 -5e-7 这种微负值，被 `f >= 0f` 判成"没撞到" —— 表现为
+            // 翻越/攀爬上墙后落在台面上立刻"失重"往下掉（v0.3 实测踩到）。
+            // 和上面地面分支一样：贴着就算 fraction=0 的命中（Godot CastMotion 语义）。
+            const float contactEps = 1e-4f;   // 0.1mm
+            if (delta.Y < -1e-9f && overXZ && feet >= by1 - contactEps)
             {
                 float f = (by1 - feet) / delta.Y;
-                if (f >= 0f && f < fraction) { fraction = f; hitNormal = F3.Up; }
+                if (f < 0f) f = 0f;
+                if (f < fraction) { fraction = f; hitNormal = F3.Up; }
             }
 
             // 底面（撞头）
-            if (delta.Y > 1e-9f && overXZ && head <= by0 + 1e-6f)
+            if (delta.Y > 1e-9f && overXZ && head <= by0 + contactEps)
             {
                 float f = (by0 - head) / delta.Y;
-                if (f >= 0f && f < fraction) { fraction = f; hitNormal = F3.Up * -1f; }
+                if (f < 0f) f = 0f;
+                if (f < fraction) { fraction = f; hitNormal = F3.Up * -1f; }
             }
         }
 

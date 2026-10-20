@@ -153,10 +153,49 @@ public static class CameraTest
             Check("落地视角踢（瞬间低头）", firstPitch < -0.01f, $"pitchOffset={firstPitch:F4} rad");
 
             // 弹簧应把它拉回 0
+            //
+            // v0.3：这里的下界原来写死 0.02 rad（对应 v0.2 的 10° 级砸镜头），
+            // 而 v0.3 按需求把幅度压到 2.5° 级，所以下界必须跟着改 —— 否则这条断言
+            // 会变成"必须晃动得足够剧烈才算通过"，与需求本身冲突。
+            // 真正防"踢量悄悄归零"的守卫放到下面第 7b 条（带上界，方向明确）。
             float peak = MathF.Abs(firstPitch);
             for (int i = 0; i < 90; i++) o = rig.Update(Snap(tick: 11 + i), dt);
-            Check("视角踢自动回正", MathF.Abs(o.PitchOffset) < 0.005f && peak > 0.02f,
+            Check("视角踢自动回正", MathF.Abs(o.PitchOffset) < 0.005f && peak > 0.005f,
                   $"峰值 {peak:F4} → 1.5s 后 {o.PitchOffset:F4} rad");
+
+            // ── 7b. v0.3 幅度守卫：落地砸镜头必须"轻"，而且仍确实存在 ──
+            {
+                float PeakAbs(LandingTier tier)
+                {
+                    var r = new ApexCameraRig();
+                    r.Update(Snap(), dt);
+                    float pk = 0f;
+                    for (int i = 0; i < 60; i++)
+                    {
+                        var s = i == 0 ? Snap(landing: tier, tick: 1) : Snap(tick: 2 + i);
+                        var oo = r.Update(s, dt);
+                        pk = MathF.Max(pk, MathF.Abs(oo.PitchOffset));
+                    }
+                    return pk;
+                }
+
+                const float Upper = 0.0873f;   // 5°
+                const float Lower = 0.0175f;   // 1°
+                float hardPeak = PeakAbs(LandingTier.Hard);
+                float lowPeak = PeakAbs(LandingTier.Low);
+
+                Check("v0.3 落地砸镜头收敛到 5° 以内",
+                      hardPeak <= Upper && lowPeak <= Upper,
+                      $"Hard={hardPeak * 180f / MathF.PI:F2}° / Low={lowPeak * 180f / MathF.PI:F2}°（上限 5.00°）");
+
+                Check("v0.3 落地砸镜头未被压没（Hard 仍在 1°–5°）",
+                      hardPeak >= Lower && hardPeak <= Upper,
+                      $"Hard={hardPeak * 180f / MathF.PI:F2}°（要求 1.00°–5.00°）");
+
+                Check("v0.3 MaxKickAngle 只作保险丝（未成为工作点）",
+                      hardPeak < rig.Config.MaxKickAngle * 0.9f,
+                      $"Hard 峰值 {hardPeak:F4} < 上限 {rig.Config.MaxKickAngle:F4} × 0.9");
+            }
         }
 
         // ═════════ 8. 落地踢幅度按档位单调 ═════════

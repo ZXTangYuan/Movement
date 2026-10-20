@@ -251,11 +251,76 @@ public sealed class MovementConfig
     /// <summary>[A] 判定"向上爬"的垂直速度阈值 (m/s) = 10 hu/s = 0.254。</summary>
     public float ClimbUpwardSpeedThreshold = 0.25400f;
 
-    /// <summary>[A] 非向上爬的脱离计时 (s) = 1.0。wiki Climb。</summary>
+    /// <summary>
+    /// [A] 非向上爬的脱离计时 (s) = 1.0。wiki Climb。
+    ///
+    /// **v0.3 起不再是主脱离计时**：v0.2 拿它做「没按 W 就 1 秒后掉」，
+    /// 手感变成"贴墙挂满一秒才掉"。v0.3 按需求改成
+    /// <see cref="ClimbNoInputGrace"/>（短宽限），本字段只保留给
+    /// 「按着输入但实际在向下/侧向爬」的情形。
+    /// </summary>
     public float ClimbNonUpwardTimer = 1.0f;
 
     /// <summary>[C] 向上攀爬速度 (m/s)。</summary>
     public float ClimbSpeed = 2.0f;
+
+    // ── v0.3：非强制攀爬（面向墙 + 空中 + 朝墙速度） ──
+
+    /// <summary>
+    /// [A] 允许**附着**攀爬的最大视角偏角 (deg) = 45.57。
+    ///
+    /// wiki Climb L40：「You can initiate a climb while looking up to 45.57° away
+    /// from a wall」；L208 给出 45.57° = <c>arccos(0.7)</c>。
+    ///
+    /// 注意与 <see cref="MantleMaxViewAngle"/>（50°，Mantle grab 用）区分：
+    /// v0.2 把两者混用，还在判定里乘了 0.5 的魔法系数，结果"只是路过墙边"
+    /// 也会被吸住 —— v0.3 拆开并去掉魔法系数。
+    /// </summary>
+    public float ClimbAttachMaxViewAngle = 45.57f;
+
+    /// <summary>
+    /// [C] 附着攀爬所需的**最小朝墙速度** (m/s)。
+    ///
+    /// 需求：「必须角色在空中 + 有朝向墙壁的速度才触发」。
+    /// wiki Climb L37-38 也印证：真正决定粘不粘墙的是**朝墙的动量**，而不是
+    /// "有没有按前进键"（「You technically don't need a Forward input to Climb.
+    /// Just moving towards a wall mid air will have you at least stick to it」）。
+    ///
+    /// 0.5 m/s ≈ 20 hu/s：轻擦墙不触发，正常跳向墙面的速度（>3 m/s）必然满足。
+    /// </summary>
+    public float ClimbMinApproachSpeed = 0.5f;
+
+    /// <summary>
+    /// [C] 松 W 后仍留在墙上的宽限时长 (s)。
+    ///
+    /// 需求：「按住 W 才向上爬；短时间没按 W 则取消攀爬开始下落」。
+    /// 宽限让"点一下 W 再松"仍能完成一次抓附（wiki L37 的 brief stick），
+    /// 超过这个时长才真正脱手下落。
+    /// </summary>
+    public float ClimbNoInputGrace = 0.22f;
+
+    /// <summary>
+    /// [C] "即将扒墙"时额外补爬的距离 (m)。
+    ///
+    /// 需求：「即将扒墙，则会继续上爬一小部分进入扒墙状态」。
+    /// 检测到墙顶（前向探针打不到墙 / 到达高度上限）后，先补爬这段距离，
+    /// 让手正好够到台沿，再切 <see cref="MovementState.Hang"/>。
+    /// </summary>
+    public float ClimbHangApproachDistance = 0.35f;
+
+    /// <summary>[C] 上面那段"补爬"的时长 (s)。距离 / 时长 = 该阶段的爬升速度。</summary>
+    public float ClimbHangApproachTime = 0.12f;
+
+    /// <summary>
+    /// [A] 重附着豁免角 (deg) = 25.842（wiki Climb L172-175）。
+    ///
+    /// 默认规则：脱离攀爬后必须**掉回上次 attach point 以下**才能再次附着；
+    /// 但若新表面与旧表面的法线夹角 ≥ 此值，视为"换了面"，豁免该限制。
+    /// </summary>
+    public float ClimbReattachNormalAngle = 25.842f;
+
+    /// <summary>[C] 是否允许从攀爬过渡到扒墙（Hang）。关掉就退回"到顶直接弹上去"。</summary>
+    public bool ClimbToHangEnabled = true;
 
     /// <summary>[A] 允许触发翻越的最大视角偏角 (deg) = 50。wiki Mantle grab：「within 50° to each side」。</summary>
     public float MantleMaxViewAngle = 50f;
@@ -353,14 +418,58 @@ public sealed class MovementConfig
 
     // ═════════════════════════════ 固定 tick ═════════════════════════════
 
-    /// <summary>[C] 固定 tick 频率 (Hz)。60 与 Godot 默认物理频率一致。</summary>
-    public int TickRate = 60;
+    /// <summary>
+    /// **钉死的移动 tick 频率**：60 Hz。
+    ///
+    /// 需求原话：「移动 tick 我希望固定为 60 tick/s，以这个为基准」。
+    /// 因此它不是一个"可调手感参数"，而是求解器时间轴的定义 ——
+    /// <see cref="TickRate"/> 的默认值就是它，<c>ApexPlayer</c> 也会拒绝被改小/改大。
+    /// 要省性能请降 <see cref="TraversalProbeInterval"/>（昂贵探针的抽样率），
+    /// 而不是改这个数，否则所有按秒标定的 A 级数值（跳跃高度、滑铲时长…）都会失真。
+    /// </summary>
+    public const int PinnedTickRate = 60;
+
+    /// <summary>钉死的追赶上限（防死亡螺旋）。60Hz 下单帧最多补 4 tick ≈ 66 ms 卡顿。</summary>
+    public const int PinnedMaxCatchUpTicks = 4;
+
+    /// <summary>
+    /// [C] **移动求解器的固定 tick 频率 (Hz)，v0.3 起恒为 60**。
+    ///
+    /// 需求：移动 tick 固定 60 tick/s 作为基准，不要跟随工程物理频率改变；
+    /// 性能开销大的子系统可以单独降到 30 tick/s（见
+    /// <see cref="TraversalProbeInterval"/>）。
+    ///
+    /// <c>player/ApexPlayer</c> 用累加器（<c>ApexTickClock</c>）把渲染/物理帧
+    /// 折算成固定 60Hz 的 tick，所以工程把 physics_ticks_per_second 设成 30 或 144
+    /// 都不影响求解器时间轴 —— 只影响每帧要追赶几个 tick。
+    /// </summary>
+    public int TickRate = PinnedTickRate;
 
     /// <summary>[C] 单帧最多追赶的 tick 数（防死亡螺旋）。</summary>
-    public int MaxCatchUpTicks = 4;
+    public int MaxCatchUpTicks = PinnedMaxCatchUpTicks;
 
     /// <summary>[C] 是否在 <see cref="ApexMovementCore.Step"/> 内自动尝试翻越/攀爬。</summary>
     public bool AutoTraverse = true;
+
+    /// <summary>
+    /// [C] **翻越探针的抽样间隔**（单位：tick）。2 = 每 2 个 tick 探一次 → 30 Hz。
+    ///
+    /// 翻越/窗口探测是整个求解器里最贵的一段（窗口扫描 12 条竖直探针 + 若干辅助射线，
+    /// 攀爬 6 点向内扫描）。它只是"有没有可翻的东西"的**机会检测**，不推进状态，
+    /// 因此抽到 30 Hz 对玩法零影响，却把最贵的一段开销直接砍半 ——
+    /// 这就是需求里"性能开销大的地方可以降到 30 tick/s"的落点。
+    ///
+    /// 1 = 每 tick（60 Hz，最灵敏），4 = 15 Hz（更省）。
+    /// </summary>
+    public int TraversalProbeInterval = 2;
+
+    /// <summary>
+    /// [C] **攀爬附着探针的抽样间隔**（单位：tick）。默认 1 = 每 tick。
+    ///
+    /// 附着只是 1 条射线 + 几次点积，很便宜；而它决定"贴墙瞬间抓不抓住"的手感，
+    /// 所以默认不降频。真需要省性能时调到 2。
+    /// </summary>
+    public int ClimbProbeInterval = 1;
 
     /// <summary>固定 tick 时长 (s)。</summary>
     public float FixedDelta => 1.0f / TickRate;
@@ -453,7 +562,15 @@ public sealed class MovementConfig
     {
         if (TickRate <= 0) throw new ArgumentOutOfRangeException(nameof(TickRate));
         if (FixedDelta <= 0f) throw new ArgumentOutOfRangeException(nameof(TickRate));
+        if (TraversalProbeInterval < 1) throw new ArgumentOutOfRangeException(nameof(TraversalProbeInterval));
+        if (ClimbProbeInterval < 1) throw new ArgumentOutOfRangeException(nameof(ClimbProbeInterval));
         if (CapsuleRadius <= 0f) throw new ArgumentOutOfRangeException(nameof(CapsuleRadius));
+        if (ClimbAttachMaxViewAngle <= 0f || ClimbAttachMaxViewAngle >= 90f)
+            throw new ArgumentOutOfRangeException(nameof(ClimbAttachMaxViewAngle));
+        if (ClimbMinApproachSpeed < 0f)
+            throw new ArgumentOutOfRangeException(nameof(ClimbMinApproachSpeed));
+        if (ClimbNoInputGrace < 0f)
+            throw new ArgumentOutOfRangeException(nameof(ClimbNoInputGrace));
         if (StandHeight < CrouchHeight)
             throw new ArgumentException("StandHeight 必须 >= CrouchHeight");
         if (CrouchHeight < 0f)

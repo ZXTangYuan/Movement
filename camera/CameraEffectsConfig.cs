@@ -73,20 +73,54 @@ public sealed class CameraEffectsConfig
     /// <summary>[C] 弹簧阻尼 c（`viewkick_spring_cooldown_fadetime` 的对应物）。</summary>
     public float SpringDamping = 18f;
 
-    /// <summary>[C] 各落地档位的俯仰冲量 (rad/s)。索引 = <c>LandingTier</c>。</summary>
-    public float[] LandingPitchImpulse = { 0f, 0.9f, 2.2f, 4.0f, 6.5f };
+    /// <summary>
+    /// [C] **视角踢总幅度倍率**（v0.3 新增）。
+    ///
+    /// 需求「镜头晃动过于剧烈」的**手感总闸**：所有冲量（落地 / 跳跃）在
+    /// <see cref="ApexCameraRig.AddKick"/> 入口统一乘上它，所以调这一个数就能
+    /// 整体放大/缩小镜头晃动，不必逐档改数组。
+    ///
+    /// 默认 1.0（各项已在下面的数组里按目标幅度标定好）；0 = 完全关闭视角踢；
+    /// 想更"硬核"可调到 1.3 左右。
+    /// </summary>
+    public float KickScale = 1.0f;
 
-    /// <summary>[C] 各落地档位的偏航随机量 (rad/s)。落地不应有确定方向，这里用确定性的符号交替。</summary>
-    public float[] LandingYawImpulse = { 0f, 0.15f, 0.35f, 0.6f, 0.9f };
+    // ── v0.3：把落地方向的冲量整体下调（这才是"晃动过于剧烈"的真正修法） ──
+    //
+    // 推导（ζ = c/(2√k) = 0.67，ω_n = √180 = 13.42，ω_d = ω_n√(1−ζ²) = 9.96）：
+    //   冲量 v₀ 下的峰值位移 ≈ (v₀/ω_d)·e^(−ζω_n·t_p)·sin(ω_d·t_p) ≈ 0.047·v₀
+    // v0.2 的实际幅度：
+    //   档1 v₀=0.9 → 0.042 rad ≈  2.4°
+    //   档2 v₀=2.2 → 0.104 rad ≈  5.9°
+    //   档3 v₀=4.0 → 0.189 rad ≈ 10.8°  ← 已被 MaxKickAngle 0.18 钳死
+    //   档4 v₀=6.5 → 0.307 rad ≈ 17.6°  ← 同样钳死 ⇒ 高空落地固定 10.3° 俯仰砸脸
+    // 这就是"剧烈"的量化根因：后两档**都撞上限**，等于所有大跳落地都是同一次 10° 甩头。
+    // v0.3 把各档压到约 0.7° / 1.5° / 2.5° / 3.6°，并把上限放宽到 4.3° 留出余量。
 
-    /// <summary>[C] 各落地档位的滚转冲量 (rad/s)。</summary>
-    public float[] LandingRollImpulse = { 0f, 0.10f, 0.25f, 0.45f, 0.7f };
+    /// <summary>
+    /// [C] 各落地档位的俯仰冲量 (rad/s)。索引 = <c>LandingTier</c>。
+    /// 峰值位移 ≈ 0.047 × 本值 ⇒ {0, 0.25, 0.55, 0.90, 1.33} → 0° / 0.7° / 1.5° / 2.5° / 3.6°。
+    /// </summary>
+    public float[] LandingPitchImpulse = { 0f, 0.25f, 0.55f, 0.90f, 1.33f };
 
-    /// <summary>[C] 跳跃时给一点向上的视角踢（起跳"抬镜头"）。</summary>
-    public float JumpPitchImpulse = 0.5f;
+    /// <summary>
+    /// [C] 各落地档位的偏航随机量 (rad/s)。落地不应有确定方向，这里用确定性的符号交替。
+    /// 峰值 ≈ 0.047 × 本值 ⇒ 最大约 0.5°。
+    /// </summary>
+    public float[] LandingYawImpulse = { 0f, 0.03f, 0.07f, 0.12f, 0.18f };
 
-    /// <summary>[C] 视角踢的总幅度上限 (rad)，防止极端情况把镜头甩飞。</summary>
-    public float MaxKickAngle = 0.18f;
+    /// <summary>[C] 各落地档位的滚转冲量 (rad/s)。峰值 ⇒ 最大约 0.4°。</summary>
+    public float[] LandingRollImpulse = { 0f, 0.02f, 0.05f, 0.09f, 0.14f };
+
+    /// <summary>[C] 跳跃时给一点向上的视角踢（起跳"抬镜头"）。峰值 ≈ 0.28°。</summary>
+    public float JumpPitchImpulse = 0.10f;
+
+    /// <summary>
+    /// [C] 视角踢的总幅度上限 (rad)，防止极端情况把镜头甩飞。
+    /// v0.3 从 0.18 rad (10.3°) 收到 0.075 rad (4.3°)：让它只当**保险丝**，
+    /// 而不是像 v0.2 那样成为"每次大落地都撞到"的实际工作点。
+    /// </summary>
+    public float MaxKickAngle = 0.075f;
 
     // ═══════════════════════════ 侧倾（roll） ═══════════════════════════
 
@@ -141,20 +175,22 @@ public sealed class CameraEffectsConfig
     ///
     /// ⚠️ **Apex 没有 `cl_bob` 类 cvar**（逆向负结论），走路摇晃来自第一人称动画，
     /// 因此这里**没有任何证据可依**，纯手感参数。
+    ///
+    /// v0.3：0.035 → 0.026（配合下面几项一起收，需求是"镜头晃动过于剧烈"）。
     /// </summary>
-    public float BobAmplitude = 0.035f;
+    public float BobAmplitude = 0.026f;
 
-    /// <summary>[C] 走路摇晃的横向幅度 (m)。</summary>
-    public float BobLateralAmplitude = 0.022f;
+    /// <summary>[C] 走路摇晃的横向幅度 (m)。v0.3：0.022 → 0.016。</summary>
+    public float BobLateralAmplitude = 0.016f;
 
     /// <summary>[C] 冲刺时摇晃幅度倍率。</summary>
     public float BobSprintMultiplier = 1.6f;
 
-    /// <summary>[C] 摇晃的俯仰幅度 (deg)。</summary>
-    public float BobPitchDeg = 0.35f;
+    /// <summary>[C] 摇晃的俯仰幅度 (deg)。v0.3：0.35 → 0.24。</summary>
+    public float BobPitchDeg = 0.24f;
 
-    /// <summary>[C] 摇晃的滚转幅度 (deg)。</summary>
-    public float BobRollDeg = 0.30f;
+    /// <summary>[C] 摇晃的滚转幅度 (deg)。v0.3：0.30 → 0.20。</summary>
+    public float BobRollDeg = 0.20f;
 
     /// <summary>[C] 摇晃开始生效的最低速度 (m/s)。</summary>
     public float BobMinSpeed = 0.6f;
@@ -178,6 +214,7 @@ public sealed class CameraEffectsConfig
             throw new ArgumentOutOfRangeException(nameof(FovBase), "FovBase 必须在 [FovMin, FovMax] 内");
         if (SpringStiffness <= 0f) throw new ArgumentOutOfRangeException(nameof(SpringStiffness));
         if (SpringDamping < 0f) throw new ArgumentOutOfRangeException(nameof(SpringDamping));
+        if (KickScale < 0f) throw new ArgumentOutOfRangeException(nameof(KickScale));
         if (LandingPitchImpulse.Length < 5 || LandingYawImpulse.Length < 5 || LandingRollImpulse.Length < 5)
             throw new ArgumentException("落地冲量数组必须至少 5 项（对应 LandingTier 0..4）");
         if (SlideRollPlayerSpeedRef <= 0f)

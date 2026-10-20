@@ -80,6 +80,7 @@ func _run_all() -> void:
 	await _case_slide_hop_chain()
 	await _case_mantle_classes()
 	await _case_mantle_6m()
+	await _case_climb_gate()
 	await _case_ramp()
 	await _case_vault_wall()
 	await _case_window()
@@ -286,6 +287,69 @@ func _case_mantle_6m() -> void:
 	_press(KEY_W, false)
 
 	_expect_near("6m 攀爬（High 档）", max_feet, EXPECT_MANTLE_H, 0.25)
+	await _frames(40)
+
+
+func _case_climb_gate() -> void:
+	# ── 需求（m00799）：攀爬不许强制触发 ────────────────────────────────
+	# ClimbWall 在 (50, 4, 0)、尺寸 (2, 8, 24) ⇒ 朝玩家那面 x=49，高 8m。
+	# 8m > MantleMaxHeight(6.93m) ⇒ 这个场景连翻越都不该发生，专测攀爬。
+	_release_all()
+	_player.DebugTeleport(44.0, 1.05, 0.0)      # 中心 y=1.05 ⇒ 脚底 ≈ 0
+	_player.DebugSetYaw(PI * 0.5)               # 朝 +X，正对墙（forward(yaw)=(sin,0,-cos)）
+	await _frames(40)
+
+	# ① 站在地面上顶着墙按 W —— 不许进 Climb
+	var seen_climb := false
+	_press(KEY_W, true)
+	for i in range(90):
+		await get_tree().physics_frame
+		if _player.DebugState == "Climb":
+			seen_climb = true
+	var x_blocked: float = _player.global_position.x
+	_expect("地面顶着墙按 W 不触发攀爬（非强制）", not seen_climb,
+		"state=%s" % _player.DebugState)
+	_expect("顶墙被挡住、没有穿墙", x_blocked < 49.0 and _player.DebugFeetY < 0.2,
+		"x=%.3f feetY=%.3f（墙面 x=49.0）" % [x_blocked, _player.DebugFeetY])
+	_press(KEY_W, false)
+	await _frames(20)
+
+	# ② 跑向墙 + 空中按 W ⇒ 必须挂上（面向墙 + 朝墙速度 + 空中）
+	_release_all()
+	_player.DebugTeleport(44.0, 1.05, 0.0)
+	_player.DebugSetYaw(PI * 0.5)
+	await _frames(30)
+	_press(KEY_W, true)
+	await _frames(15)                            # 离墙 ~4m 时起跳，保挂上时仍有朝墙速度
+	_press(KEY_SPACE, true)
+	await _frames(2)
+	_press(KEY_SPACE, false)
+
+	var climb_at := -1
+	for i in range(150):
+		await get_tree().physics_frame
+		if _player.DebugState == "Climb":
+			climb_at = i
+			break
+	_expect("跳跃后贴墙（面向墙 + 朝墙速度）会挂上攀爬", climb_at >= 0,
+		"state=%s x=%.3f" % [_player.DebugState, _player.global_position.x])
+
+	if climb_at >= 0:
+		var feet0: float = _player.DebugFeetY
+		for i in range(45):
+			await get_tree().physics_frame
+		var feet1: float = _player.DebugFeetY
+		_expect("按住 W 持续上爬（0.75s 至少 +0.8m）", feet1 - feet0 > 0.8,
+			"Δfeet=%.3f（ClimbSpeed 2.0 m/s）" % (feet1 - feet0))
+
+		# ③ 松开 W ⇒ 宽限 0.22s 后取消攀爬、开始下落
+		_press(KEY_W, false)
+		await _frames(30)
+		_expect("松开 W 后取消攀爬并下落",
+			_player.DebugState != "Climb" and _player.DebugVerticalSpeed < 0.0,
+			"state=%s vy=%.3f" % [_player.DebugState, _player.DebugVerticalSpeed])
+	else:
+		_press(KEY_W, false)
 	await _frames(40)
 
 

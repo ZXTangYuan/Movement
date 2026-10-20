@@ -111,12 +111,19 @@ public sealed class ApexCameraRig
     /// <summary>直接设定基础 FOV。</summary>
     public void SetBaseFov(float deg) => _cfg.FovBase = Math.Clamp(deg, _cfg.FovMin, _cfg.FovMax);
 
-    /// <summary>手动触发一次视角踢（用于测试 / 受击反馈）。</summary>
+    /// <summary>
+    /// 手动触发一次视角踢（用于测试 / 受击反馈）。
+    ///
+    /// v0.3：所有冲量在**这一个入口**统一乘 <see cref="CameraEffectsConfig.KickScale"/>，
+    /// 于是"整体调小镜头晃动"只需改一个数（需求：镜头晃动过于剧烈）。
+    /// </summary>
     public void AddKick(float pitch, float yaw, float roll)
     {
-        _kickPitchVel += pitch;
-        _kickYawVel += yaw;
-        _kickRollVel += roll;
+        float k = _cfg.KickScale;
+        if (k <= 0f) return;      // 0 = 完全关闭视角踢
+        _kickPitchVel += pitch * k;
+        _kickYawVel += yaw * k;
+        _kickRollVel += roll * k;
     }
 
     /// <summary>
@@ -175,13 +182,14 @@ public sealed class ApexCameraRig
         int idx = (int)s.LandingTier;
         if (idx < 0 || idx >= _cfg.LandingPitchImpulse.Length) return;
 
+        // 统一走 AddKick，保证 KickScale 对所有冲量（落地 + 跳跃）都可调。
+        //
         // 俯仰冲量取负：落地瞬间镜头向下砸一下，然后弹簧把它拉回来。
-        _kickPitchVel -= _cfg.LandingPitchImpulse[idx];
-
-        // 偏航/滚转用确定性的正负交替（不读随机源，保持可复现）
+        // 偏航/滚转用确定性的正负交替（不读随机源，保持可复现）。
         float sign = (s.TickCount & 1) == 0 ? 1f : -1f;
-        _kickYawVel += _cfg.LandingYawImpulse[idx] * sign;
-        _kickRollVel += _cfg.LandingRollImpulse[idx] * sign;
+        AddKick(-_cfg.LandingPitchImpulse[idx],
+                _cfg.LandingYawImpulse[idx] * sign,
+                _cfg.LandingRollImpulse[idx] * sign);
     }
 
     // ───────────────────────── 内部：弹簧积分 ─────────────────────────

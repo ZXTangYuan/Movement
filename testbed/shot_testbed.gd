@@ -152,6 +152,47 @@ func _player_shots() -> void:
 	_save("shot_player_mantle")
 	_press_key(KEY_W, false)
 
+	# ── ⑦⑧⑨ 攀爬 / 扒墙 / 上墙（v0.3 新增）──────────────────────
+	# 用 3.0m 台阶（> AutoMantleMaxHeight 2.032 ⇒ 地面贴墙不会自动翻越，只能走攀爬）：台阶够矮，攀爬时眼睛（脚底 +1.85m）已在台沿之上，画面里能看到
+	# 台面与地平线；又能验证 Hang → Mantle 的完整链路。
+	# 硬证据在 HUD：state=Climb 且 vy=+2.00（只有按住 W 才上爬）。
+	_player.DebugTeleport(6.0, 1.2, 29.5)
+	_player.DebugSetYaw(PI)                       # 朝 +Z，正对 3.0m 台阶（Above 档）
+	await _settle()
+	_press_key(KEY_W, true)
+	await _wait_frames(12)                        # 留出朝墙速度再起跳
+	_press_key(KEY_SPACE, true)
+	await _wait_frames(2)
+	_press_key(KEY_SPACE, false)
+
+	# ⑦ 攀爬中：一进 Climb 就取图（这个台阶只够爬 ~25 tick，等太久会进 Hang）
+	for i in 240:
+		await get_tree().physics_frame
+		if _player.DebugState == "Climb":
+			break
+	await _wait_frames(4)
+	_save("shot_player_climb")
+
+	# ⑧ 扒墙：一进 Hang 立刻松开 W（不松开会当 tick 就转 Mantle），下一帧取图
+	for i in 240:
+		await get_tree().physics_frame
+		if _player.DebugState in ["Hang", "Mantle"]:
+			break
+	_press_key(KEY_W, false)
+	await get_tree().process_frame
+	_save("shot_player_hang")
+
+	# ⑨ 挂边按 W 上墙：站到台面上（Hang → Mantle → Ground）
+	_press_key(KEY_W, true)
+	for i in 240:
+		await get_tree().physics_frame
+		if _player.DebugState == "Ground" and _player.DebugOnGround and _player.DebugFeetY > 2.5:
+			break
+	_press_key(KEY_W, false)                      # 立刻松手，别跑出 4m 台面的远端
+	await _wait_frames(15)
+	print("CLIMB TOP feet=%.2f state=%s" % [_player.DebugFeetY, _player.DebugState])
+	_save("shot_player_climb_top")
+
 
 # ───────────────────────── 工具 ─────────────────────────
 
