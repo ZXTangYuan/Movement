@@ -14,7 +14,7 @@ namespace ApexMovement.GodotBridge;
 ///
 /// 只读查询，不修改物理世界。
 /// </summary>
-public sealed class GodotMovementWorld : IMovementWorld
+public sealed class GodotMovementWorld : IMovementWorld, ISlipWorld
 {
     private readonly PhysicsDirectSpaceState3D _space;
     private readonly uint _collisionMask;
@@ -22,10 +22,156 @@ public sealed class GodotMovementWorld : IMovementWorld
     private readonly PhysicsShapeQueryParameters3D _shapeQuery = new();
     private readonly PhysicsRayQueryParameters3D _rayQuery = new();
 
+    /// <summary>
+    /// 打滑体积（Apex 的 <c>C_TriggerSlipSphere</c> 对应物）。
+    /// 由 <see cref="SetSlipVolumes"/> 注入：任何带 <see cref="CollisionShape3D"/>
+    /// 子节点的 <see cref="Node3D"/> 都行（球 / 盒 / 胶囊）。
+    /// </summary>
+    private readonly System.Collections.Generic.List<SlipVolume> _slipVolumes = new();
+
+    private struct SlipVolume
+    {
+        public Node3D Node;
+        public CollisionShape3D ShapeNode;
+        public float Speed;
+        public float Acceleration;
+        public F3 Direction;       // 已归一化；零 = 用玩家当前水平速度方向
+        public bool LockToPlane;
+    }
+
     public GodotMovementWorld(PhysicsDirectSpaceState3D space, uint collisionMask = 0xFFFFFFFF)
     {
         _space = space;
         _collisionMask = collisionMask;
+    }
+
+    // ═══════════════════════ 打滑体积（ISlipWorld） ═══════════════════════
+
+    /// <summary>
+    /// 注册打滑体积。节点上的可调参数（用 <c>set_meta</c> 或导出属性都行）：
+    /// <list type="bullet">
+    /// <item><c>slip_speed</c>：目标水平速度 m/s（默认 6.0，对应 <c>m_slipSpeed</c>）</item>
+    /// <item><c>slip_accel</c>：逼近加速度 m/s²（默认 30.0，对应 <c>m_slipAcceleration</c>）</item>
+    /// <item><c>slip_dir</c>：推动方向（Vector3；缺省/零向量 = 沿用玩家进入时的水平方向）</item>
+    /// <item><c>slip_lock_plane</c>：是否把垂直速度也抹掉（斜槽用，默认 false）</item>
+    /// </list>
+    /// 一般不用手动调用 —— <see cref="ApexPlayer"/> 会自动收集 <c>slip_volume</c> 组。
+    /// </summary>
+    public void SetSlipVolumes(System.Collections.Generic.IEnumerable<Node3D> volumes)
+    {
+        _slipVolumes.Clear();
+        foreach (Node3D node in volumes)
+        {
+            if (node == null || !GodotObject.IsInstanceValid(node)) continue;
+
+            CollisionShape3D? shapeNode = null;
+            foreach (Node child in node.GetChildren())
+            {
+                if (child is CollisionShape3D cs && cs.Shape != null) { shapeNode = cs; break; }
+            }
+            if (shapeNode == null) continue;
+
+            F3 dir = F3.Zero;
+            if (node.HasMeta("slip_dir"))
+            {
+                Variant v = node.GetMeta("slip_dir");
+                if (v.VariantType == Variant.Type.Vector3) dir = F3.From(v.AsVector3()).Normalized();
+            }
+
+            _slipVolumes.Add(new SlipVolume
+            {
+                Node = node,
+                ShapeNode = shapeNode,
+                Speed = node.HasMeta("slip_speed") ? (float)node.GetMeta("slip_speed").AsDouble() : 6.0f,
+                Acceleration = node.HasMeta("slip_accel") ? (float)node.GetMeta("slip_accel").AsDouble() : 30.0f,
+                Direction = dir,
+                LockToPlane = node.HasMeta("slip_lock_plane") && node.GetMeta("slip_lock_plane").AsBool(),
+            });
+        }
+    }
+
+    /// <summary>当前注册的打滑体积数量（HUD / 自检用）。</summary>
+    public int SlipVolumeCount => _slipVolumes.Count;
+
+    public bool SampleSlip(F3 pos, out SlipSample sample)
+    {
+        sample = default;
+        if (_slipVolumes.Count == 0) return false;
+
+        Vector3 p = pos.ToGodot();
+        bool any = false;
+        float bestSpeed = 0f;
+        float bestAccel = 0f;
+        F3 dirSum = F3.Zero;
+        bool lockPlane = false;
+        Vector3 pushAway = Vector3.Zero;
+
+        for (int i = 0; i < _slipVolumes.Count; i++)
+        {
+            SlipVolume vol = _slipVolumes[i];
+            if (vol.Node == null || !GodotObject.IsInstanceValid(vol.Node)) continue;
+            if (!ContainsPoint(vol, p)) continue;
+
+            any = true;
+            if (vol.Speed > bestSpeed) bestSpeed = vol.Speed;
+            if (vol.Acceleration > bestAccel) bestAccel = vol.Acceleration;
+            if (vol.Direction.LengthSq() > 1e-8f) dirSum += vol.Direction;
+            lockPlane |= vol.LockToPlane;
+
+            // 没配方向时的兜底：从体积中心往外推（对应 C_TriggerSlipSphere
+            // "站进去就被往外挤"的语义）。
+            Vector3 away = p - vol.Node.GlobalTransform.Origin;
+            away.Y = 0f;
+            if (away.LengthSquared() > 1e-6f) pushAway += away;
+        }
+
+        if (!any) return false;
+
+        // 方向优先级：显式配置 > 从中心往外推 > 零（交给求解器用玩家速度兜底）
+        F3 dir;
+        if (dirSum.LengthSq() > 1e-8f) dir = dirSum.Normalized();
+        else if (pushAway.LengthSquared() > 1e-6f) dir = F3.From(pushAway).Normalized();
+        else dir = F3.Zero;
+
+        sample = new SlipSample
+        {
+            Direction = dir,
+            Speed = bestSpeed,
+            Acceleration = bestAccel,
+            LockToPlane = lockPlane,
+        };
+        return true;
+    }
+
+    private static bool ContainsPoint(in SlipVolume vol, Vector3 p)
+    {
+        Transform3D xform = vol.ShapeNode.GlobalTransform;
+        Vector3 local = xform.AffineInverse() * p;
+
+        switch (vol.ShapeNode.Shape)
+        {
+            case SphereShape3D sphere:
+                return local.LengthSquared() <= sphere.Radius * sphere.Radius;
+
+            case BoxShape3D box:
+            {
+                Vector3 half = box.Size * 0.5f;
+                return Mathf.Abs(local.X) <= half.X &&
+                       Mathf.Abs(local.Y) <= half.Y &&
+                       Mathf.Abs(local.Z) <= half.Z;
+            }
+
+            case CapsuleShape3D capsule:
+            {
+                float cylHalf = Mathf.Max(0f, capsule.Height * 0.5f - capsule.Radius);
+                float y = Mathf.Clamp(local.Y, -cylHalf, cylHalf);
+                Vector3 axisPoint = new(0f, y, 0f);
+                return (local - axisPoint).LengthSquared() <= capsule.Radius * capsule.Radius;
+            }
+
+            default:
+                return false;
+        }
     }
 
     private void ConfigureCapsule(float radius, float halfHeight)

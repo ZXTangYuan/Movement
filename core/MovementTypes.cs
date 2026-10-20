@@ -19,6 +19,17 @@ public enum MovementState
     Climb = 6,
     /// <summary>挂边待机（Mantle hang）。</summary>
     Hang = 7,
+    /// <summary>
+    /// 打滑（Slip）。被 <c>C_TriggerSlipSphere</c> 类体积推动时进入：
+    /// 摩擦失效，速度被体积的 speed / acceleration 拽向体积方向。
+    /// </summary>
+    Slip = 8,
+    /// <summary>
+    /// 扒墙 / 悬垂（Wall hang / dangle）。与 <see cref="Hang"/> 不同：
+    /// Hang 是"攀爬到顶的过渡态"，WallHang 是**可停留**的独立状态，
+    /// 支持沿墙上下 / 左右移动，久了会脱手。
+    /// </summary>
+    WallHang = 9,
 }
 
 /// <summary>
@@ -162,6 +173,20 @@ public struct MovementSnapshot
     /// <summary>是否挂在沿上（Mantle hang / 扒墙）。</summary>
     public bool Hanging;
 
+    // ── 打滑 / 扒墙（v0.3 完整版） ──
+    /// <summary>是否处于打滑态（<c>IsSlipping</c>）。</summary>
+    public bool Slipping;
+    /// <summary>打滑体积给的推动方向（水平单位向量）；不在滑区且无可继承方向时为零。</summary>
+    public F3 SlipDirection;
+    /// <summary>离开滑区后的"空中方向限制"剩余时间 (s)（<c>m_slipAirRestrictTime</c>）。</summary>
+    public float SlipAirRestrictRemaining;
+    /// <summary>是否处于扒墙态（<c>IsWallHanging</c>）。</summary>
+    public bool WallHanging;
+    /// <summary>扒墙握力 0..1：1 = 刚挂上，0 = 脱手（<c>m_wallDangleClimbProgressFloor</c> 的手感映射）。</summary>
+    public float WallHangGrip;
+    /// <summary>本次扒墙已持续时间 (s)（<c>m_wallHangTime</c>）。</summary>
+    public float WallHangTime;
+
     // ── 落地事件（供相机晃动） ──
     public LandingTier LandingTier;       // 本 tick 是否发生落地
     public float LandingFallDistance;     // 本次落地的下落高度（米）
@@ -197,4 +222,46 @@ public interface IMovementWorld
     /// 命中返回距离与法线。用于攀爬/翻越的前方探测。
     /// </summary>
     bool Raycast(F3 origin, F3 dir, float maxDist, out F3 hitPoint, out F3 hitNormal);
+}
+
+/// <summary>
+/// 一次打滑采样：由体积（Apex 的 <c>C_TriggerSlipSphere</c>）提供。
+///
+/// **来源**：逆向在 `.rdata` 观测到
+/// <c>DT_TriggerSlipSphere</c> / <c>C_TriggerSlipSphere</c> / <c>trigger_slip_sphere</c>
+/// 与体积上的 <c>m_slipSpeed</c> / <c>m_slipAcceleration</c> / <c>m_defaultSlipDirection</c>；
+/// 玩家身上有 <c>m_touchingSlipTriggersCount</c> 及
+/// <c>m_touchingSlipTriggersSpeed[] / Acceleration[] / Direction[] / Origin[]</c>
+/// 与聚合值（见 docs/reverse-engineering-v0.2.md §5.10）。
+/// 说明它是**世界里的体积**，不是"地面材质"。
+/// </summary>
+public struct SlipSample
+{
+    /// <summary>推动方向（水平、单位向量）。体积未配置方向时用玩家当前水平速度方向。</summary>
+    public F3 Direction;
+
+    /// <summary>目标水平速度 (m/s)（<c>m_slipSpeed</c>）。</summary>
+    public float Speed;
+
+    /// <summary>逼近目标速度的加速度 (m/s²)（<c>m_slipAcceleration</c>）。</summary>
+    public float Acceleration;
+
+    /// <summary>
+    /// 是否把玩家的**垂直**速度也一起抹掉（"滑道/斜槽"式体积）。
+    /// 平地滑区用 false，让重力照常；斜槽用 true。
+    /// </summary>
+    public bool LockToPlane;
+}
+
+/// <summary>
+/// 可选的世界能力：打滑体积采样。
+///
+/// <see cref="IMovementWorld"/> 不加这个方法，是为了**不破坏**已有实现
+/// （测试替身 AnalyticWorld、Godot 桥接层都能只实现基础三件事）。
+/// 求解器用 <c>world is ISlipWorld</c> 探测，没实现就当作"世界里没有滑区"。
+/// </summary>
+public interface ISlipWorld
+{
+    /// <summary>查询 <paramref name="pos"/> 是否落在某个打滑体积内，并给出合成后的推动参数。</summary>
+    bool SampleSlip(F3 pos, out SlipSample sample);
 }

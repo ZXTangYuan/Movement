@@ -132,6 +132,8 @@ public partial class ApexPlayer : Node3D
     public int DebugMantles => _core.MantleCount;
     public int DebugTick => _core.TickCount;
     public string DebugState => _core.State.ToString();
+    /// <summary>HUD 上那一行摘要（截图脚本用来核对"图上数字 == 物理状态"，防止截到半路的旧帧）。</summary>
+    public string DebugHudLine => _hud != null ? _hud.Text : string.Empty;
     public string DebugMantleClass => _core.CurrentMantleClass.ToString();
     public string DebugMantlePhase => _core.CurrentMantlePhase.ToString();
     public string DebugLandingTier => _core.LastLandingTier.ToString();
@@ -158,6 +160,9 @@ public partial class ApexPlayer : Node3D
 
     /// <summary>设定朝向（yaw，弧度）。测试脚本用它对准目标。</summary>
     public void DebugSetYaw(float yaw) => _core.Reset(_core.Position, yaw, _core.Pitch, _core.Up);
+
+    /// <summary>设定俯仰（pitch，弧度，正数抬头）。截图脚本用它把视线压到墙面/地面，制造景深。</summary>
+    public void DebugSetPitch(float pitch) => _core.Reset(_core.Position, _core.Yaw, pitch, _core.Up);
 
     /// <summary>把角色瞬移到指定位置（脚底贴地由物理自然处理）。</summary>
     public void DebugTeleport(float x, float y, float z)
@@ -342,7 +347,12 @@ public partial class ApexPlayer : Node3D
 
         // 2) 物理空间（每次查询前取一次；求解器的所有射线都在 tick 内部完成）
         PhysicsDirectSpaceState3D space = GetWorld3D().DirectSpaceState;
-        if (_world == null) { _world = new GodotMovementWorld(space); _core.BindWorld(_world); }
+        if (_world == null)
+        {
+            _world = new GodotMovementWorld(space);
+            _core.BindWorld(_world);
+            RefreshSlipVolumes();
+        }
 
         // 3) 把本帧时间交给累加器，然后**跑够 60Hz 该跑的 tick 数**
         //
@@ -450,6 +460,25 @@ public partial class ApexPlayer : Node3D
         _pendingLandingTick = -1;
     }
 
+    /// <summary>
+    /// 收集场景里所有 <c>slip_volume</c> 组的节点，注册给世界查询。
+    ///
+    /// 逆向里打滑是 <c>C_TriggerSlipSphere</c> 这类**世界体积**推挤（不是地面材质），
+    /// 所以这里是"场景里放了几个体积就有几个"。随时可以再调一次刷新
+    /// （例如关卡流式加载后）。
+    /// </summary>
+    public void RefreshSlipVolumes()
+    {
+        if (_world == null) return;
+
+        var volumes = new System.Collections.Generic.List<Node3D>();
+        foreach (Node node in GetTree().GetNodesInGroup("slip_volume"))
+        {
+            if (node is Node3D n3) volumes.Add(n3);
+        }
+        _world.SetSlipVolumes(volumes);
+    }
+
     private void UpdateCamera()
     {
         if (_camera == null) return;
@@ -496,14 +525,23 @@ public partial class ApexPlayer : Node3D
         string holster = _holstered ? "收枪" : "持枪";
         string stun = _core.FallStunRemaining > 0.01f ? $"{_core.FallStunRemaining:F2}s" : "-";
 
+        // v0.3 完整版：打滑 / 扒墙 一行摘要
+        string slip = _snapshot.Slipping
+            ? $"SLIP dir={_snapshot.SlipDirection.X:F2},{_snapshot.SlipDirection.Z:F2}"
+            : (_core.IsSlipAirRestricted ? $"restrict {_snapshot.SlipAirRestrictRemaining:F2}s" : "no");
+        string hang = _snapshot.WallHanging
+            ? $"WALLHANG grip={_snapshot.WallHangGrip:F2} t={_snapshot.WallHangTime:F2}s"
+            : "no";
+
         _hud.Text =
             $"state={_core.State}  speed={_core.HorizontalSpeed:F2} m/s  vy={_core.VerticalSpeed:F2}\n" +
             $"ground={_core.OnGround}  crouch={_core.CrouchAmount:F2}  h={_core.CurrentHeight:F2}  {holster}\n" +
             $"fov={_camOut.Fov:F1}°  roll={_camOut.Roll * 180f / Mathf.Pi:F1}°  bobPhase={_snapshot.BobPhase:F2}\n" +
             $"mantle={_core.CurrentMantleClass}/{_core.CurrentMantlePhase}  xBlend={_camOut.TraversalBlend:F2}\n" +
+            $"slip={slip}  hang={hang}\n" +
             $"slideBoost={boost}  slideHops={_core.SlideHopCount}  bhops={_core.BunnyHopCount}  mantles={_core.MantleCount}\n" +
             $"jumpFatigue={fatigue}  fallstun={stun}  tick={_core.TickCount}\n" +
             $"[WASD] move  [Space] jump/climb  [Ctrl] crouch  [Shift] sprint\n" +
-            $"[Shift+Ctrl] slide  [Shift+Ctrl+Space] slide-jump  [H] holster  [ [ / ] ] FOV  [R] reset";
+            $"[Shift+Ctrl] slide  [Shift+Ctrl+Space] slide-jump  [空中贴墙+Ctrl] 扒墙  [H] holster  [ [ / ] ] FOV  [R] reset";
     }
 }

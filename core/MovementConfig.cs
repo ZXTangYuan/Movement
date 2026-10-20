@@ -471,6 +471,123 @@ public sealed class MovementConfig
     /// </summary>
     public int ClimbProbeInterval = 1;
 
+    /// <summary>
+    /// [C] **攀爬到顶探针的抽样间隔**（单位：tick）。默认 **2 = 30 Hz**。
+    ///
+    /// 攀爬期间每 tick 都要打一条"前面还有墙吗"的射线（到顶检测）。它是
+    /// 持续开销（整段攀爬都在跑），而墙顶不会一帧之内消失，抽到 30 Hz 完全够用。
+    /// 攀爬附着探针（<see cref="ClimbProbeInterval"/>）保持 1，因为它是一次性的、
+    /// 且直接决定"贴墙那一瞬抓不抓住"。
+    /// </summary>
+    public int ClimbWallProbeInterval = 2;
+
+    /// <summary>
+    /// [C] **打滑体积采样的抽样间隔**（单位：tick）。默认 **2 = 30 Hz**。
+    ///
+    /// 打滑体积是静态的（关卡里的滑道/冰面），采样频率不影响判定正确性；
+    /// 但它是每 tick 都要问一次世界的持续开销，降到 30 Hz 省一半。
+    /// </summary>
+    public int SlipProbeInterval = 2;
+
+    // ═════════════════ 打滑（Slip / C_TriggerSlipSphere） ═════════════════
+    //
+    // 逆向依据（docs/reverse-engineering-v0.2.md §5.10）：
+    //   体积：DT_TriggerSlipSphere / C_TriggerSlipSphere / trigger_slip_sphere，
+    //         字段 m_slipSpeed / m_slipAcceleration / m_defaultSlipDirection
+    //   玩家：m_touchingSlipTriggersCount / Speed[] / Acceleration[] / Direction[] / Origin[]，
+    //         聚合 m_touchingSlipTriggersSpeed / Acceleration / Direction，
+    //         以及 m_slipAirRestrictTime / m_slipAirRestrictDirection
+    //   全局：slipAirRestrictDuration、slipSpeed、slipAcceleration
+    //
+    // 语义：走到"打滑体积"里 → 摩擦失效、被体积的 speed/accel 拽向体积方向；
+    //       离开体积后 m_slipAirRestrictTime 内，空中转向被限制在离开时的方向附近。
+
+    /// <summary>
+    /// [C] 离开打滑体积后，"空中方向限制"持续多久 (s)（<c>slipAirRestrictDuration</c>，
+    /// 数值未读到，取 0.6s 手感值）。
+    /// </summary>
+    public float SlipAirRestrictDuration = 0.6f;
+
+    /// <summary>
+    /// [C] 记录"离开方向"所需的最小水平速度 (m/s)。太慢（几乎站着）就沿用体积方向，
+    /// 免得记录出一个抖动的零向量。
+    /// </summary>
+    public float SlipMinSpeedToRecordDirection = 1.0f;
+
+    /// <summary>
+    /// [C] 方向限制的**圆锥半角** (deg)。离开滑区后的空中加速只能落在这个圆锥内，
+    /// 而不是完全锁死方向（完全锁死会让玩家觉得"失控"）。
+    /// </summary>
+    public float SlipAirRestrictConeDeg = 35f;
+
+    /// <summary>[C] 打滑态的转向能力（0 = 完全不能转向，1 = 和地面一样）。默认 0.15。</summary>
+    public float SlipSteerFactor = 0.15f;
+
+    // ═════════════════ 扒墙 / 悬垂（Wall hang / dangle） ═════════════════
+    //
+    // 逆向依据（docs/reverse-engineering-v0.2.md §5.11）：
+    //   m_wallHanging / m_wallHangTime / IsWallHanging / m_wallDangleClimbProgressFloor
+    //   ACT_MP_WALLHANG_FRONT / UP / RIGHT / LEFT / IDLE  ← 5 个姿势 = 可上下左右移动
+    //   sound_wallHangStart / Slip / Complete / Fall     ← 挂上 / 下滑 / 完成 / 掉落
+    //   spread_wallhanging                               ← 挂着时仍可射击
+    //   automantle_disable_hang                          ← 自动翻越不允许转 hang
+
+    /// <summary>[C] 是否启用扒墙（关闭后空中按蹲不再抓墙）。</summary>
+    public bool WallHangEnabled = true;
+
+    /// <summary>
+    /// [C] 扒墙是否**必须按住蹲键**。
+    ///
+    /// 默认 true —— 这是"非强制"原则的延续：贴着墙跳一下不该被自动抓成悬垂，
+    /// 玩家必须显式按住 Ctrl 才挂。关掉后变成"空中贴墙自动挂"（不推荐）。
+    /// </summary>
+    public bool WallHangRequiresCrouch = true;
+
+    /// <summary>[A] 扒墙的最大视角偏角 (deg)。与攀爬同源 = arccos(0.7)。</summary>
+    public float WallHangMaxViewAngle = 45.57f;
+
+    /// <summary>[C] 扒墙的前向抓取距离 (m)（在胶囊半径之外还要够到多远）。</summary>
+    public float WallHangReach = 0.9f;
+
+    /// <summary>[C] 沿墙上爬 / 下移的速度 (m/s)（`ACT_MP_WALLHANG_UP`）。</summary>
+    public float WallHangClimbSpeed = 1.0f;
+
+    /// <summary>[C] 沿墙左右横移的速度 (m/s)（`ACT_MP_WALLHANG_LEFT/RIGHT`）。</summary>
+    public float WallHangShimmySpeed = 0.8f;
+
+    /// <summary>[C] 单次扒墙的最长持续时间 (s)（<c>m_wallHangTime</c> 的上限）。</summary>
+    public float WallHangMaxTime = 6.0f;
+
+    /// <summary>
+    /// [C] 松手后的**下滑速度** (m/s)。对应 <c>sound_wallHangSlip</c>：
+    /// 挂着不动会缓慢往下滑，而不是像钉子一样钉住。
+    /// </summary>
+    public float WallHangSlipSpeed = 0.22f;
+
+    /// <summary>
+    /// [C] 累计下滑多少米后脱手（对应 <c>m_wallDangleClimbProgressFloor</c>：
+    /// "能爬升的进度下限"，滑过这条线就抓不住了）。
+    /// </summary>
+    public float WallHangMaxSlipDistance = 1.2f;
+
+    /// <summary>
+    /// [C] 扒墙时按 W 是否能**回补**握力（抵消下滑）。
+    /// 打开后"按 W 往上爬"同时把已经滑下去的进度拉回来，手感更宽容。
+    /// </summary>
+    public bool WallHangClimbRestoresGrip = true;
+
+    /// <summary>
+    /// [C] 是否禁止在"可自动翻越的矮墙"上扒墙。
+    /// 对应 <c>automantle_disable_hang</c>：能自动翻过去就别先挂那儿。
+    /// </summary>
+    public bool WallHangDisableWhenAutoMantleable = true;
+
+    /// <summary>[C] 脱手后再次扒墙的冷却 (s)，避免贴墙连点 Ctrl 反复挂。</summary>
+    public float WallHangReattachCooldown = 0.35f;
+
+    /// <summary>[C] 从扒墙"完成"（翻上去）时给的前推速度 (m/s)（`sound_wallHangComplete`）。</summary>
+    public float WallHangCompleteForwardSpeed = 1.2f;
+
     /// <summary>固定 tick 时长 (s)。</summary>
     public float FixedDelta => 1.0f / TickRate;
 
@@ -564,6 +681,22 @@ public sealed class MovementConfig
         if (FixedDelta <= 0f) throw new ArgumentOutOfRangeException(nameof(TickRate));
         if (TraversalProbeInterval < 1) throw new ArgumentOutOfRangeException(nameof(TraversalProbeInterval));
         if (ClimbProbeInterval < 1) throw new ArgumentOutOfRangeException(nameof(ClimbProbeInterval));
+        if (ClimbWallProbeInterval < 1) throw new ArgumentOutOfRangeException(nameof(ClimbWallProbeInterval));
+        if (SlipProbeInterval < 1) throw new ArgumentOutOfRangeException(nameof(SlipProbeInterval));
+        if (SlipAirRestrictDuration < 0f) throw new ArgumentOutOfRangeException(nameof(SlipAirRestrictDuration));
+        if (SlipAirRestrictConeDeg <= 0f || SlipAirRestrictConeDeg > 180f)
+            throw new ArgumentOutOfRangeException(nameof(SlipAirRestrictConeDeg));
+        if (SlipSteerFactor < 0f || SlipSteerFactor > 1f)
+            throw new ArgumentOutOfRangeException(nameof(SlipSteerFactor));
+        if (WallHangMaxViewAngle <= 0f || WallHangMaxViewAngle >= 90f)
+            throw new ArgumentOutOfRangeException(nameof(WallHangMaxViewAngle));
+        if (WallHangReach <= 0f) throw new ArgumentOutOfRangeException(nameof(WallHangReach));
+        if (WallHangClimbSpeed < 0f) throw new ArgumentOutOfRangeException(nameof(WallHangClimbSpeed));
+        if (WallHangShimmySpeed < 0f) throw new ArgumentOutOfRangeException(nameof(WallHangShimmySpeed));
+        if (WallHangMaxTime <= 0f) throw new ArgumentOutOfRangeException(nameof(WallHangMaxTime));
+        if (WallHangSlipSpeed < 0f) throw new ArgumentOutOfRangeException(nameof(WallHangSlipSpeed));
+        if (WallHangMaxSlipDistance <= 0f) throw new ArgumentOutOfRangeException(nameof(WallHangMaxSlipDistance));
+        if (WallHangReattachCooldown < 0f) throw new ArgumentOutOfRangeException(nameof(WallHangReattachCooldown));
         if (CapsuleRadius <= 0f) throw new ArgumentOutOfRangeException(nameof(CapsuleRadius));
         if (ClimbAttachMaxViewAngle <= 0f || ClimbAttachMaxViewAngle >= 90f)
             throw new ArgumentOutOfRangeException(nameof(ClimbAttachMaxViewAngle));

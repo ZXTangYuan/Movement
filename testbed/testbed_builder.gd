@@ -14,6 +14,7 @@ extends Node3D
 ##   · 贴墙爬（8m 高墙）                  —— Climb 状态：attach offset / end boost
 ##   · 低天花板通道                       —— 蹲下才能进 / 站起被头顶挡住
 ##   · 滑铲长道（80m）                    —— 滑铲距离 / 滑铲跳 / 连续滑铲跳
+##   · 打滑体积（Slip，v0.3 新增）        —— C_TriggerSlipSphere：走进球里被往外推
 ##   · 落差平台（3 / 6 / 10 / 22m）       —— 落地分档 Low/Medium/High/Hard + Fallstun
 ##
 ## 全部几何为 StaticBody3D（静态），保证物理查询在固定 tick 下确定性。
@@ -41,6 +42,7 @@ func _ready() -> void:
 	_build_climb_wall()
 	_build_low_ceiling()
 	_build_slide_lane()
+	_build_slip_zone()
 	_build_drop_platforms()
 	_spawn_player()
 
@@ -301,6 +303,66 @@ func _build_slide_lane() -> void:
 	for i in range(1, 8):
 		_deco_box("SlideMark_%d" % i, Vector3(-70, 0.06, -40.0 + i * 10.0), Vector3(12, 0.05, 0.4),
 			Color(0.95, 0.95, 0.6))
+
+
+## 打滑体积（Slip）：对应逆向里的 C_TriggerSlipSphere。
+##
+## 实现要点（别改成"地面材质"）：它是**世界里的体积**，玩家走进去会被往外推。
+## 节点的 meta 就是配置：
+##   slip_speed      推出的目标水平速度（m/s，Apex 默认 400hu/s ≈ 10.16，这里取 8）
+##   slip_accel      加速到目标速度的加速度（m/s²）
+##   slip_dir        推出方向；留空 = 从体积中心往外推（m_defaultSlipDirection）
+##   slip_lock_plane 是否把速度锁在水平面（贴地滑道 = true）
+## 必须在 "slip_volume" 组里 —— ApexPlayer 按组名收集（见 RefreshSlipVolumes）。
+func _build_slip_zone() -> void:
+	const X := 80.0
+	const Z := 0.0
+	const RADIUS := 7.0
+
+	var vol := Node3D.new()
+	vol.name = "SlipZone"
+	vol.position = Vector3(X, RADIUS * 0.5, Z)
+	vol.add_to_group("slip_volume")
+	vol.set_meta("slip_speed", 8.0)
+	vol.set_meta("slip_accel", 40.0)
+	vol.set_meta("slip_dir", Vector3(0, 0, 1))     # 往 +Z 推
+	vol.set_meta("slip_lock_plane", true)
+
+	# 体积本身（球）——只用碰撞形状，不参与移动扫掠
+	var shape := CollisionShape3D.new()
+	var sphere := SphereShape3D.new()
+	sphere.radius = RADIUS
+	shape.shape = sphere
+	vol.add_child(shape)
+
+	# 可视化：地面上的一片半透明"水洼"，**不要**画整颗球。
+	# 画球壳会导致第一人称截图整屏泛绿（相机在球内，看到的都是半透明面），
+	# 既看不清场地也看不出角色在动。功能判定用的是上面的 SphereShape3D，
+	# 视觉只需要标出"踩进这个圈就会被推"。
+	var disc := MeshInstance3D.new()
+	var disc_mesh := CylinderMesh.new()
+	disc_mesh.top_radius = RADIUS
+	disc_mesh.bottom_radius = RADIUS
+	disc_mesh.height = 0.04
+	disc_mesh.radial_segments = 48
+	disc.position = Vector3(X, 0.03, Z)
+	disc.mesh = disc_mesh
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(0.25, 0.85, 0.45, 0.45)
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	disc.material_override = mat
+	disc.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	add_child(disc)
+
+	add_child(vol)
+
+	# 地面上标一圈参考色，方便看清"推进方向"
+	_deco_box("SlipMarkIn", Vector3(X, 0.03, Z - RADIUS - 2.0),
+		Vector3(6, 0.06, 1.0), Color(0.95, 0.95, 0.4))
+	_deco_box("SlipMarkOut", Vector3(X, 0.03, Z + RADIUS + 2.0),
+		Vector3(6, 0.06, 1.0), Color(0.95, 0.4, 0.4))
 
 
 func _build_drop_platforms() -> void:

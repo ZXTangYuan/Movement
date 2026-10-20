@@ -32,7 +32,11 @@ public partial class DeterminismTestRunner : Node
         (bool climbPass, string climbReport) = ClimbTest.Run();
         GD.Print(climbReport);
 
-        bool all = detPass && featurePass && camPass && climbPass;
+        GD.Print("=== v0.3 打滑 / 扒墙 ===");
+        (bool slipHangPass, string slipHangReport) = SlipHangTest.Run();
+        GD.Print(slipHangReport);
+
+        bool all = detPass && featurePass && camPass && climbPass && slipHangPass;
         GD.Print(all
             ? "=== APEX MOVEMENT SELFTEST PASS ==="
             : "=== APEX MOVEMENT SELFTEST FAIL ===");

@@ -33,6 +33,10 @@ v0.3 的两个主打变化：**攀爬不再是被动吸入**（必须同时满�
 | **面向墙 + 在空中 + 有朝墙速度** | **挂上墙（`Climb` 状态）**：视角夹角 ≤ 45.57°、朝墙速度 ≥ 0.5 m/s、且必须在空中 |
 | 挂墙后按住 `W` | 以 2 m/s 上爬；**松开 0.22s 就取消攀爬、开始下落** |
 | 爬到墙顶（有台面） | 补爬 0.35m 进入 `Hang` 扒墙，再按 `W` 上墙 |
+| **贴墙 + 按住 `Ctrl`** | **独立扒墙（`WallHang` 状态）**：空中贴墙按住蹲才挂（非强制）。能自动翻越的矮墙不挂 |
+| 挂墙中 `W` / `A` `D` / 不动 | 上爬 ≈1 m/s（并回补握力）/ 横移 ≈0.8 m/s / 缓慢下滑（掉握力） |
+| 挂墙中 `Space` / 松 `Ctrl` | 蹬墙跳（离墙 + 向上）/ 直接松手 |
+| **走进打滑体积** | **打滑（`Slip` 状态）**：被地面方向推着滑到 8 m/s；蹲下优先转滑铲、按跳优先起跳 |
 | `H` | 收枪 / 持枪切换（收枪 = ×1.15 速度） |
 | `[` / `]` | FOV −2° / +2° |
 | `R` | 回到出生点 |
@@ -67,6 +71,8 @@ v0.3 的两个主打变化：**攀爬不再是被动吸入**（必须同时满�
 | 攀爬 Attach offset / End boost | 2.54 m（100 hu）/ 0.7112 m（28 hu） | wiki Climb |
 | 可越过台阶 | 0.762 m（30 hu） | wiki Ground（overwalkable） |
 | Fallstun | 7.62 m（300 hu）起算 → 20.32 m（800 hu）满值 1 s，二次曲线 | wiki Fallstun |
+| 打滑速度 / 方向限制锥 | 8 m/s / 35° | **C 级手感参数**（逆向只证明 `slipSpeed`、`m_slipAirRestrictDirection` 字段存在） |
+| 扒墙爬升 / 横移 / 下滑 | 1.0 / 0.8 / 0.22 m/s；握力上限 6 s | **C 级手感参数**（对应 `ACT_MP_WALLHANG_*`、`sound_wallHangSlip`） |
 
 **`Legacy` 预设**：v0.1 的口径（行走 5.4 / 冲刺 ×1.37 = 7.4 / 攀爬 6.5 / 跳跃 1.15）。
 在 `ApexPlayer.ConfigPreset` 里一行切换。
@@ -96,11 +102,13 @@ GODOT="D:/Godot/Godot_4.7_stable_mono/Godot_v4.7-stable_mono_win64_console.exe"
 # 截图（需要窗口/真实渲染）
 "$GODOT" --path . --rendering-driver vulkan --resolution 1920x1080 \
          res://addons/apex_movement/testbed/shot_testbed.tscn
-# 出 17 张图到 user://shot_*.png：
-#   8 张自由机位（overview / ramps / mantle_steps / vault_walls /
-#                  window_frames / climb_wall / slide_lane / drop_plats）
-#   9 张玩家第一人称（fp / fov110 / fov70 / walking / slide / mantle /
-#                    climb / hang / climb_top ← 后三张是 v0.3 新增）
+# 出 20 张图到 user://shot_*.png：
+#   9 张自由机位（overview / ramps / mantle_steps / vault_walls / window_frames /
+#                  climb_wall / slide_lane / drop_plats / slip_zone）
+#  11 张玩家视角（fp / fov110 / fov70 / walking / slide / mantle /
+#                  climb / hang / climb_top / slip / wallhang）
+#   ← climb / hang / climb_top 是 v0.3 攀爬三阶段；slip / wallhang 是 v0.3 打滑与扒墙
+#   wallhang 是唯一的第三人称图（第一人称贴墙只有一片墙，看不出挂点）
 #   HUD 会打印当时的 fov / roll / state —— 这是相机效果的视觉证据
 ```
 
@@ -116,8 +124,8 @@ GODOT="D:/Godot/Godot_4.7_stable_mono/Godot_v4.7-stable_mono_win64_console.exe"
 core/                        ← 纯 C#，不引用 Godot（可脱离引擎单元测试）
   F3.cs                       确定性三维向量（标量 float，不走 SIMD）
   MovementConfig.cs           全部参数 + 证据等级 + Apex/Legacy 双预设
-  MovementTypes.cs            状态/翻越档位/落地档位/输入/快照/世界接口
-  ApexMovementCore.cs         求解器（状态机 + 加速/摩擦/跳跃/滑铲/翻越/攀爬/疲劳/Fallstun）
+  MovementTypes.cs            状态/翻越档位/落地档位/输入/快照/世界接口（含 ISlipWorld 打滑探针）
+  ApexMovementCore.cs         求解器（状态机 + 加速/摩擦/跳跃/滑铲/翻越/攀爬/打滑/扒墙/疲劳/Fallstun）
   ApexTickClock.cs            固定 tick 累加器（含死亡螺旋防护）
 
 camera/                      ← 纯 C#，相机效果（可脱离引擎单元测试）
@@ -125,7 +133,7 @@ camera/                      ← 纯 C#，相机效果（可脱离引擎单元�
   ApexCameraRig.cs            每帧算出 FOV / roll / pitch-yaw 偏移 / 眼位偏移
 
 godot_bridge/
-  GodotMovementWorld.cs       IMovementWorld 的 Godot 实现（CastMotion / GetRestInfo / Raycast）
+  GodotMovementWorld.cs       IMovementWorld + ISlipWorld 的 Godot 实现（CastMotion / GetRestInfo / Raycast / SampleSlip）
 
 player/
   ApexPlayer.cs               玩家节点：输入累积 + 固定 tick 驱动 + 相机应用 + HUD
@@ -142,6 +150,7 @@ tests/
   FeatureTest.cs              36 项功能断言（纯数学）
   CameraTest.cs               23 项相机断言（纯数学）
   ClimbTest.cs                29 项攀爬/tick/探针断言（纯数学）
+  SlipHangTest.cs             34 项打滑/扒墙断言（纯数学）
   determinism_test.tscn       自检 A 入口
   integration_test.gd/.tscn   44 项真实物理集成断言（自检 B）
 ```
@@ -205,15 +214,37 @@ v0.2 的攀爬是"只要在空中按着 W 贴着墙就被吸上去，吸上就�
 | 走路 bob | 0.035 m / 0.022 m / 0.35° / 0.30° | 0.026 m / 0.016 m / 0.24° / 0.20°（实测移动峰值 0.0281 m） |
 | `KickScale` | 无 | 新增总倍率（0 = 关掉所有视角踢；落地踢与手动踢都受它控制） |
 
-**④ v0.3 逆向补充**
+**④ 打滑态 Slip（对应逆向字段 `slipSpeed` / `IsSlipping` / `m_slipAirRestrictTime` / `m_slipAirRestrictDirection`）**
 
-- 攀爬常量与 wiki 对齐：attach offset **100 hu**、climb 空间 cutoff **147 hu**、end boost **28 hu**、
-  attach 视角容差 **45.57°** = arccos(0.7)、可攀墙面角度 > **45.572°**。
-- 逆向新发现、但**本轮未实现**的两套机制（v0.4 候选）：打滑态
-  `slipSpeed` / `IsSlipping` / `m_slipAirRestrictTime` / `m_slipAirRestrictDirection`；
-  以及独立扒墙（dangle）状态机
-  `wallhang` / `m_wallHanging` / `IsWallHanging` / `automantle_disable_hang` / `ACT_MP_WALLHANG_*` / `sound_wallHang*`。
-  注意：v0.3 的 `Hang` 是"攀爬到顶后的过渡态"，**不是**这套 dangle 机器。
+新增 `MovementState.Slip` 与 `ISlipWorld` 探针接口：场景里放一个 `Node3D` 打滑体积
+（`add_to_group("slip_volume")` + 子 `CollisionShape3D`），角色进入就被地面方向推着滑走。
+
+| 项 | 行为 |
+|---|---|
+| 进入 | 探针命中打滑体积 ⇒ `Slip`。**只覆盖地面态**：蹲下优先转 `Slide`、按跳优先转 `Air`，环境不抢玩家状态 |
+| 速度 | 沿体积方向加速到 `SlipSpeed`（默认 8 m/s，实测 8.00）；方向由体积给，没配方向时**从体积中心往外推**（对应 `C_TriggerSlipSphere` 的"站进去被挤出去"） |
+| 方向限制 | 空中时用 `SlipAirRestrictConeDeg`（默认 35°）把速度压进以原方向为轴的圆锥，`m_slipAirRestrictTime` 计时结束后衰减到 0；纯数学部分 `ClampToCone` 已开放为 `public static` 供自检验证 |
+| 垂直方向 | `LockToPlane` 只压掉**向上**分量（`if (upVel > 0f) _vel -= _up * upVel`），重力照常 ⇒ 空中进滑区会正常落地，**不会悬空**（这条是自检抓出来的真实 bug，见第 7 节） |
+| 探测频率 | `SlipProbeInterval = 2` ⇒ 60 Hz tick 下 30 Hz 采样（实测 60 tick 只采样 30 次） |
+
+**⑤ 独立扒墙 WallHang（对应逆向字段 `wallhang` / `m_wallHanging` / `IsWallHanging` / `automantle_disable_hang` / `ACT_MP_WALLHANG_*` / `sound_wallHang*`）**
+
+v0.3 早先的 `Hang` 只是"攀爬到顶后的过渡态"。本轮新增真正独立的 `MovementState.WallHang`：
+
+| 项 | 行为 |
+|---|---|
+| 触发 | **非强制**：空中 + 贴墙 + **按住蹲键**才挂（`automantle_disable_hang` 语义：能自动翻越的矮墙不挂）。松蹲立刻松手 |
+| 姿态 | 速度恒为 0（`speed=0.00` / `vy=0.00`），身体贴到墙面（离墙 = 半径 + 皮肤，实测 z=-1.574） |
+| 握力 | `WallHangGrip` 从 1.0 开始消耗（HUD `grip=`），耗尽自动脱手；按 `W` 上爬会回补（`m_wallDangleClimbProgressFloor` 语义，实测 0.81 → 0.90） |
+| 移动 | 按 `W` 沿墙上爬 ≈1 m/s；按 `A`/`D` 横移 ≈0.8 m/s（`ACT_MP_WALLHANG_LEFT/RIGHT`）；不动则缓慢下滑（`sound_wallHangSlip`，实测 0.22 m） |
+| 脱手 | 松蹲 / 握力耗尽 / 超 `WallHangMaxTime`(6 s) / 甩视角超过 `WallHangMaxViewAngle`(45.57°) / 按跳（蹬墙跳，实测 vz=2.69 vy=6.15） |
+| 重复挂 | `_wallHangNeedRelease` 门闩：脱手后必须"离开墙面一次"才能再挂，否则按住蹲的玩家会在冷却一过被立刻抓回去，`m_wallHangTime` 永远走不到上限 |
+| 探测频率 | 不按蹲时提前返回，**零射线开销**；按住蹲时每 tick 探（实测 40 tick 探 40 次） |
+
+**⑥ v0.3 逆向补充（常量对齐）**
+
+攀爬常量与 wiki 对齐：attach offset **100 hu**、climb 空间 cutoff **147 hu**、end boost **28 hu**、
+attach 视角容差 **45.57°** = arccos(0.7)、可攀墙面角度 > **45.572°**。
 
 ### 6.2 v0.2 相比 v0.1 的机制变化
 
@@ -241,7 +272,35 @@ v0.2 的攀爬是"只要在空中按着 W 贴着墙就被吸上去，吸上就�
 
 ## 7. 本轮修掉的真实 bug（根因均已实测确认）
 
-### v0.3 新增：⑧ ⑨ ⑩
+### v0.3 新增：⑧ ⑨ ⑩ ⑪ ⑫
+
+#### ⑪ 打滑态把垂直速度整体归零 —— 空中进滑区永远落不了地，悬在离地 22cm
+
+`StepSlip` 的 `LockToPlane` 分支写的是 `_vel -= _up * F3.Dot(_vel, _up)` —— 这行把**垂直分量整体**
+（含向下的重力速度）抹掉，于是空中进打滑体积后既下不去也上不来；同时贴地探测
+（`Sweep` 向下 0.1 m）因为角色悬空 22cm 而永远打空。
+症状很有迷惑性：HUD 明写 `state=Slip`，但 `ground=False`、`feet=0.22` —— 数值上看"在打滑"，
+画面里人浮在半空。修法：只压掉**向上**分量
+
+```csharp
+float upVel = F3.Dot(_vel, _up);
+if (upVel > 0f) _vel -= _up * upVel;      // 只杀向上，保留下落
+```
+
+并把重力 / `MaxFallSpeed` 处理从 `else if (!_onGround)` 提到独立 `if (!_onGround)`，
+让 `LockToPlane` 与空中都走重力分支。回归断言："贴地滑道上仍然踩在地上（ground=True，不悬空）"
+→ 实测 `OnGround=True feet=0.001`。
+
+#### ⑫ 截图抓帧落后于物理 tick —— 图上是 3.00 m/s，控制台是 8.00 m/s
+
+`_save()` 里 `await RenderingServer.frame_post_draw` **只等一次**就 `get_texture().get_image()`，
+Vulkan 下拿到的可能是"已提交但还没显示"的旧帧。而 HUD 文本在 `_Process` 里刷新、又比物理 tick
+慢一拍 ⇒ PNG 上的 `speed=3.00` 与控制台 `speed=8.00` 对不上，视觉复核会得出错误结论。
+修法：等**两次** `frame_post_draw` 再抓；所有 `_save(...)` 改成 `await _save(...)`；
+`_save` 里打印抓帧前后两份 HUD 文本（`HUD@capture:` / `HUD@after:`）做交叉核对。
+修完两份都是 `state=Slip speed=8.00 vy=0.00 ground=True`。
+
+> 这条不是插件 bug，但**会让人误判插件有 bug** —— 所以同样记在这里。
 
 #### ⑧ 攀爬贴墙代码从未生效 —— 点积符号写反
 
@@ -344,7 +403,7 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
 
 ## 8. 自检结果（实测）
 
-### A. 确定性 + 功能 + 相机 + 攀爬/tick/探针（`determinism_test.tscn`，88 项断言）
+### A. 确定性 + 功能 + 相机 + 攀爬/tick/探针 + 打滑/扒墙（`determinism_test.tscn`，122 项断言）
 
 ```
 === 跨帧率确定性 ===
@@ -384,6 +443,20 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
   同一面墙爬过后不能在同一高度以上立刻重附着
   tick：TickRate=60 / FixedDelta=1/60 / 30fps 每帧 2 tick / 144fps 10s=599 tick / 卡顿最多补 4
   探针：TraversalProbeInterval=2（60 tick 只探 30 次）/ ClimbProbeInterval=1
+
+=== v0.3 打滑 / 扒墙（34 项，全 PASS）===
+  打滑：进球 → Slip；速度拉到 8.00 m/s；方向 = 体积方向(+X)；HUD Slipping=True
+        贴地滑道上仍踩在地上（OnGround=True feet=0.001，**不悬空**）
+        没配方向 → 从球心往外推（vx=6.00）；滑出体积回 Ground
+        方向限制计时器自行衰减到 0；ClampToCone 三例（内→原样 / 90°外→35.00° / 反向→退回轴）
+        滑区里蹲 → Slide（speed=8.87）/ 滑区里跳 → Air（vy=7.69）
+        探针 SlipProbeInterval=2，60 tick 只采样 30 次
+  扒墙：不按蹲不挂；按蹲+贴墙 → WallHang（speed=0.00 vy=0.00，贴墙 z=-1.574，grip=0.99）
+        松蹲 → Air；W 上爬 Δy=1.00；D 横移 Δx=0.80；不动下滑 Δy=0.22（grip=0.81）
+        握力耗尽脱手；W 回补 grip 0.81→0.90；超 WallHangMaxTime(6s) 脱手
+        按跳 → 蹬墙跳（vz=2.69 vy=6.15）；甩视角 90° → 松手
+        矮墙(1.5 < AutoMantleMaxHeight 2.03)不挂（automantle_disable_hang）；离墙 2.5m 挂不上
+        探针：不按蹲零开销；按住蹲 40 tick 探 40 次
 
 === APEX MOVEMENT SELFTEST PASS ===
 ```
@@ -427,6 +500,7 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
 | 贴墙爬墙 | x=50, z∈[-12,12]，高 8m | Climb 状态 / attach offset / end boost |
 | 低天花板 | x=-60, z∈[15,25]，净高 1.1m | 蹲下才能进 / 站起被头顶挡住 |
 | 滑铲长道 | x=-70, 80m 带 10m 刻度 | 滑铲距离 / 连续滑铲跳 |
+| 打滑体积 | x=80, z∈[-7,7]，半径 7m（`slip_volume` 组） | Slip 状态 / 方向限制 / 滑出回 Ground |
 | 落差平台 | x∈[20,44], z=55，高 3/6/10/22m | 落地四档 + Fallstun |
 
 ---
@@ -443,8 +517,8 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
 | 7 种 MANTLE 分类 | 二进制里有 **10 个** `ACT_VM_MANTLE_*`（4 主档 × 蹲姿变体 + IDLE + JUMPOFF）。本插件实现 4 档 + grab/pull 两段 + 可选挂边，**蹲姿变体未实现** |
 | Superglide / Wallbounce / Wallrun / 滑索 / 钩爪 / Tap strafe / Lurch | **未实现**（不在本次需求内）。逆向字段（`superjump*`、`wallrun_*`、`zipline*`、`grapple*`）已记录在 `docs/reverse-engineering-v0.2.md`，v0.3 可直接接 |
 | `ClimbNoInputGrace = 0.22s` / `ClimbHangApproachDistance = 0.35m` | **自研手感参数**（C 级）。wiki 只说"向上爬 untimed、静止 1s 才脱离"，没给松手宽限；0.22 s 是为了"点一下 W 也能爬一小段"而不至于一松手就掉 |
-| 打滑态（`slipSpeed` / `IsSlipping` / `m_slipAirRestrictTime`） | **逆向已确认但本轮未实现**（v0.4 候选） |
-| 独立扒墙 / dangle 状态机（`wallhang` / `IsWallHanging` / `ACT_MP_WALLHANG_*`） | **逆向已确认但本轮未实现**；v0.3 的 `Hang` 只是攀爬到顶的过渡态 |
+| 打滑态（`slipSpeed` / `IsSlipping` / `m_slipAirRestrictTime`） | **已实现**（见 6.1 ④）。`SlipSpeed` / `SlipAirRestrictConeDeg` 是 C 级手感参数 —— 逆向只证明字段存在，具体数值读不到 |
+| 独立扒墙 / dangle 状态机（`wallhang` / `IsWallHanging` / `ACT_MP_WALLHANG_*`） | **已实现**（见 6.1 ⑤）。`WallHangGrip` 消耗/回补速率、`WallHangMaxTime` 为 C 级手感参数 |
 | 移动平台速度继承 | **未实现**（需求范围外） |
 | 动画 | 无（纯物理位移 + 相机效果） |
 
@@ -452,7 +526,7 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
 
 ## 11. 截图（逐张视觉复核过）
 
-**17 张 1920×1080**，全部位于 [`../../docs/reference/apex_movement/`](../../docs/reference/apex_movement/)。
+**20 张 1920×1080**，全部位于 [`../../docs/reference/apex_movement/`](../../docs/reference/apex_movement/)。
 每张第一人称图的 HUD 会打印当时的 `fov / roll / state / vy / xBlend`，可对着数字核验。
 
 | 文件 | 内容 | 图上可核验的数字 |
@@ -474,8 +548,18 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
 | `shot_player_climb.png` | **v0.3 攀爬状态**（3m 台阶，Above 档） | `state=Climb`、`speed=0.00`、`vy=2.00` —— 静止水平 + 只有按 W 才 2 m/s 上爬 |
 | `shot_player_hang.png` | **v0.3 扒墙**（补爬结束挂边） | `state=Hang`、`speed=0.00`、`vy=0.00` —— 挂住不自己动 |
 | `shot_player_climb_top.png` | **v0.3 挂边上墙**（站到 3m 台面） | `state=Ground`，控制台同时打印 `CLIMB TOP feet=3.00` |
+| `shot_slip_zone.png` | **v0.3 打滑场地**（地面绿色圆盘 + 进出参考色条） | HUD `slip=no hang=no`（玩家不在圈内） |
+| `shot_player_slip.png` | **v0.3 打滑态**（站在圆盘里被推着走） | `state=Slip`、`speed=8.00`、`ground=True`、`slip=SLIP dir=0.00,1.00` |
+| `shot_player_wallhang.png` | **v0.3 扒墙**（第三人称看挂点与高度） | `state=WallHang`、`speed=0.00`、`vy=0.00`、`hang=WALLHANG grip=0.95 t=0.25s` |
 
-> 三张 v0.3 新图是同一条链路的三个阶段：**挂墙 → 爬 → 补爬 → Hang → 按 W 上墙**。
+> 攀爬三张（`climb` / `hang` / `climb_top`）是同一条链路的三个阶段：
+> **挂墙 → 爬 → 补爬 → Hang → 按 W 上墙**。
+>
+> `shot_player_wallhang.png` 是**唯一的第三人称图**：第一人称挂在墙上时脸离墙面只有 0.43 m，
+> 且 `WallHangMaxViewAngle`(45.57°) 限制视线偏离法线，无论怎么调都只能看到一片墙。
+> 为此截图脚本临时生成一个**纯视觉**胶囊替身（`_build_proxy()`，无碰撞体、不参与移动），
+> 按玩家真实位置同步后拍完即隐藏。
+>
 > 全部由 `testbed/shot_testbed.gd` 自动驱动按键与相机，不是摆拍。
 
 ---
@@ -485,5 +569,7 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
 - [`docs/wiki-reference.md`](docs/wiki-reference.md) —— **社区 wiki 数值换算表**（1hu=2.54cm、速度表、机制说明，每条带来源 URL）
 - [`docs/reverse-engineering-v0.2.md`](docs/reverse-engineering-v0.2.md) —— **本轮逆向报告**（相机/FOV/晃动/翻越/滑铲/攀爬字段的 A 级证据 + 复现命令）
 - [`docs/reverse-engineering.md`](docs/reverse-engineering.md) —— v0.1 逆向报告（PE 布局 / cvar 注册点 / 7 种 MANTLE 枚举）
+- [`docs/selftest/v0.3-determinism.txt`](docs/selftest/v0.3-determinism.txt) —— **自检 A 实测原始输出**（122 项，逐条 PASS）
+- [`docs/selftest/v0.3-integration.txt`](docs/selftest/v0.3-integration.txt) —— **自检 B 实测原始输出**（44 项，逐条 PASS）
 - `../../docs/design/PLUGIN-CONVENTION.md` —— 插件化开发约定
 - 截图：[`../../docs/reference/apex_movement/`](../../docs/reference/apex_movement/)

@@ -3,7 +3,7 @@ using System;
 namespace ApexMovement.Core;
 
 /// <summary>
-/// Apex 风格移动求解器 v0.2 —— **固定 tick 确定性**实现。
+/// Apex 风格移动求解器 v0.3 —— **固定 tick 确定性**实现。
 ///
 /// ## 与 Apex 原版的关系
 /// Apex（Source 2 / Titanfall 谱系）按**渲染帧**积分：两次画面帧之间的输入动量会叠加，
@@ -30,6 +30,18 @@ namespace ApexMovement.Core;
 /// | Fallstun | 无 | **有**（300hu→800hu 二次曲线） |
 /// | 蹲下收缩方向 | 一律脚底锚定 | **地面向下缩 / 空中向中间缩**（slidehop vs bhop 差异根因） |
 /// | 落地分档 | 无 | **Low/Medium/High/Hard**（供相机晃动） |
+///
+/// ## v0.3 相比 v0.2 的机制变化
+///
+/// | 机制 | v0.2 | v0.3 |
+/// |---|---|---|
+/// | 攀爬触发 | 空中 + `MoveZ > 0.3`（贴墙就吸） | **四条件**：空中 + 面向墙（≤45.57°）+ 朝墙速度 ≥0.5 + 不重复附着 |
+/// | 攀爬上升 | 无条件爬到顶 | **必须按 W**（2 m/s）；松手 0.22 s 取消 |
+/// | 翻越触发 | 无输入门槛 | `MoveZ > 0.3`（wiki：mantle grab 需要指向墙面的输入） |
+/// | 打滑态 | 无 | **`Slip`**：环境体积把角色沿地面方向推到 `SlipSpeed`；空中方向限制进 35° 圆锥 |
+/// | 扒墙态 | 无（`Hang` 只是攀爬到顶的过渡） | **`WallHang`**：贴墙 + 按蹲才挂（非强制），有握力 / 爬升 / 横移 / 下滑 / 蹬墙跳 |
+/// | tick 基准 | 跟随引擎物理频率 | **固定 60/s**（`PinnedTickRate`），由 `ApexTickClock` 折算 |
+/// | 昂贵探针 | 每 tick | `TraversalProbeInterval` / `SlipProbeInterval` 可降到 30 Hz |
 ///
 /// ## 参考的引擎公式（Source 谱系，本实现沿用）
 /// - 加速：<c>accelSpeed = accel × dt × wishSpeed</c>，并夹到 <c>addSpeed</c>
@@ -111,6 +123,34 @@ public sealed class ApexMovementCore
     private int _traversalProbeCount;
     /// <summary>攀爬探针实际执行次数（自检用）。</summary>
     private int _climbProbeCount;
+
+    // ── 打滑（Slip） ──
+    /// <summary>当前所在滑区的推动参数（缓存，供抽样间隙复用，避免状态抖动）。</summary>
+    private SlipSample _slipSample;
+    /// <summary>缓存的滑区采样是否有效（上一次探针的结果）。</summary>
+    private bool _slipSampleValid;
+    /// <summary>离开滑区后的空中方向限制剩余时间 (s)（<c>m_slipAirRestrictTime</c>）。</summary>
+    private float _slipAirRestrictTimer;
+    /// <summary>空中方向限制的基准方向（<c>m_slipAirRestrictDirection</c>）。</summary>
+    private F3 _slipAirRestrictDir = F3.Zero;
+    /// <summary>滑区采样探针实际执行次数（自检用）。</summary>
+    private int _slipProbeCount;
+
+    // ── 扒墙 / 悬垂（WallHang） ──
+    private float _wallHangTime;
+    private float _wallHangSlip;
+    private float _wallHangCooldown;
+    private F3 _wallHangNormal = F3.Zero;
+    private F3 _wallHangLastHit;
+    /// <summary>
+    /// 脱手后"必须先离开墙面一次才能再挂"的门闩。
+    /// 没有它，按住蹲的玩家会在同一位置反复「抓住 → 滑落/超时脱手 → 再抓住」。
+    /// </summary>
+    private bool _wallHangNeedRelease;
+    /// <summary>扒墙探针实际执行次数（自检用）。</summary>
+    private int _wallHangProbeCount;
+    /// <summary>攀爬到顶探针实际执行次数（自检用：验证 30 Hz 抽样）。</summary>
+    private int _climbWallProbeCount;
 
     // ── 跳跃辅助 ──
     private bool _justJumped;
@@ -234,6 +274,14 @@ public sealed class ApexMovementCore
             : 0f,
         ClimbApproaching = _climbApproaching,
         Hanging = _state == MovementState.Hang,
+        Slipping = _state == MovementState.Slip,
+        SlipDirection = _slipSampleValid ? _slipSample.Direction : F3.Zero,
+        SlipAirRestrictRemaining = _slipAirRestrictTimer,
+        WallHanging = _state == MovementState.WallHang,
+        WallHangGrip = _state == MovementState.WallHang
+            ? MathF.Max(0f, 1f - _wallHangSlip / MathF.Max(1e-4f, _cfg.WallHangMaxSlipDistance))
+            : 0f,
+        WallHangTime = _state == MovementState.WallHang ? _wallHangTime : 0f,
         BobPhase = _bobPhase,
         TickCount = _tickCount,
     };
@@ -274,6 +322,16 @@ public sealed class ApexMovementCore
         _lastClimbAttachY = 0f;
         _lastClimbWallNormal = F3.Zero;
         _hasClimbed = false;
+        _slipSample = default;
+        _slipSampleValid = false;
+        _slipAirRestrictTimer = 0f;
+        _slipAirRestrictDir = F3.Zero;
+        _wallHangTime = 0f;
+        _wallHangSlip = 0f;
+        _wallHangCooldown = 0f;
+        _wallHangNormal = F3.Zero;
+        _wallHangLastHit = F3.Zero;
+        _wallHangNeedRelease = false;
         _jumpBuffered = false;
         _jumpBufferTimer = 0f;
         _coyoteTimer = 0f;
@@ -332,6 +390,8 @@ public sealed class ApexMovementCore
         if (_jumpBufferTimer > 0f) { _jumpBufferTimer -= dt; if (_jumpBufferTimer <= 0f) _jumpBuffered = false; }
         if (_coyoteTimer > 0f) _coyoteTimer -= dt;
         if (_timeSinceLanded < 900f) _timeSinceLanded += dt;
+        if (_slipAirRestrictTimer > 0f) _slipAirRestrictTimer = MathF.Max(0f, _slipAirRestrictTimer - dt);
+        if (_wallHangCooldown > 0f) _wallHangCooldown = MathF.Max(0f, _wallHangCooldown - dt);
 
         if (input.JumpPressed) { _jumpBuffered = true; _jumpBufferTimer = _cfg.JumpBufferTime; }
 
@@ -349,8 +409,24 @@ public sealed class ApexMovementCore
             return;
         }
 
+        // 4b) 扒墙 / 悬垂期间独占推进（位置是运动学积分，不需要 MoveWithCollision）
+        if (_state == MovementState.WallHang)
+        {
+            StepWallHang(input, dt);
+            return;
+        }
+
         // 5) 蹲伏插值（含"空中向中间缩"的处理）
         UpdateCrouch(input, dt);
+
+        // 5b) 打滑体积采样 → 进/出 Slip 状态
+        //
+        // 逆向（§5.10）：C_TriggerSlipSphere 是**世界里的体积**（不是地面材质），
+        // 玩家身上记 m_touchingSlipTriggers*（数量/速度/加速度/方向/原点）与
+        // m_slipAirRestrictTime / m_slipAirRestrictDirection。
+        // 采样按 SlipProbeInterval 抽样（默认 30 Hz），两次探针之间复用上次结果 ——
+        // 否则抽样空档里会误判"已离开滑区"而抖动进出状态。
+        UpdateSlip(dt);
 
         // 6) 自动翻越/窗口探测
         //
@@ -373,6 +449,7 @@ public sealed class ApexMovementCore
         switch (_state)
         {
             case MovementState.Slide: StepSlide(input, dt); break;
+            case MovementState.Slip: StepSlip(input, dt); break;
             case MovementState.Ground: StepGround(input, dt); break;
             case MovementState.Hang: StepHang(input, dt); break;
             default: StepAir(input, dt); break;
@@ -440,6 +517,18 @@ public sealed class ApexMovementCore
         // 空中加速：wishSpeed 被硬限制在 AirWishSpeed(60hu/s) —— 这是 air strafe 的物理根因。
         F3 wishDir = WishDirection(input);
         float wishSpeed = MathF.Min(WishSpeed(input), _cfg.AirWishSpeed);
+
+        // ★ 离开打滑体积后的方向限制（m_slipAirRestrictTime / Direction）
+        //
+        // Apex 在离开滑区后会"锁一会儿方向"：这段时间里空中加速只能落在
+        // 离开方向的圆锥内，所以不能立刻反身拉回来 —— 这是滑道出口手感的一部分。
+        // 完全锁死方向会让人觉得失控，所以用圆锥（SlipAirRestrictConeDeg，默认 35°）。
+        if (_slipAirRestrictTimer > 0f && _slipAirRestrictDir.LengthSq() > 1e-8f &&
+            wishDir.LengthSq() > 1e-8f)
+        {
+            wishDir = ClampToCone(wishDir, _slipAirRestrictDir, _cfg.SlipAirRestrictConeDeg);
+        }
+
         Accelerate(wishDir, wishSpeed, _cfg.AirAccel, dt);
 
         // 重力
@@ -461,6 +550,17 @@ public sealed class ApexMovementCore
 
         // 土狼跳
         if (_jumpBuffered && _coyoteTimer > 0f) DoJump(fromSlide: false, crouchHeld: input.CrouchHeld);
+
+        // 扒墙 / 悬垂（WallHang）
+        //
+        // 放在攀爬之前：两者互斥（扒墙要按蹲键，攀爬要朝墙动量），
+        // 但"按住蹲 + 贴墙"这种组合优先理解成"我要挂住"。
+        // 探针与攀爬共用 30 Hz 抽样（ClimbProbeInterval）。
+        if (_state == MovementState.Air && ShouldProbeClimb())
+        {
+            _wallHangProbeCount++;
+            if (TryAttachWallHang(input)) return;
+        }
 
         // 贴墙爬附着（Climb）
         //
@@ -501,6 +601,205 @@ public sealed class ApexMovementCore
 
     /// <summary>攀爬探针累计执行次数（只读，自检/性能面板用）。</summary>
     public int ClimbProbeCount => _climbProbeCount;
+
+    /// <summary>
+    /// 攀爬到顶探针是否该在本 tick 跑。间隔 2 ⇒ 60 Hz tick 下 30 Hz。
+    /// 这是**整段攀爬期间**每 tick 都要打的一条射线，属于持续开销。
+    /// </summary>
+    private bool ShouldProbeClimbWall()
+    {
+        int iv = _cfg.ClimbWallProbeInterval;
+        return iv <= 1 || (_tickCount % iv) == 0;
+    }
+
+    /// <summary>打滑体积采样是否该在本 tick 跑。间隔 2 ⇒ 30 Hz。</summary>
+    private bool ShouldProbeSlip()
+    {
+        int iv = _cfg.SlipProbeInterval;
+        return iv <= 1 || (_tickCount % iv) == 0;
+    }
+
+    /// <summary>攀爬到顶探针累计执行次数（只读，自检用）。</summary>
+    public int ClimbWallProbeCount => _climbWallProbeCount;
+
+    /// <summary>打滑体积采样累计执行次数（只读，自检用）。</summary>
+    public int SlipProbeCount => _slipProbeCount;
+
+    /// <summary>扒墙探针累计执行次数（只读，自检用）。</summary>
+    public int WallHangProbeCount => _wallHangProbeCount;
+
+    /// <summary>
+    /// 本 tick 是否处于"离开滑区后的空中方向限制"里（供 HUD / 自检读取）。
+    /// </summary>
+    public bool IsSlipAirRestricted => _slipAirRestrictTimer > 0f;
+
+    // ───────────────────────── 打滑（Slip） ─────────────────────────
+    //
+    // 语义来源（docs/reverse-engineering-v0.2.md §5.10，全部 A 级字段名）：
+    //   体积  DT_TriggerSlipSphere / C_TriggerSlipSphere / trigger_slip_sphere
+    //         m_slipSpeed / m_slipAcceleration / m_defaultSlipDirection
+    //   玩家  m_touchingSlipTriggersCount
+    //         m_touchingSlipTriggersSpeed[] / Acceleration[] / Direction[] / Origin[]
+    //         m_touchingSlipTriggersSpeed / Acceleration / Direction（聚合）
+    //         m_slipAirRestrictTime / m_slipAirRestrictDirection
+    //   全局  slipAirRestrictDuration / slipSpeed / slipAcceleration
+    //
+    // 因此"打滑"不是地面材质，而是**世界里的体积**：
+    //   进入体积 → 摩擦失效，速度被体积的 speed/acceleration 拽向体积方向；
+    //   离开体积 → 接下来 slipAirRestrictDuration 内空中转向被限制在离开方向附近。
+    //
+    // 未实现的部分（明确声明）：skydive_slipSpeed / skydive_slipAcceleration /
+    // m_skydiveSlipVelocity —— 那是**跳伞/滑翔**阶段的滑行，本插件没有跳伞状态。
+
+    /// <summary>
+    /// 每 tick 更新打滑状态：采样滑区 → 进/出 <see cref="MovementState.Slip"/>。
+    ///
+    /// 只在 Ground / Air 之间转换：
+    /// 玩家主动滑铲（Slide）、翻越、攀爬、扒墙时**不被滑区抢状态** ——
+    /// 那些是玩家主动意图，优先级高于环境推挤。
+    /// </summary>
+    private void UpdateSlip(float dt)
+    {
+        _ = dt;
+
+        // 抽样（探针之间复用上次结果，避免状态抖动）
+        if (ShouldProbeSlip())
+        {
+            _slipProbeCount++;
+            _slipSampleValid = _world is ISlipWorld slipWorld &&
+                               slipWorld.SampleSlip(_pos, out _slipSample);
+        }
+
+        bool inSlip = _slipSampleValid;
+        bool convertible = _state is MovementState.Ground or MovementState.Air or MovementState.Slip;
+
+        if (inSlip && convertible && _state != MovementState.Slip)
+        {
+            BeginSlip();
+            return;
+        }
+
+        if (!inSlip && _state == MovementState.Slip)
+            EndSlip();
+    }
+
+    private void BeginSlip()
+    {
+        _state = MovementState.Slip;
+        _slideTime = 0f;
+    }
+
+    /// <summary>
+    /// 离开滑区：记录"方向限制"（<c>m_slipAirRestrictDirection</c>）与剩余时间
+    /// （<c>m_slipAirRestrictTime</c>），然后回到地面/空中。
+    /// </summary>
+    private void EndSlip()
+    {
+        F3 horiz = F3.ProjectOnPlane(_vel, _up);
+        float speed = horiz.Length();
+
+        // 优先记录"玩家实际飞出去的方向"；速度太小（几乎站着）就用体积方向，
+        // 免得记录出一个抖动的零向量把后面 0.6s 的空中控制全废掉。
+        if (speed >= _cfg.SlipMinSpeedToRecordDirection)
+            _slipAirRestrictDir = horiz / speed;
+        else if (_slipSample.Direction.LengthSq() > 1e-8f)
+            _slipAirRestrictDir = _slipSample.Direction.Normalized();
+        else
+            _slipAirRestrictDir = F3.Zero;
+
+        if (_slipAirRestrictDir.LengthSq() > 1e-8f)
+            _slipAirRestrictTimer = _cfg.SlipAirRestrictDuration;
+
+        _state = _onGround ? MovementState.Ground : MovementState.Air;
+    }
+
+    /// <summary>
+    /// 打滑态推进：没有普通摩擦，只有体积给的"朝目标速度加速"。
+    ///
+    /// 与 Slide 的区别：Slide 是**玩家**蹲下触发的、速度只减不增；
+    /// Slip 是**环境**推的、速度会被拉到体积的 slipSpeed。
+    /// </summary>
+    private void StepSlip(in MovementInput input, float dt)
+    {
+        F3 dir = _slipSample.Direction;
+
+        // 体积没给方向（例如玩家正好站在触发球中心）→ 用玩家当前水平速度兜底，
+        // 对应逆向里的 m_defaultSlipDirection：沿"已经被推出去的那个方向"继续滑。
+        if (dir.LengthSq() < 1e-8f)
+        {
+            F3 horiz = F3.ProjectOnPlane(_vel, _up);
+            float hs = horiz.Length();
+            if (hs > _cfg.SlipMinSpeedToRecordDirection) dir = horiz / hs;
+        }
+
+        if (dir.LengthSq() < 1e-8f)
+        {
+            // 既没方向也没速度：站着不动就无所谓打滑，回普通状态即可。
+            EndSlip();
+            return;
+        }
+        dir = dir.Normalized();
+
+        // ── 沿体积方向加速到 slipSpeed ──────────────────────────────
+        float target = _slipSample.Speed;
+        float along = F3.Dot(_vel, dir);
+        float add = target - along;
+        if (add > 0f)
+        {
+            float accelStep = _slipSample.Acceleration * dt;
+            if (accelStep > add) accelStep = add;
+            _vel += dir * accelStep;
+        }
+
+        // ── 极弱转向（滑道上还能勉强掰一点方向） ────────────────────
+        if (_cfg.SlipSteerFactor > 0f)
+        {
+            F3 wishDir = WishDirection(input);
+            if (wishDir.LengthSq() > 1e-6f)
+            {
+                float steerSpeed = WishSpeed(input) * _cfg.SlipSteerFactor;
+                Accelerate(wishDir, steerSpeed, _cfg.GroundAccel * _cfg.SlipSteerFactor, dt);
+            }
+        }
+
+        // ── 垂直方向 ────────────────────────────────────────────────
+        if (_slipSample.LockToPlane)
+        {
+            // 滑槽式体积：只压掉**向上**的分量（别让球把人顶飞）。
+            //
+            // ★ 这里**不能**把垂直速度整体归零：v0.3 初版就是 `_vel -= up*dot`，
+            //   结果空中进入滑区后每 tick 都被清零 ⇒ 永远落不下去、贴地探测永远打空，
+            //   HUD 上表现为 `state=Slip` 但 `ground=False`、角色悬在离地 0.22m 处。
+            //   向下的分量必须留给下面那段重力/落地处理。
+            float upVel = F3.Dot(_vel, _up);
+            if (upVel > 0f) _vel -= _up * upVel;
+        }
+
+        if (!_onGround)
+        {
+            _vel -= _up * (_cfg.Gravity * dt);
+            float downward = -F3.Dot(_vel, _up);
+            if (downward > _cfg.MaxFallSpeed)
+                _vel += _up * (downward - _cfg.MaxFallSpeed);
+        }
+
+        if (_onGround)
+            _vel = F3.ProjectOnPlane(_vel, _groundNormal);
+
+        // ── 玩家主动行为优先 ────────────────────────────────────────
+        // 滑区里仍然允许：蹲下滑铲（把环境推挤转成玩家可控的滑铲）、跳出去。
+        if (input.CrouchHeld && HorizontalSpeed >= _cfg.SlideMinStartSpeed)
+        {
+            BeginSlide(input, fromAir: !_onGround);
+            return;
+        }
+
+        if (_jumpBuffered)
+        {
+            DoJump(fromSlide: false, crouchHeld: input.CrouchHeld);
+            return;
+        }
+    }
 
     // ───────────────────────── 滑铲 ─────────────────────────
 
@@ -872,15 +1171,30 @@ public sealed class ApexMovementCore
         }
 
         // ── 墙没了 / 到顶 ─────────────────────────────────────────
-        bool wallGone =
-            !_world!.Raycast(_pos, intoWall, _cfg.CapsuleRadius + 0.35f,
-                             out F3 wallHit, out F3 n2) ||
-            MathF.Abs(F3.Dot(n2, _up)) > _cfg.WalkableNormalDot;
+        //
+        // ★ 探针按 ClimbWallProbeInterval 抽样（默认 2 ⇒ 30 Hz）。
+        //   这条射线是**整段攀爬期间每 tick** 都要打的持续开销（一次 Raycast），
+        //   而墙顶不可能在一个 tick 内消失 —— 抽样对玩法零影响，开销直接砍半。
+        //   非探针 tick 沿用上一次的命中点做贴墙钳制。
+        bool wallGone = false;
+        F3 wallHit = _climbLastWallHit;
 
-        // 记住最后一次看到的墙面**真实命中点**：一旦到顶，上面那条射线就打空了，
-        // 而"找台面"的向下扫描还需要知道墙在哪个水平平面上 —— 所以墙还在时就持续记录。
-        if (!wallGone)
-            _climbLastWallHit = wallHit;
+        if (ShouldProbeClimbWall())
+        {
+            _climbWallProbeCount++;
+            wallGone =
+                !_world!.Raycast(_pos, intoWall, _cfg.CapsuleRadius + 0.35f,
+                                 out F3 probedHit, out F3 n2) ||
+                MathF.Abs(F3.Dot(n2, _up)) > _cfg.WalkableNormalDot;
+
+            // 记住最后一次看到的墙面**真实命中点**：一旦到顶，上面那条射线就打空了，
+            // 而"找台面"的向下扫描还需要知道墙在哪个水平平面上 —— 所以墙还在时持续记录。
+            if (!wallGone)
+            {
+                _climbLastWallHit = probedHit;
+                wallHit = probedHit;
+            }
+        }
 
         // 两个高度上限"谁先到谁生效"：attach offset（个人体力）与 climb space cutoff（墙高）
         float climbed = F3.Dot(_pos, _up) - _climbAttachHeight;
@@ -1149,6 +1463,286 @@ public sealed class ApexMovementCore
         _jumpFatigueState = false;
         _wasAirborne = true;
         _airPeakHeight = F3.Dot(_pos, _up);
+    }
+
+    // ───────────────────────── 扒墙 / 悬垂（WallHang） ─────────────────────────
+    //
+    // 与 Climb 的分工（这是 v0.3 完整版新增的一套**独立**状态机）：
+    //
+    //   Climb    —— 有朝墙动量 → 抓着墙往上爬，松 W 就掉。
+    //   WallHang —— 停在墙上（悬垂），可以沿墙上下左右挪，久了脱手。
+    //
+    // 逆向依据（docs/reverse-engineering-v0.2.md §5.11，A 级字段名）：
+    //   m_wallHanging / m_wallHangTime / IsWallHanging
+    //   m_wallDangleClimbProgressFloor          ← "还能爬升的进度下限"（握力）
+    //   ACT_MP_WALLHANG_FRONT/UP/RIGHT/LEFT/IDLE ← 5 个姿势 = 可上下左右移动
+    //   sound_wallHangStart / Slip / Complete / Fall ← 挂上/下滑/完成/掉落
+    //   spread_wallhanging                       ← 挂着时仍可射击（本插件无武器，仅语义）
+    //   automantle_disable_hang                  ← 能自动翻越的矮墙不该先挂上去
+    //
+    // 设计取舍（C 级）：进入条件是**显式按蹲键**，而不是"贴墙自动挂" ——
+    // 延续需求里的"非强制"原则：贴着墙跳一下不该被环境抓走。
+
+    /// <summary>
+    /// 尝试进入扒墙。返回 true 表示本 tick 已切到 <see cref="MovementState.WallHang"/>。
+    ///
+    /// 五条同时满足：① 空中 ② （默认）按住蹲键 ③ 前方够得到一面陡墙
+    /// ④ 视角夹角 ≤ <see cref="MovementConfig.WallHangMaxViewAngle"/> ⑤ 不在冷却里。
+    /// 另外 <see cref="MovementConfig.WallHangDisableWhenAutoMantleable"/> 时，
+    /// 矮到能自动翻越的墙不挂（对应 <c>automantle_disable_hang</c>）。
+    /// </summary>
+    private bool TryAttachWallHang(in MovementInput input)
+    {
+        if (!_cfg.WallHangEnabled) return false;
+        if (_wallHangCooldown > 0f) return false;
+        if (_cfg.WallHangRequiresCrouch && !input.CrouchHeld) return false;
+        if (_world == null) return false;
+
+        F3 fwd = Forward();
+        float reach = _cfg.CapsuleRadius + _cfg.WallHangReach;
+
+        if (!_world.Raycast(_pos, fwd, reach, out F3 hitPoint, out F3 hitNormal))
+        {
+            // 视野里已经没有墙 ⇒ 玩家确实离开了墙面，"必须重新接近才能再挂"的
+            // 状态在这里解除（这是唯一解除点，见下面的 _wallHangNeedRelease）。
+            _wallHangNeedRelease = false;
+            return false;
+        }
+
+        // 刚松手 / 刚脱手：必须先离开这面墙一次，才能重新挂上。
+        //
+        // 不加这条会出大问题：挂着不动会因握力耗尽而脱手，但玩家还按着蹲、人还贴着墙，
+        // 冷却一过（0.35s）就又被抓回来 —— 表现为「挂满 6s 掉一下、立刻又挂回去」，
+        // 既不符合"脱手"的语义，也让 m_wallHangTime 永远走不到上限。
+        if (_wallHangNeedRelease) return false;
+
+        // 必须是陡墙（法线与 up 的 |点积| ≤ WalkableNormalDot ⇔ 墙面陡于 45.57°）
+        if (MathF.Abs(F3.Dot(hitNormal, _up)) > _cfg.WalkableNormalDot) return false;
+
+        // 视角容差（与攀爬同源 = arccos(0.7)）
+        float facing = -F3.Dot(hitNormal, fwd);
+        float cosLimit = MathF.Cos(_cfg.WallHangMaxViewAngle * MathF.PI / 180f);
+        if (facing < cosLimit) return false;
+
+        // 对应 automantle_disable_hang：墙顶低于"自动翻越上限"时，先别挂 ——
+        // 用一条射线近似判断：在 AutoMantleMaxHeight 高度上打不到墙 ⇒ 墙比它矮。
+        if (_cfg.WallHangDisableWhenAutoMantleable)
+        {
+            F3 highOrigin = _pos + _up * _cfg.AutoMantleMaxHeight;
+            if (!_world.Raycast(highOrigin, fwd, reach, out _, out _))
+                return false;
+        }
+
+        // ── 附着成立 ──
+        _state = MovementState.WallHang;
+        _wallHangTime = 0f;
+        _wallHangSlip = 0f;
+        _wallHangNormal = hitNormal;
+        _wallHangLastHit = hitPoint;
+
+        // 贴到墙面上（半径 + 皮肤），否则下一 tick 的"墙还在吗"探针会打空
+        float dist = F3.Dot(_pos - hitPoint, hitNormal);
+        float want = _cfg.CapsuleRadius + 0.02f;
+        _pos += hitNormal * (want - dist);
+
+        // 挂住 = 动量清零（下落被手接住）
+        _vel = F3.Zero;
+        _wasAirborne = false;
+        _jumpBuffered = false;
+        _jumpBufferTimer = 0f;
+        return true;
+    }
+
+    /// <summary>
+    /// 扒墙态推进。位置是**运动学**积分（同 Climb / Traversal），所以
+    /// <see cref="Step"/> 里是独占分支、不走 MoveWithCollision。
+    ///
+    /// 行为映射：
+    ///   W / S      → 沿墙上爬 / 下移（`ACT_MP_WALLHANG_UP`）
+    ///   A / D      → 沿墙左右横移（`ACT_MP_WALLHANG_LEFT/RIGHT`）
+    ///   不动       → 缓慢下滑（`sound_wallHangSlip`），滑过握力下限就掉
+    ///   Space      → 翻上去（`sound_wallHangComplete`）
+    ///   松开蹲键   → 松手（`sound_wallHangFall`）
+    /// </summary>
+    private void StepWallHang(in MovementInput input, float dt)
+    {
+        _wallHangTime += dt;
+
+        // ── 主动松手 ──────────────────────────────────────────────
+        if (_cfg.WallHangRequiresCrouch && !input.CrouchHeld)
+        {
+            DetachWallHang(jumped: false);
+            return;
+        }
+
+        // ── 向上翻越（Complete） / 主动下落 ────────────────────────
+        if (_jumpBuffered)
+        {
+            if (!TryCompleteWallHang())
+                DetachWallHang(jumped: true);
+            return;
+        }
+
+        if (input.MoveZ < -0.6f)
+        {
+            DetachWallHang(jumped: false);
+            return;
+        }
+
+        // ── 挂太久脱手（m_wallHangTime 上限） ──────────────────────
+        if (_wallHangTime >= _cfg.WallHangMaxTime)
+        {
+            DetachWallHang(jumped: false);
+            return;
+        }
+
+        // ── 视角甩开太大 → 松手（与攀爬同一容差） ──────────────────
+        F3 fwd = Forward();
+        float facing = -F3.Dot(_wallHangNormal, fwd);
+        float cosLimit = MathF.Cos(_cfg.WallHangMaxViewAngle * MathF.PI / 180f);
+        if (facing < cosLimit)
+        {
+            DetachWallHang(jumped: false);
+            return;
+        }
+
+        // ── 沿墙移动 ──────────────────────────────────────────────
+        F3 right = F3.Cross(fwd, _up).Normalized();
+        bool pressingW = input.MoveZ > 0.3f;
+
+        float vUp = 0f;
+        if (pressingW) vUp = _cfg.WallHangClimbSpeed;
+        else if (input.MoveZ < -0.3f) vUp = -_cfg.WallHangClimbSpeed * 0.6f;
+
+        float vSide = Clamp(input.MoveX, -1f, 1f) * _cfg.WallHangShimmySpeed;
+
+        _pos += _up * (vUp * dt) + right * (vSide * dt);
+
+        // ── 握力（m_wallDangleClimbProgressFloor） ────────────────
+        //
+        // 挂着不动会往下滑；按 W 往上爬能把手"再抓高一点"，把下滑量收回来。
+        if (pressingW)
+        {
+            if (_cfg.WallHangClimbRestoresGrip)
+                _wallHangSlip = MathF.Max(0f, _wallHangSlip - _cfg.WallHangSlipSpeed * dt);
+        }
+        else
+        {
+            _wallHangSlip += _cfg.WallHangSlipSpeed * dt;
+            _pos -= _up * (_cfg.WallHangSlipSpeed * dt);
+
+            if (_wallHangSlip >= _cfg.WallHangMaxSlipDistance)
+            {
+                DetachWallHang(jumped: false);
+                return;
+            }
+        }
+
+        // ── 墙还在吗（探针按 ClimbWallProbeInterval 抽样，默认 30 Hz） ──
+        bool wallGone;
+        if (ShouldProbeClimbWall())
+        {
+            _climbWallProbeCount++;
+            wallGone =
+                !_world!.Raycast(_pos, -_wallHangNormal, _cfg.CapsuleRadius + 0.35f,
+                                 out F3 wallHit, out F3 n2) ||
+                MathF.Abs(F3.Dot(n2, _up)) > _cfg.WalkableNormalDot;
+
+            if (!wallGone)
+            {
+                _wallHangLastHit = wallHit;
+                _wallHangNormal = n2;
+
+                // 每 tick 把身体重新贴回墙面
+                float dist = F3.Dot(_pos - wallHit, _wallHangNormal);
+                float want = _cfg.CapsuleRadius + 0.02f;
+                if (dist > want) _pos -= _wallHangNormal * (dist - want);
+            }
+        }
+        else
+        {
+            // 非探针 tick：沿用上一帧的结论（这里只需要"贴墙"）
+            float dist = F3.Dot(_pos - _wallHangLastHit, _wallHangNormal);
+            float want = _cfg.CapsuleRadius + 0.02f;
+            if (dist > want) _pos -= _wallHangNormal * (dist - want);
+            wallGone = false;
+        }
+
+        if (wallGone)
+        {
+            // 到墙顶了：能翻就翻，不能翻就松手
+            if (!TryCompleteWallHang())
+                DetachWallHang(jumped: false);
+            return;
+        }
+
+        // 挂着的时候速度对外恒为 0（HUD 上应该看到 speed=0.00 / vy=0.00）
+        _vel = F3.Zero;
+    }
+
+    /// <summary>
+    /// 从扒墙"完成"上墙：找到台沿就转 <see cref="MovementState.Hang"/>，
+    /// 复用攀爬到顶那条已经验证过的 Hang → Mantle pull 路径。
+    /// </summary>
+    private bool TryCompleteWallHang()
+    {
+        if (!_cfg.EnableMantleHang) return false;
+        if (_wallHangNormal.LengthSq() < 1e-8f) return false;
+
+        // TryFindClimbLedge 读的是 _climbWallNormal / _climbLastWallHit，
+        // 这里把扒墙的墙面信息借给它用。
+        F3 savedNormal = _climbWallNormal;
+        F3 savedHit = _climbLastWallHit;
+
+        _climbWallNormal = _wallHangNormal;
+        _climbLastWallHit = _wallHangLastHit;
+
+        bool found = TryFindClimbLedge(out F3 ledgeTop);
+        if (found)
+        {
+            _climbHangTop = ledgeTop;
+            EnterHangFromClimb();
+
+            // 完成时给一点前推，避免"翻上去之后贴着墙站着"
+            _vel += -_wallHangNormal * _cfg.WallHangCompleteForwardSpeed;
+
+            _wallHangNormal = F3.Zero;
+            _wallHangTime = 0f;
+            _wallHangSlip = 0f;
+            return true;
+        }
+
+        _climbWallNormal = savedNormal;
+        _climbLastWallHit = savedHit;
+        return false;
+    }
+
+    /// <summary>松手：回到空中，带一个可选的"蹬墙跳"。</summary>
+    private void DetachWallHang(bool jumped)
+    {
+        _state = MovementState.Air;
+        _wallHangCooldown = _cfg.WallHangReattachCooldown;
+        _wallHangTime = 0f;
+        _wallHangSlip = 0f;
+        _wallHangNeedRelease = true;   // 必须先离开墙面一次才能再挂（见 TryAttachWallHang）
+        _wasAirborne = true;
+        _airPeakHeight = F3.Dot(_pos, _up);
+
+        if (jumped && _wallHangNormal.LengthSq() > 1e-8f)
+        {
+            // 蹬墙跳：离墙 + 向上
+            _vel = _wallHangNormal * (_cfg.JumpVelocity * 0.35f) + _up * (_cfg.JumpVelocity * 0.8f);
+            _jumpBuffered = false;
+            _jumpBufferTimer = 0f;
+            _justJumped = true;
+            _jumpFatigueState = true;
+        }
+        else
+        {
+            _vel = F3.Zero;
+        }
+
+        _wallHangNormal = F3.Zero;
     }
 
     // ───────────────────────── 翻越 / 窗口 ─────────────────────────
@@ -1588,10 +2182,47 @@ public sealed class ApexMovementCore
         _vel += wishDir * accelSpeed;
     }
 
+    /// <summary>
+    /// 把 <paramref name="dir"/> 夹到以 <paramref name="axis"/> 为轴、半角
+    /// <paramref name="halfAngleDeg"/> 的圆锥内（都按单位向量处理）。
+    ///
+    /// 用于打滑后的空中方向限制：不是把方向投影成一条线（那样会完全失控），
+    /// 而是允许在圆锥内自由偏转。轴反平行时退回轴本身。
+    /// </summary>
+    /// <summary>
+    /// 把一个方向夹进以 <paramref name="axis"/> 为轴、半角 <paramref name="halfAngleDeg"/>
+    /// 的圆锥里（已在圆锥内则原样返回）。
+    ///
+    /// 用途：离开打滑体积后的空中方向限制（<c>m_slipAirRestrictDirection</c>）。
+    /// 用圆锥而不是锁死一条线，是为了"不能立刻反身拉回来"但仍能微调。
+    ///
+    /// 公开是为了让自检能直接验证这段纯数学（见 <c>SlipHangTest</c>）。
+    /// </summary>
+    public static F3 ClampToCone(F3 dir, F3 axis, float halfAngleDeg)
+    {
+        F3 a = axis.Normalized();
+        F3 d = dir.Normalized();
+        float cosAngle = F3.Dot(d, a);
+        float cosLimit = MathF.Cos(halfAngleDeg * MathF.PI / 180f);
+        if (cosAngle >= cosLimit) return d;      // 已在圆锥内
+
+        // 把 d 分解成"沿轴 + 垂直轴"，垂直分量缩到极限角度对应的比例
+        F3 perp = d - a * cosAngle;
+        float perpLen = perp.Length();
+        if (perpLen < 1e-6f)
+        {
+            // 完全反向：任何垂直于轴的修正都无意义，直接返回轴
+            return a;
+        }
+
+        float sinLimit = MathF.Sqrt(MathF.Max(0f, 1f - cosLimit * cosLimit));
+        F3 clamped = a * cosLimit + (perp / perpLen) * sinLimit;
+        return clamped.Normalized();
+    }
+
     /// <summary>Source 谱系的摩擦公式。</summary>
     private void ApplyFriction(float dt, float friction)
-    {
-        float speed = _vel.Length();
+    {        float speed = _vel.Length();
         if (speed < 0.1f) { _vel = F3.Zero; return; }
 
         float control = speed < _cfg.StopSpeed ? _cfg.StopSpeed : speed;

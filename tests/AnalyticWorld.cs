@@ -12,15 +12,90 @@ namespace ApexMovement.Tests;
 /// 它按"轴分离 + 最早命中"处理，胶囊近似为竖直圆柱 + 球端。
 /// 它与求解器的契约和 GodotMovementWorld 一致（Sweep/Overlaps/Raycast）。
 /// </summary>
-public sealed class AnalyticWorld : IMovementWorld
+public sealed class AnalyticWorld : IMovementWorld, ISlipWorld
 {
     public float GroundY;
 
     public readonly System.Collections.Generic.List<(F3 Min, F3 Max)> Boxes = new();
 
+    /// <summary>
+    /// 打滑体积（对应 Godot 侧 <c>C_TriggerSlipSphere</c>）。
+    /// 方向为 <see cref="F3.Zero"/> 时，按"从球心往外推"兜底 —— 与
+    /// <c>GodotMovementWorld.SampleSlip</c> 的行为一致。
+    /// </summary>
+    public readonly System.Collections.Generic.List<SlipSphere> SlipSpheres = new();
+
+    public readonly struct SlipSphere
+    {
+        public readonly F3 Center;
+        public readonly float Radius;
+        public readonly float Speed;
+        public readonly float Accel;
+        public readonly F3 Direction;
+        public readonly bool LockToPlane;
+
+        public SlipSphere(F3 center, float radius, float speed, float accel,
+                          F3 direction, bool lockToPlane)
+        {
+            Center = center; Radius = radius; Speed = speed; Accel = accel;
+            Direction = direction; LockToPlane = lockToPlane;
+        }
+    }
+
     public AnalyticWorld(float groundY = 0f) { GroundY = groundY; }
 
     public void AddBox(F3 min, F3 max) => Boxes.Add((min, max));
+
+    /// <summary>加一个打滑球。direction 留零 = 从球心往外推。</summary>
+    public void AddSlipSphere(F3 center, float radius, float speed = 6f, float accel = 30f,
+                              F3? direction = null, bool lockToPlane = false)
+        => SlipSpheres.Add(new SlipSphere(center, radius, speed, accel,
+                                          direction ?? F3.Zero, lockToPlane));
+
+    // ═══════════════════════ ISlipWorld ═══════════════════════
+
+    public bool SampleSlip(F3 pos, out SlipSample sample)
+    {
+        sample = default;
+        if (SlipSpheres.Count == 0) return false;
+
+        bool any = false;
+        float bestSpeed = 0f, bestAccel = 0f;
+        F3 dirSum = F3.Zero;
+        F3 pushAway = F3.Zero;
+        bool lockPlane = false;
+
+        foreach (SlipSphere s in SlipSpheres)
+        {
+            F3 d = pos - s.Center;
+            if (d.LengthSq() > s.Radius * s.Radius) continue;
+
+            any = true;
+            if (s.Speed > bestSpeed) bestSpeed = s.Speed;
+            if (s.Accel > bestAccel) bestAccel = s.Accel;
+            if (s.Direction.LengthSq() > 1e-8f) dirSum += s.Direction;
+            lockPlane |= s.LockToPlane;
+
+            F3 away = new(d.X, 0f, d.Z);
+            if (away.LengthSq() > 1e-8f) pushAway += away;
+        }
+
+        if (!any) return false;
+
+        F3 dir;
+        if (dirSum.LengthSq() > 1e-8f) dir = dirSum.Normalized();
+        else if (pushAway.LengthSq() > 1e-8f) dir = pushAway.Normalized();
+        else dir = F3.Zero;
+
+        sample = new SlipSample
+        {
+            Direction = dir,
+            Speed = bestSpeed,
+            Acceleration = bestAccel,
+            LockToPlane = lockPlane,
+        };
+        return true;
+    }
 
     /// <summary>
     /// 轴分离扫掠：分别求 X/Y/Z 三轴的最早接触分数，取最小值。
