@@ -28,15 +28,19 @@ public partial class DeterminismTestRunner : Node
         (bool camPass, string camReport) = CameraTest.Run();
         GD.Print(camReport);
 
-        GD.Print("=== v0.3 攀爬 / tick / 探针 ===");
+        GD.Print("=== v0.4 贴墙（攀爬 / 扒墙） / 三档障碍 / tick / 探针 ===");
         (bool climbPass, string climbReport) = ClimbTest.Run();
         GD.Print(climbReport);
 
-        GD.Print("=== v0.3 打滑 / 扒墙 ===");
+        GD.Print("=== v0.4 步态模型 / 镜头抖动推导 ===");
+        (bool gaitPass, string gaitReport) = GaitTest.Run();
+        GD.Print(gaitReport);
+
+        GD.Print("=== v0.4 打滑 / 扒墙（滑区与握力） ===");
         (bool slipHangPass, string slipHangReport) = SlipHangTest.Run();
         GD.Print(slipHangReport);
 
-        bool all = detPass && featurePass && camPass && climbPass && slipHangPass;
+        bool all = detPass && featurePass && camPass && climbPass && gaitPass && slipHangPass;
         GD.Print(all
             ? "=== APEX MOVEMENT SELFTEST PASS ==="
             : "=== APEX MOVEMENT SELFTEST FAIL ===");

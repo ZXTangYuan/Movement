@@ -15,6 +15,8 @@ extends Node3D
 ##   · 低天花板通道                       —— 蹲下才能进 / 站起被头顶挡住
 ##   · 滑铲长道（80m）                    —— 滑铲距离 / 滑铲跳 / 连续滑铲跳
 ##   · 打滑体积（Slip，v0.3 新增）        —— C_TriggerSlipSphere：走进球里被往外推
+##   · 台阶区（v0.4 新增）               —— 0.10/0.15/0.20/0.25m 孤立单阶 + 6 级 ×0.20m 连续台阶
+##                                        三档障碍第一档：≤0.25m 直接迈过、无速度衰减
 ##   · 落差平台（3 / 6 / 10 / 22m）       —— 落地分档 Low/Medium/High/Hard + Fallstun
 ##
 ## 全部几何为 StaticBody3D（静态），保证物理查询在固定 tick 下确定性。
@@ -38,6 +40,7 @@ func _ready() -> void:
 	_build_ramps()
 	_build_mantle_steps()
 	_build_vault_walls()
+	_build_step_stairs()
 	_build_window_frames()
 	_build_climb_wall()
 	_build_low_ceiling()
@@ -230,6 +233,24 @@ func _build_vault_walls() -> void:
 			Color(0.75, 0.35, 0.35))
 		x += 6.0
 
+
+func _build_step_stairs() -> void:
+	# 台阶区（v0.4 三档障碍的**第一档**：≤0.25m 直接迈过去，不触发任何动作）
+	#   孤立单阶：0.10 / 0.15 / 0.20 / 0.25 m —— 走过时应"无速度衰减、只改方向不改大小"
+	#   连续台阶：6 级 × 0.20 m —— 走上去应一路平滑，且每级都产生一次台阶倾角
+	var singles := [0.10, 0.15, 0.20, 0.25]
+	var sx := -30.0
+	for h in singles:
+		_box("StepSingle_%.2f" % h, Vector3(sx, h * 0.5, -70.0), Vector3(4, h, 3),
+			Color(0.55, 0.70, 0.85))
+		_deco_box("StepLabel_%.2f" % h, Vector3(sx, h + 0.06, -70.0), Vector3(0.8, 0.10, 0.8),
+			Color(1.0, 0.9, 0.2))
+		sx += 6.0
+	# 连续台阶：沿 -Z 方向递增 0.20 m
+	for i in 6:
+		var h: float = 0.20 * float(i + 1)
+		_box("StairFlight_%d" % i, Vector3(10.0, h * 0.5, -60.0 - float(i) * 2.0),
+			Vector3(10, h, 2), Color(0.45, 0.60, 0.80))
 
 func _build_window_frames() -> void:
 	# 窗口翻越（TRAVERSAL_WINDOW）：窗台 + 窗楣，中间留 1.6m 净高开口。

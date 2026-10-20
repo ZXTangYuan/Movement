@@ -5,18 +5,30 @@ using ApexMovement.Core;
 namespace ApexMovement.Tests;
 
 /// <summary>
-/// v0.3 三组需求的专项验收：
+/// v0.4 贴墙 / 三档障碍 / 探针 的专项验收（纯数学世界，逐 tick 确定性）。
 ///
-/// ① **攀爬必须是非强制的**（用户原话）：
-///    必须同时满足「面向墙壁 + 角色在空中 + 有朝向墙壁的速度」才触发；
-///    触发后进入攀爬**状态**（不会自己爬到顶）；按住 W 才向上爬，
-///    短时间不按 W 就取消攀爬开始下落；快贴到墙顶时再向上补爬一小段，
-///    然后进入**扒墙（Hang）**状态。
-/// ② **移动 tick 固定 60/s** 为基准，性能开销大的探针降到 **30/s**。
-/// ③ 相机幅度收敛（在 <see cref="CameraTest"/> 里验收）。
+/// 这一组断言逐条对应需求方 m02704 的四条反馈：
 ///
-/// 与 FeatureTest 一样跑在 <see cref="AnalyticWorld"/>（纯数学碰撞替身）上，
-/// 因此无头、无引擎依赖、逐 tick 确定性。
+/// **需求 2（贴墙门控）**
+///   「人物在墙壁旁时不要按一下 W 就开始攀爬，按 W 时会撞墙然后停止移动
+///    （或是贴着墙壁朝 W 方向移动），只有按 W 贴墙 + Space 跳起后才会爬墙」
+///   → 断言 1 / 2 / 3 / 4
+///
+/// **需求 3（扒墙默认化）**
+///   「扒墙我希望是默认扒墙，不需要按任何按键，玩家攀爬时应该持续按住 W 才能一直往上攀爬，
+///    途中松开了 W 就会进入扒墙状态，如果持续一小段时间没有按键输入，就会掉落，
+///    中途如果按 a 或 d 则会在墙上左右移动，按 wa 或 wd 则会向左上右上移动，
+///    按 w 继续向上攀爬，只要按了 s，就会取消扒墙直接垂直下落，
+///    下落的过程中按 w 可以继续扒住墙」
+///   → 断言 5 … 18
+///
+/// **需求 5（三档障碍分级）**
+///   「>1m 是墙 / ≤1m 是小障碍（W+Space 翻越，不触发攀爬）/ ≤0.25m 是台阶
+///    （无速度衰减，只改方向不改大小，tan θ = b/a）」
+///   → 断言 19 … 27
+///
+/// **v0.3 遗留（tick 基准与探针开销）**
+///   → 断言 28 … 34
 /// </summary>
 public static class ClimbTest
 {
@@ -30,7 +42,8 @@ public static class ClimbTest
     }
 
     private static MovementInput In(float mz = 0f, float mx = 0f, bool jump = false,
-                                    bool crouch = false, bool sprint = false) => new()
+                                    bool crouch = false, bool sprint = false,
+                                    float mouseYaw = 0f) => new()
     {
         MoveX = mx,
         MoveZ = mz,
@@ -38,6 +51,7 @@ public static class ClimbTest
         JumpHeld = jump,
         CrouchHeld = crouch,
         SprintHeld = sprint,
+        MouseDeltaYaw = mouseYaw,
     };
 
     /// <summary>跑 N 个 tick（跳跃只在第一 tick 是上升沿）。</summary>
@@ -47,7 +61,7 @@ public static class ClimbTest
         for (int i = 0; i < ticks; i++)
         {
             MovementInput i2 = input;
-            if (i > 0) { i2.JumpPressed = false; i2.JumpHeld = false; }
+            if (i > 0) { i2.JumpPressed = false; i2.JumpHeld = false; i2.MouseDeltaYaw = 0f; }
             core.Step(i2, dt);
         }
     }
@@ -66,6 +80,24 @@ public static class ClimbTest
         return w;
     }
 
+    /// <summary>
+    /// 「贴墙 + W + Space 起跳 → 抓墙」的完整驱动。
+    /// 返回 true 表示成功挂上（Climb 或 WallHang）。
+    /// </summary>
+    private static bool JumpAndGrab(ApexMovementCore core, float wallTop, int maxTicks = 60)
+    {
+        // 先贴着墙走几 tick 建立朝墙姿态（v0.4 的抓墙不再看朝墙动量，
+        // 但"先走到墙边"仍然是玩家真实操作顺序）。
+        Run(core, 6, In(mz: 1f));
+        for (int i = 0; i < maxTicks; i++)
+        {
+            MovementInput input = In(mz: 1f, jump: i == 0);
+            core.Step(input, core.Config.FixedDelta);
+            if (core.State is MovementState.Climb or MovementState.WallHang) return true;
+        }
+        return false;
+    }
+
     public static (bool Pass, string Report) Run()
     {
         var sb = new StringBuilder();
@@ -82,367 +114,603 @@ public static class ClimbTest
 
         var cfg0 = MovementConfig.Apex();
 
-        // ═════════ 1. 非强制①：站在地面上贴墙按 W —— 不许攀爬 ═════════
+        // ═════════════ 需求 2：贴墙门控 ═════════════
+
+        // 1. 地面贴墙按住 W —— 撞墙停住，绝不攀爬
         {
             var world = WallWorld(wallTop: 6f);
             var core = MakeCore(world);
             core.Reset(new F3(0f, 1.0f, -1.0f));
-            Settle(core, 40);          // 落到地面
+            Settle(core, 40);
 
-            bool everClimbed = false;
-            MovementState firstNonGround = MovementState.Ground;
-            bool sawNonGround = false;
+            bool everGrab = false;
             for (int i = 0; i < 120; i++)
             {
                 core.Step(In(mz: 1f), core.Config.FixedDelta);
-                if (core.State == MovementState.Climb) everClimbed = true;
-                if (!sawNonGround && core.State != MovementState.Ground)
-                {
-                    sawNonGround = true;
-                    firstNonGround = core.State;
-                }
+                if (core.State is MovementState.Climb or MovementState.WallHang) everGrab = true;
             }
 
-            Check("非强制①：地面贴墙按住 W 不会进入攀爬",
-                  !everClimbed,
-                  $"onGround 起手，120 tick 内是否 Climb={everClimbed}（首个非地面状态={firstNonGround}）");
+            Check("① 地面贴墙按住 W 120 tick → 不攀爬不扒墙（只撞停）",
+                  !everGrab && core.OnGround,
+                  $"state={core.State} onGround={core.OnGround} z={core.Position.Z:F3}");
+
+            Check("① 撞墙后停在墙面外侧（没穿模、也没被推远）",
+                  core.Position.Z > -2.0f && core.Position.Z < -1.50f,
+                  $"z={core.Position.Z:F3}（墙面 -2.00，期望 ≈ -1.594 = 半径 0.4064）");
         }
 
-        // ═════════ 2. 非强制②：空中 + 面向墙，但没有朝墙速度 —— 不许攀爬 ═════════
+        // 2. 地面贴墙 + W + Space —— 起跳后抓住
         {
             var world = WallWorld(wallTop: 6f);
             var core = MakeCore(world);
-            core.Reset(new F3(0f, 3.0f, -1.0f));   // 空中，水平速度 0
-            core.SetVelocity(F3.Zero);
+            core.Reset(new F3(0f, 1.0f, -1.0f));
+            Settle(core, 40);
+            float startFeet = core.FeetPosition.Y;
 
-            // 注意：这里**不给 W**。给 W 会让空中加速产生朝墙速度（那是另一条正确的
-            // 触发路径），就测不到"没有朝墙速度不挂"这件事了 —— 视角依旧朝向墙。
-            float maxApproach = 0f;
-            bool everClimbed = false;
-            for (int i = 0; i < 20; i++)
+            bool grabbed = JumpAndGrab(core, 6f);
+
+            Check("② 地面贴墙 + W + Space 起跳 → 抓住墙（Climb / WallHang）",
+                  grabbed,
+                  $"state={core.State} feet={core.FeetPosition.Y:F2}（起跳前 {startFeet:F2}）");
+
+            Check("② 抓住后脚底已经离地上升",
+                  grabbed && core.FeetPosition.Y > startFeet + 0.2f,
+                  $"feet={core.FeetPosition.Y:F2}（起跳前 {startFeet:F2}）");
+        }
+
+        // 3. 空中面向墙、正在**上升**、不按 W —— 不许抓（避免"向上跳经过墙面被吸住"）
+        {
+            var world = WallWorld(wallTop: 6f);
+            var core = MakeCore(world);
+            core.Reset(new F3(0f, 3.0f, -1.0f));
+            core.SetVelocity(new F3(0f, 4f, 0f));   // 正在上升
+
+            bool everGrab = false;
+            for (int i = 0; i < 8; i++)   // 起跳后到顶点约 11.5 tick，这里只覆盖**上升段**
+            {
+                core.Step(In(), core.Config.FixedDelta);   // 不给 W
+                if (core.State is MovementState.Climb or MovementState.WallHang) everGrab = true;
+            }
+
+            Check("③ 空中上升 + 面向墙 + 不按 W → 不抓（上升不打断）",
+                  !everGrab,
+                  $"state={core.State} vy={core.VerticalSpeed:F2}（8 tick 内是否抓={everGrab}）");
+        }
+
+        // 4. 空中面向墙、正在**下落**、不按任何键 —— 自动抓住（需求「扒墙默认」）
+        {
+            var world = WallWorld(wallTop: 6f);
+            var core = MakeCore(world);
+            core.Reset(new F3(0f, 3.0f, -1.0f));
+            core.SetVelocity(new F3(0f, -2f, 0f));   // 正在下落
+
+            bool grabbed = false;
+            for (int i = 0; i < 10; i++)
             {
                 core.Step(In(), core.Config.FixedDelta);
-                // 朝墙速度 = -dot(vel, 墙法线 +Z) = -vel.Z
-                maxApproach = MathF.Max(maxApproach, -core.Velocity.Z);
-                if (core.State == MovementState.Climb) everClimbed = true;
+                if (core.State is MovementState.Climb or MovementState.WallHang) { grabbed = true; break; }
             }
 
-            Check("非强制②：空中面向墙但无朝墙速度 → 不攀爬",
-                  !everClimbed,
-                  $"30 tick 内 max(朝墙速度)={maxApproach:F3}（门槛 {cfg0.ClimbMinApproachSpeed:F2}），Climb={everClimbed}");
-
-            // 对照组必须证明确实"在空中"——否则"没挂住"可能只是因为早就落地了。
-            // 起点脚底 2.025m、重力 20.78 m/s²：20 tick（0.33s）只落 ~1.15m，
-            // 还离地 0.8m 以上；跑 30 tick 就会落地，对照组失去意义。
-            Check("非强制②：确实处于空中（对照组有效）",
-                  !core.OnGround && core.FeetPosition.Y > 0.5f,
-                  $"onGround={core.OnGround} feetY={core.FeetPosition.Y:F3}（起点 2.025，20 tick 后应仍 >0.5）");
+            Check("④ 空中下落 + 贴墙 + 不按任何键 → 自动抓住（扒墙默认化）",
+                  grabbed && core.State == MovementState.WallHang,
+                  $"state={core.State}（不按 W 时应停在 WallHang 而不是 Climb）");
         }
 
-        // ═════════ 3. 非强制③：面向墙 + 背对负速度 —— 必须有朝墙速度才挂 ═════════
+        // 5. 离墙太远 —— 挂不上
         {
             var world = WallWorld(wallTop: 6f);
             var core = MakeCore(world);
-            core.Reset(new F3(0f, 3.0f, -1.0f));
-            core.SetVelocity(new F3(0f, 0f, -6f));   // 朝墙（-Z）6 m/s
+            core.Reset(new F3(0f, 3.0f, 0.5f));      // 离墙面 2.5m
+            core.SetVelocity(new F3(0f, -2f, 0f));
 
-            core.Step(In(mz: 1f), core.Config.FixedDelta);
+            bool everGrab = false;
+            for (int i = 0; i < 10; i++)
+            {
+                core.Step(In(), core.Config.FixedDelta);
+                if (core.State is MovementState.Climb or MovementState.WallHang) everGrab = true;
+            }
 
-            Check("非强制③：空中 + 面向墙 + 朝墙速度 → 进入攀爬",
-                  core.State == MovementState.Climb,
-                  $"state={core.State}，朝墙速度 6.0（门槛 {cfg0.ClimbMinApproachSpeed:F2}）");
-
-            Check("攀爬是**状态**而不是直接爬顶（挂上瞬间竖直速度≈0）",
-                  MathF.Abs(core.VerticalSpeed) < 0.01f && core.FeetPosition.Y < 3.0f,
-                  $"vertSpeed={core.VerticalSpeed:F4} feetY={core.FeetPosition.Y:F3}（挂住时不该自己上升）");
+            Check("⑤ 离墙超过 reach → 挂不上",
+                  !everGrab,
+                  $"state={core.State} z={core.Position.Z:F2}");
         }
 
-        // ═════════ 4. 按住 W 才向上爬 ═════════
+        // ═════════════ 需求 3：攀爬 / 扒墙输入映射 ═════════════
+
+        // 6. 按住 W 抓住 → 状态是 Climb（在爬）
+        // 7. 松 W → 回到 WallHang（扒住不动）
         {
             var world = WallWorld(wallTop: 6f);
             var core = MakeCore(world);
-            core.Reset(new F3(0f, 3.0f, -1.0f));
-            core.SetVelocity(new F3(0f, 0f, -6f));
-            core.Step(In(mz: 1f), core.Config.FixedDelta);
+            core.Reset(new F3(0f, 1.0f, -1.0f));
+            Settle(core, 40);
 
-            float y0 = core.FeetPosition.Y;
-            Run(core, 30, In(mz: 1f));        // 0.5 s
-            float y1 = core.FeetPosition.Y;
-
-            Check("按住 W 向上爬（0.5s 至少 +0.6m）",
-                  core.State == MovementState.Climb && y1 - y0 > 0.6f,
-                  $"ΔfeetY={y1 - y0:F3}（ClimbSpeed={cfg0.ClimbSpeed:F2} → 期望≈{cfg0.ClimbSpeed * 0.5f:F2}）");
-        }
-
-        // ═════════ 5. 完全松手 → 宽限后取消攀爬、开始下落 ═════════
-        {
-            var world = WallWorld(wallTop: 6f);
-            var core = MakeCore(world);
-            core.Reset(new F3(0f, 3.0f, -1.0f));
-            core.SetVelocity(new F3(0f, 0f, -6f));
-            core.Step(In(mz: 1f), core.Config.FixedDelta);
-            Run(core, 10, In(mz: 1f));        // 先爬一小段
-
-            Check("攀爬中（对照组）", core.State == MovementState.Climb,
+            bool grabbed = JumpAndGrab(core, 6f);
+            Check("⑥ 按住 W 抓住 → 状态 = Climb（正在上爬）",
+                  grabbed && core.State == MovementState.Climb,
                   $"state={core.State}");
 
-            // 宽限期内仍挂在墙上
-            int graceTicks = (int)MathF.Ceiling(cfg0.ClimbNoInputGrace / cfg0.FixedDelta) - 1;
-            Run(core, Math.Max(1, graceTicks), In(mz: 0f));
-            MovementState duringGrace = core.State;
+            float yBefore = core.FeetPosition.Y;
+            Run(core, 30, In(mz: 1f));   // 继续按 W 上爬 0.5s
+            float climbed = core.FeetPosition.Y - yBefore;
+            Check("⑦ 按住 W 上爬 ≈ ClimbSpeed（2 m/s）",
+                  climbed > 0.85f && climbed < 1.15f,
+                  $"0.5s 爬升 {climbed:F2}m（期望 ≈ 1.00）");
 
-            // 再跑 20 tick：早已过宽限
-            Run(core, 20, In(mz: 0f));
-            MovementState afterGrace = core.State;
-            float vyAfter = core.VerticalSpeed;
-
-            Check("松手后在宽限期内仍保持攀爬",
-                  duringGrace == MovementState.Climb,
-                  $"宽限 {cfg0.ClimbNoInputGrace:F2}s（{graceTicks} tick）后 state={duringGrace}");
-
-            Check("松手超时 → 取消攀爬并开始下落",
-                  afterGrace == MovementState.Air && vyAfter < -0.1f,
-                  $"state={afterGrace} vertSpeed={vyAfter:F3}");
+            // 松 W
+            Run(core, 3, In());
+            Check("⑧ 途中松开 W → 进入扒墙状态（WallHang）",
+                  core.State == MovementState.WallHang,
+                  $"state={core.State}");
         }
 
-        // ═════════ 6. 爬到墙顶 → 补爬一小段 → 扒墙（Hang）═════════
-        {
-            var world = WallWorld(wallTop: 2f);
-            var core = MakeCore(world);
-            core.Reset(new F3(0f, 1.0f, -1.0f));
-            core.SetVelocity(new F3(0f, 0f, -6f));
-            core.Step(In(mz: 1f), core.Config.FixedDelta);
-
-            Check("攀爬起步（对照组）", core.State == MovementState.Climb,
-                  $"state={core.State} feetY={core.FeetPosition.Y:F3}");
-
-            bool everApproaching = false;
-            bool everHang = false;
-            float attachFeet = core.FeetPosition.Y;
-            float hangFeet = 0f;
-
-            for (int i = 0; i < 200; i++)
-            {
-                core.Step(In(mz: 1f), core.Config.FixedDelta);
-                var s = core.Snapshot;
-                if (s.ClimbApproaching) everApproaching = true;
-                if (core.State == MovementState.Hang) { everHang = true; hangFeet = core.FeetPosition.Y; break; }
-            }
-
-            Check("爬到墙顶会先进入「补爬」阶段",
-                  everApproaching,
-                  $"ClimbApproaching 出现过={everApproaching}");
-
-            Check("补爬结束进入扒墙状态（Hang）",
-                  everHang,
-                  $"state={core.State}，攀爬起点脚底={attachFeet:F3} → 挂姿脚底={hangFeet:F3}（墙顶 2.00，期望 ≈ 1.75）");
-
-            Check("挂姿位置在墙顶下方约 0.25m",
-                  everHang && MathF.Abs(hangFeet - (2.0f - 0.25f)) < 0.12f,
-                  $"hangFeet={hangFeet:F3}，期望 1.750 ± 0.120");
-        }
-
-        // ═════════ 7. 扒墙里按 W 上墙（复用 v0.2 Mantle pull）═════════
-        {
-            var world = WallWorld(wallTop: 2f);
-            var core = MakeCore(world);
-            core.Reset(new F3(0f, 1.0f, -1.0f));
-            core.SetVelocity(new F3(0f, 0f, -6f));
-            core.Step(In(mz: 1f), core.Config.FixedDelta);
-
-            // 爬到 Hang
-            bool reachedHang = false;
-            for (int i = 0; i < 200 && !reachedHang; i++)
-            {
-                core.Step(In(mz: 1f), core.Config.FixedDelta);
-                if (core.State == MovementState.Hang) reachedHang = true;
-            }
-
-            Check("（前置）已进入扒墙", reachedHang, $"state={core.State}");
-
-            // 上拉过程：一旦 Mantle/Vault 结束就停手，**不要**继续按着 W 往台面上走
-            // （台面只有 2m 深，按着 W 会直接走过沿口掉下去 —— 那是正常物理，
-            //  不是这条断言要测的东西）。
-            bool sawMantle = false;
-            for (int i = 0; i < 150; i++)
-            {
-                core.Step(In(mz: 1f), core.Config.FixedDelta);
-                if (core.State is MovementState.Mantle or MovementState.Vault)
-                {
-                    sawMantle = true;
-                    continue;
-                }
-                if (sawMantle) break;
-            }
-            Settle(core, 12);   // 松手站定，让地面吸附生效
-
-            Check("扒墙里按 W 能上墙（进入 Mantle 并落到台面）",
-                  sawMantle && core.State == MovementState.Ground && core.OnGround,
-                  $"sawMantle={sawMantle} state={core.State} onGround={core.OnGround}");
-
-            Check("上墙后脚底站在台面高度（≈2.00m）",
-                  MathF.Abs(core.FeetPosition.Y - 2.0f) < 0.20f,
-                  $"feetY={core.FeetPosition.Y:F3}，期望 2.000 ± 0.200");
-        }
-
-        // ═════════ 7b. 站在台面上 → 走出边缘落地（不许卡进墙体）═════════
-        //
-        // 这条防的是一个很容易复发的坑：运动学落点（翻越 / 攀爬补爬）会把胶囊
-        // **恰好**放到台面上（脚底 == 台面高度）。若 Sweep 把"刚好贴住"当成没撞到，
-        // 角色上墙后立刻失重、而且会一边"空中加速"一边钻进墙体内部。
-        {
-            var world = WallWorld(wallTop: 2f);
-            var core = MakeCore(world);
-            core.Reset(new F3(0f, 3.0f, -2.6f));   // 台面上方（台面 y=2.0）
-            Settle(core, 20);
-
-            Check("台面上站得住（贴面接触算着地）",
-                  core.OnGround && MathF.Abs(core.FeetPosition.Y - 2.0f) < 0.05f,
-                  $"onGround={core.OnGround} feetY={core.FeetPosition.Y:F3}（台面 2.000）");
-
-            Run(core, 90, In(mz: 1f));   // 朝 -Z 走出台面边缘
-
-            Check("走出台面边缘会掉到地面",
-                  core.OnGround && core.FeetPosition.Y < 0.2f,
-                  $"onGround={core.OnGround} feetY={core.FeetPosition.Y:F3} z={core.Position.Z:F3}");
-
-            // 墙占 z∈[-4,-2]，胶囊半径 0.35 ⇒ 中心落在 [-4.35,-1.65] 且脚底在台面
-            // 以下，就意味着胶囊穿进了墙体内部。
-            bool insideWall = core.Position.Z > -4.35f && core.Position.Z < -1.65f &&
-                              core.FeetPosition.Y < 1.9f;
-            Check("不会卡进墙体内部",
-                  !insideWall,
-                  $"pos.z={core.Position.Z:F3} feetY={core.FeetPosition.Y:F3}（穿模区间 z∈(-4.35,-1.65) 且 feet<1.9）");
-        }
-
-        // ═════════ 8. 扒墙里按 S / 蹲 取消 → 掉回空中 ═════════
-        {
-            var world = WallWorld(wallTop: 2f);
-            var core = MakeCore(world);
-            core.Reset(new F3(0f, 1.0f, -1.0f));
-            core.SetVelocity(new F3(0f, 0f, -6f));
-            core.Step(In(mz: 1f), core.Config.FixedDelta);
-
-            bool reachedHang = false;
-            for (int i = 0; i < 200 && !reachedHang; i++)
-            {
-                core.Step(In(mz: 1f), core.Config.FixedDelta);
-                if (core.State == MovementState.Hang) reachedHang = true;
-            }
-
-            Run(core, 3, In(mz: -1f));   // 按 S
-
-            Check("扒墙里按 S 取消并掉回空中",
-                  reachedHang && core.State == MovementState.Air,
-                  $"reachedHang={reachedHang} state={core.State}");
-        }
-
-        // ═════════ 9. 重附着规则：爬过的面不能立刻再挂回去 ═════════
+        // 9. 扒墙状态下的移动 / 掉落 / 松手
         {
             var world = WallWorld(wallTop: 6f);
             var core = MakeCore(world);
-            core.Reset(new F3(0f, 3.0f, -1.0f));
-            core.SetVelocity(new F3(0f, 0f, -6f));
-            core.Step(In(mz: 1f), core.Config.FixedDelta);
-            float attachY = core.Position.Y;
+            core.Reset(new F3(0f, 1.0f, -1.0f));
+            Settle(core, 40);
+            core.Step(In(mz: 1f, jump: true), core.Config.FixedDelta);   // 起跳
+            Run(core, 10, In(mz: 1f));                                    // 抓住
+            Run(core, 2, In());                                           // 松 W → WallHang
 
-            Run(core, 20, In(mz: 1f));   // 往上爬
-            float climbedY = core.Position.Y;
+            // 挂住时对外速度恒为 0
+            Check("⑨ 挂住时对外速度恒为 0（HUD 上 speed=0 / vy=0）",
+                  core.State == MovementState.WallHang &&
+                  core.HorizontalSpeed < 1e-3f && MathF.Abs(core.VerticalSpeed) < 1e-3f,
+                  $"state={core.State} speed={core.HorizontalSpeed:F4} vy={core.VerticalSpeed:F4}");
 
-            // 松手脱离（宽限 0.22s ≈ 13 tick，逐 tick 推进到真的掉下来为止）
-            bool detached = false;
+            // 贴墙距离 = 半径 + 皮肤
+            Check("⑨ 挂住时贴到墙面（离墙 ≈ 半径 + 0.02）",
+                  MathF.Abs(core.Position.Z - (-2f + cfg0.CapsuleRadius + 0.02f)) < 0.06f,
+                  $"z={core.Position.Z:F3}（期望 ≈ {-2f + cfg0.CapsuleRadius + 0.02f:F3}）");
+
+            // A / D 横移
+            float x0 = core.Position.X;
+            Run(core, 30, In(mx: 1f));
+            float dxRight = core.Position.X - x0;
+            Check("⑩ 按 D 沿墙横移 ≈ WallHangShimmySpeed（0.8 m/s）",
+                  MathF.Abs(dxRight - 0.4f) < 0.12f,
+                  $"0.5s 横移 {dxRight:F2}m（期望 ≈ +0.40）");
+
+            float x1 = core.Position.X;
+            Run(core, 30, In(mx: -1f));
+            float dxLeft = core.Position.X - x1;
+            Check("⑩ 按 A 沿墙反向横移",
+                  dxLeft < -0.25f,
+                  $"0.5s 横移 {dxLeft:F2}m（期望 ≈ -0.40）");
+        }
+
+        // 11. WA / WD 斜移（左上 / 右上）
+        {
+            var world = WallWorld(wallTop: 6f);
+            var core = MakeCore(world);
+            core.Reset(new F3(0f, 1.0f, -1.0f));
+            Settle(core, 40);
+            core.Step(In(mz: 1f, jump: true), core.Config.FixedDelta);
+            Run(core, 10, In(mz: 1f));
+
+            float x0 = core.Position.X, y0 = core.FeetPosition.Y;
+            Run(core, 30, In(mz: 1f, mx: 1f));
+            float dx = core.Position.X - x0, dy = core.FeetPosition.Y - y0;
+
+            Check("⑪ 按 W+D → 向右上斜移（同时有 +X 与 +Y）",
+                  dx > 0.25f && dy > 0.35f,
+                  $"Δx={dx:F2} Δy={dy:F2}（期望两者都为正）");
+        }
+
+        // 12. 无输入一小段时间 → 掉落
+        {
+            var world = WallWorld(wallTop: 6f);
+            var core = MakeCore(world);
+            core.Reset(new F3(0f, 1.0f, -1.0f));
+            Settle(core, 40);
+            core.Step(In(mz: 1f, jump: true), core.Config.FixedDelta);
+            Run(core, 10, In(mz: 1f));
+            Run(core, 2, In());     // → WallHang
+
+            bool wasHanging = core.State == MovementState.WallHang;
+            int ticksToFall = 0;
+            for (int i = 0; i < 120; i++)
+            {
+                core.Step(In(), core.Config.FixedDelta);
+                ticksToFall++;
+                if (core.State != MovementState.WallHang) break;
+            }
+
+            Check("⑫ 挂住后完全无输入 → 一小段时间后自动掉落",
+                  wasHanging && ticksToFall > 5 && ticksToFall < 100,
+                  $"掉落用时 {ticksToFall} tick（{ticksToFall / 60f:F2}s，"
+                  + $"配置 WallHangIdleFallTime={cfg0.WallHangIdleFallTime:F2}s）");
+        }
+
+        // 13. 按 S → 立刻松手垂直下落
+        {
+            var world = WallWorld(wallTop: 6f);
+            var core = MakeCore(world);
+            core.Reset(new F3(0f, 1.0f, -1.0f));
+            Settle(core, 40);
+            core.Step(In(mz: 1f, jump: true), core.Config.FixedDelta);
+            Run(core, 10, In(mz: 1f));
+            Run(core, 2, In());
+
+            float yHang = core.FeetPosition.Y;
+            core.Step(In(mz: -1f), core.Config.FixedDelta);   // 按 S
+            bool detached = core.State == MovementState.Air;
+
+            Run(core, 12, In());
+            float fell = yHang - core.FeetPosition.Y;
+
+            Check("⑬ 按 S → 立刻取消扒墙，回 Air",
+                  detached,
+                  $"state={core.State}");
+            Check("⑬ 松手后垂直下落（12 tick 掉 >0.3m，且有向下速度）",
+                  fell > 0.3f && core.VerticalSpeed < -2f,
+                  $"Δy=-{fell:F2}m vy={core.VerticalSpeed:F2}");
+        }
+
+        // 14. 下落过程中按 W → 重新扒住墙
+        {
+            var world = WallWorld(wallTop: 12f);
+            var core = MakeCore(world);
+            core.Reset(new F3(0f, 5.0f, -1.0f));
+            core.SetVelocity(new F3(0f, -2f, 0f));
+            Run(core, 3, In());                    // 下落自动抓住
+
+            bool hung = core.State == MovementState.WallHang;
+            float yHang = core.FeetPosition.Y;
+
+            core.Step(In(mz: -1f), core.Config.FixedDelta);   // S 松手
+            Run(core, 4, In());                              // 自由下落
+
+            bool regained = false;
+            for (int i = 0; i < 60; i++)
+            {
+                core.Step(In(mz: 1f), core.Config.FixedDelta);  // 下落中按 W
+                if (core.State is MovementState.Climb or MovementState.WallHang) { regained = true; break; }
+            }
+
+            Check("⑭ 下落过程中按 W → 重新扒住墙",
+                  hung && regained,
+                  $"松手前 state={(hung ? "WallHang" : "未挂上")} feet={yHang:F2}，"
+                  + $"现在 state={core.State}");
+        }
+
+        // 15. 按 Space → 蹬墙跳（墙上没有可站台面时）
+        {
+            var world = WallWorld(wallTop: 6f);
+            var core = MakeCore(world);
+            core.Reset(new F3(0f, 1.0f, -1.0f));
+            Settle(core, 40);
+            core.Step(In(mz: 1f, jump: true), core.Config.FixedDelta);
+            Run(core, 10, In(mz: 1f));
+            Run(core, 2, In());
+
+            core.Step(In(jump: true), core.Config.FixedDelta);
+            Check("⑮ 挂住时按 Space → 蹬墙跳（离墙 + 向上）",
+                  core.State == MovementState.Air &&
+                  core.Velocity.Z > 0.5f && core.VerticalSpeed > 3f,
+                  $"state={core.State} vz={core.Velocity.Z:F2} vy={core.VerticalSpeed:F2}");
+        }
+
+        // 16. 视角甩开太大 → 松手
+        {
+            var world = WallWorld(wallTop: 6f);
+            var core = MakeCore(world);
+            core.Reset(new F3(0f, 1.0f, -1.0f));
+            Settle(core, 40);
+            core.Step(In(mz: 1f, jump: true), core.Config.FixedDelta);
+            Run(core, 10, In(mz: 1f));
+            Run(core, 2, In());
+
+            float yaw0 = core.Yaw;
+            core.Step(In(mouseYaw: MathF.PI * 0.5f), core.Config.FixedDelta);   // 甩 90°
+            Check("⑯ 视角偏离墙面法线超过 WallHangMaxViewAngle → 松手",
+                  core.State == MovementState.Air,
+                  $"yaw {yaw0:F2}→{core.Yaw:F2}，state={core.State}");
+        }
+
+        // 17. 太矮的障碍不挂 —— 直接迈/翻过去更合理（v0.4：门槛降到小障碍档 1m 以下）
+        {
+            var world = WallWorld(wallTop: 0.5f);
+            var core = MakeCore(world);
+            core.Reset(new F3(0f, 1.0f, -1.0f));
+            Settle(core, 40);
+            core.Step(In(mz: 1f, jump: true), core.Config.FixedDelta);
+            bool everGrab = false;
             for (int i = 0; i < 40; i++)
             {
-                core.Step(In(mz: 0f), core.Config.FixedDelta);
-                if (core.State != MovementState.Climb) { detached = true; break; }
+                core.Step(In(mz: 1f), core.Config.FixedDelta);
+                if (core.State is MovementState.Climb or MovementState.WallHang) everGrab = true;
             }
-            float dropY = core.Position.Y;
-
-            // 立刻再次朝墙推：位置仍高于上次附着点 ⇒ 同一面墙不允许立刻重附着
-            core.SetVelocity(new F3(0f, 0f, -6f));
-            core.Step(In(mz: 1f), core.Config.FixedDelta);
-            bool reattached = core.State == MovementState.Climb;
-
-            Check("同一面墙爬过之后不能在同一高度以上立刻重附着",
-                  detached && !reattached && dropY > attachY,
-                  $"attachY={attachY:F2} climbedY={climbedY:F2} dropY={dropY:F2} " +
-                  $"detached={detached} reattached={reattached}");
+            Check("⑰ 半米高的坎不会被挂住（该直接迈过去）",
+                  !everGrab,
+                  $"state={core.State}（automantle_disable_hang：脚底 +0.6m 打不到墙）");
         }
 
-        // ═════════ 10. tick 基准固定 60/s ═════════
+        // 17b. 刚过小障碍档的 1.5m 墙**可以**挂 —— v0.3 曾把它也拒了（1.0…2.03m 是死区）
         {
-            var cfg = MovementConfig.Apex();
-            Check("tick 基准固定 60/s（配置）",
-                  cfg.TickRate == 60 && cfg.MaxCatchUpTicks == 4,
-                  $"TickRate={cfg.TickRate} MaxCatchUpTicks={cfg.MaxCatchUpTicks}");
-            Check("FixedDelta = 1/60",
-                  MathF.Abs(cfg.FixedDelta - 1f / 60f) < 1e-6f,
-                  $"FixedDelta={cfg.FixedDelta:F6}（1/60={1f / 60f:F6}）");
+            var world = WallWorld(wallTop: 2.5f);
+            var core = MakeCore(world);
+            core.Reset(new F3(0f, 1.0f, -1.0f));
+            Settle(core, 40);
+            core.Step(In(mz: 1f, jump: true), core.Config.FixedDelta);
+            bool grabbed = false;
+            for (int i = 0; i < 40 && !grabbed; i++)
+            {
+                core.Step(In(mz: 1f), core.Config.FixedDelta);
+                if (core.State is MovementState.Climb or MovementState.WallHang) grabbed = true;
+            }
+            Check("⑰b 2.5m 墙（跳不上、必须攀爬）能挂住（v0.3 的 1.0…2.03m 死区已修）",
+                  grabbed,
+                  $"state={core.State}，抓到={grabbed}");
+        }
 
-            // 30 fps 帧 → 每帧吃 2 tick
-            var clock30 = new ApexTickClock(1f / 60f, 4);
-            clock30.Accumulate(1f / 30f);
-            int t30 = 0;
-            while (t30 < 100 && clock30.TryConsumeTick(out _)) t30++;
-            Check("30fps 下每帧消费 2 个 tick（60 tick/s 不漂移）",
-                  t30 == 2,
-                  $"1 帧 1/30s 消费 {t30} tick（期望 2）");
+        // 18. 挂墙期间墙消失（比如墙被打掉）→ 自动脱手，不卡在空中
+        {
+            var world = WallWorld(wallTop: 6f);
+            var core = MakeCore(world);
+            core.Reset(new F3(0f, 1.0f, -1.0f));
+            Settle(core, 40);
+            core.Step(In(mz: 1f, jump: true), core.Config.FixedDelta);
+            Run(core, 10, In(mz: 1f));
 
-            // 144 fps 帧 → 10 秒累计应正好 600 tick（最多差 1 个残 tick）
-            //
-            // 用 10 秒而不是 1 秒：float 累加 1/144 本身有舍入误差，
-            // 单秒可能只凑出 59 个 tick（残差留在 accumulator 里），这不叫漂移；
-            // 真正要证明的是"误差不会随时间累积"——10 秒仍是 599/600 就成立。
-            var clock144 = new ApexTickClock(1f / 60f, 4);
-            long total = 0;
+            // 把墙"拆掉"：换成一张无限地面（射线打不到墙了）
+            core.BindWorld(new AnalyticWorld(0f));
+            bool detached = false;
+            for (int i = 0; i < 20; i++)
+            {
+                core.Step(In(mz: 1f), core.Config.FixedDelta);
+                if (core.State is not (MovementState.Climb or MovementState.WallHang)) { detached = true; break; }
+            }
+            Check("⑱ 墙消失后自动脱手（不卡在挂墙状态）",
+                  detached,
+                  $"state={core.State}");
+        }
+
+        // ═════════════ 需求 5：三档障碍分级 ═════════════
+
+        // 19. ≤0.25m 台阶：直接走过去，无动作、速度大小不变、中途出现斜向上的速度
+        {
+            var world = new AnalyticWorld(0f);
+            world.AddBox(new F3(-6f, 0f, -6f), new F3(6f, 0.20f, -4f));   // 0.20m 台阶
+            var core = MakeCore(world);
+            core.Reset(new F3(0f, 1f, 0f));
+            Settle(core, 20);
+
+            Run(core, 40, In(mz: 1f));       // 先跑到满速
+            float speedBefore = core.HorizontalSpeed;
+
+            bool sawAction = false;
+            float maxUpVel = 0f;
+            float minTotal = float.MaxValue;
+            float maxTotal = 0f;
+            float peakFeet = core.FeetPosition.Y;
+
+            for (int i = 0; i < 90; i++)
+            {
+                core.Step(In(mz: 1f), core.Config.FixedDelta);
+                if (core.State is MovementState.Vault or MovementState.Climb
+                    or MovementState.WallHang or MovementState.Mantle) sawAction = true;
+                maxUpVel = MathF.Max(maxUpVel, core.VerticalSpeed);
+                float total = core.Velocity.Length();
+                minTotal = MathF.Min(minTotal, total);
+                maxTotal = MathF.Max(maxTotal, total);
+                peakFeet = MathF.Max(peakFeet, core.FeetPosition.Y);
+            }
+
+            Check("⑲ 0.20m 台阶：不触发任何动作（无 Vault / Climb / WallHang / Mantle）",
+                  !sawAction,
+                  $"是否触发={sawAction}");
+            Check("⑲ 0.20m 台阶：平滑踩上去（脚底到达 0.20m）",
+                  peakFeet > 0.18f && peakFeet < 0.35f,
+                  $"峰值脚底 {peakFeet:F3}m（台阶 0.20m）");
+            Check("⑲ 0.20m 台阶：上台阶瞬间速度出现斜向上分量（只改方向）",
+                  maxUpVel > 0.3f,
+                  $"最大向上速度 {maxUpVel:F2} m/s（tan θ = b/a = 0.20/{cfg0.CapsuleRadius:F2} → θ≈26°）");
+            Check("⑲ 0.20m 台阶：速度**大小**基本不变（无衰减）",
+                  MathF.Abs(maxTotal - speedBefore) < 0.6f &&
+                  minTotal > speedBefore * 0.75f,
+                  $"上台阶前 {speedBefore:F2} m/s，途中 |v|∈[{minTotal:F2}, {maxTotal:F2}]");
+        }
+
+        // 20. ≤1m 小障碍：W 撞上去被挡住（不自动翻），W+Space 才翻越
+        {
+            var world = new AnalyticWorld(0f);
+            world.AddBox(new F3(-6f, 0f, -6f), new F3(6f, 0.8f, -4f));   // 0.80m 小障碍
+            var core = MakeCore(world);
+            core.Reset(new F3(0f, 1f, 0f));
+            Settle(core, 20);
+
+            bool autoTraversed = false;
+            for (int i = 0; i < 90; i++)
+            {
+                core.Step(In(mz: 1f), core.Config.FixedDelta);
+                if (core.State is MovementState.Vault or MovementState.Mantle
+                    or MovementState.Climb or MovementState.WallHang) autoTraversed = true;
+            }
+            Check("⑳ 0.80m 小障碍：只按 W 不会自动翻越（撞住）",
+                  !autoTraversed && core.Position.Z > -4.0f,
+                  $"state={core.State} z={core.Position.Z:F2}（障碍前脸 z=-4.0）");
+
+            // 现在按 W + Space
+            bool vaulted = false;
+            float peakFeet = core.FeetPosition.Y;
+            float speedAtVaultEnd = 0f;
+            for (int i = 0; i < 90; i++)
+            {
+                core.Step(In(mz: 1f, jump: i == 0), core.Config.FixedDelta);
+                if (core.State == MovementState.Vault) vaulted = true;
+                peakFeet = MathF.Max(peakFeet, core.FeetPosition.Y);
+                if (vaulted && core.State == MovementState.Ground)
+                {
+                    speedAtVaultEnd = core.HorizontalSpeed;
+                    break;
+                }
+            }
+
+            Check("⑳ 0.80m 小障碍：W + Space → 进入 Vault 状态",
+                  vaulted,
+                  $"state={core.State}");
+            Check("⑳ 0.80m 小障碍：翻越后落到障碍上方（脚底 ≈ 0.80m）",
+                  peakFeet > 0.70f && peakFeet < 1.10f,
+                  $"峰值脚底 {peakFeet:F3}m（障碍 0.80m）");
+            Check("⑳ 0.80m 小障碍：翻越结束保留大部分水平速度（VaultSpeedRetention）",
+                  speedAtVaultEnd > cfg0.WalkSpeed * cfg0.VaultSpeedRetention * 0.8f,
+                  $"翻完水平速度 {speedAtVaultEnd:F2} m/s（保留率 {cfg0.VaultSpeedRetention:F2}，"
+                  + $"行走 {cfg0.WalkSpeed:F2}）");
+        }
+
+        // 21. >1m 墙：W 撞停，W+Space 不走 Vault（走抓墙）
+        {
+            var world = WallWorld(wallTop: 6.0f);
+            var core = MakeCore(world);
+            core.Reset(new F3(0f, 1.0f, -1.0f));
+            Settle(core, 40);
+
+            bool everVault = false;
+            for (int i = 0; i < 120; i++)
+            {
+                core.Step(In(mz: 1f), core.Config.FixedDelta);
+                if (core.State == MovementState.Vault) everVault = true;
+            }
+            Check("㉑ 6m 高墙：只按 W 不会翻越（撞停）",
+                  !everVault && core.Position.Z > -2.0f,
+                  $"z={core.Position.Z:F2}（墙面 -2.0）");
+
+            bool grabbed = JumpAndGrab(core, 6f);
+            Check("㉑ 6m 高墙：W + Space → 走抓墙（Climb / WallHang），不是 Vault",
+                  grabbed && core.State is MovementState.Climb or MovementState.WallHang,
+                  $"state={core.State}");
+        }
+
+        // 22. 显式翻越 API（TryTraversal）仍保留：1.6m 台面 → Mantle/Level
+        {
+            var world = new AnalyticWorld(0f);
+            world.AddBox(new F3(-6f, 0f, -6f), new F3(6f, 1.6f, -4f));
+            var core = MakeCore(world);
+            core.Reset(new F3(0f, 1f, 0f));
+            Settle(core, 20);
+            Run(core, 90, In(mz: 1f));      // 走到台面（4m 外，约需 60 tick）
+
+            bool ok = core.TryTraversal(In(mz: 1f));
+            Check("㉒ 显式 TryTraversal：1.6m 台面 → 进入 Mantle / Level 档",
+                  ok && core.State == MovementState.Mantle && core.CurrentMantleClass == MantleClass.Level,
+                  $"触发={ok} state={core.State} class={core.CurrentMantleClass} z={core.Position.Z:F2}");
+        }
+
+        // 23. 显式翻越超过上限（7.5m）→ 拒绝
+        {
+            var world = new AnalyticWorld(0f);
+            world.AddBox(new F3(-6f, 0f, -6f), new F3(6f, 7.5f, -4f));
+            var core = MakeCore(world);
+            core.Reset(new F3(0f, 1f, 0f));
+            Settle(core, 20);
+            Run(core, 90, In(mz: 1f));
+
+            bool ok = core.TryTraversal(In(mz: 1f));
+            Check("㉓ 显式 TryTraversal：7.5m > MantleMaxHeight(6.93) → 拒绝",
+                  !ok && core.Position.Z < -3.4f,
+                  $"触发={ok} z={core.Position.Z:F2}（已贴到台面 -3.59；上限 {cfg0.MantleMaxHeight:F2}m）");
+        }
+
+        // 24. 三档高度边界（纯配置断言，防止以后有人把档位改回去）
+        {
+            Check("㉔ 档位边界：OverwalkableHeight = 0.25（台阶档上限）",
+                  MathF.Abs(cfg0.OverwalkableHeight - 0.25f) < 1e-4f,
+                  $"OverwalkableHeight={cfg0.OverwalkableHeight:F4}");
+            Check("㉔ 档位边界：VaultMaxHeight = 1.00（小障碍档上限）",
+                  MathF.Abs(cfg0.VaultMaxHeight - 1.0f) < 1e-4f,
+                  $"VaultMaxHeight={cfg0.VaultMaxHeight:F4}");
+            Check("㉔ 档位顺序自洽：台阶 < 小障碍 < 墙",
+                  cfg0.OverwalkableHeight < cfg0.VaultMaxHeight &&
+                  cfg0.VaultMaxHeight < cfg0.AutoMantleMaxHeight,
+                  $"{cfg0.OverwalkableHeight:F2} < {cfg0.VaultMaxHeight:F2} < {cfg0.AutoMantleMaxHeight:F2}");
+        }
+
+        // ═════════════ v0.3 遗留：tick 基准 / 探针开销 ═════════════
+
+        {
+            Check("㉕ tick 基准固定 60/s（配置）",
+                  cfg0.TickRate == 60 && cfg0.MaxCatchUpTicks == 4,
+                  $"TickRate={cfg0.TickRate} MaxCatchUpTicks={cfg0.MaxCatchUpTicks}");
+            Check("㉕ FixedDelta = 1/60",
+                  MathF.Abs(cfg0.FixedDelta - 1f / 60f) < 1e-7f,
+                  $"FixedDelta={cfg0.FixedDelta:F6}");
+
+            var clock = new ApexTickClock(1f / 60f, 4);
+            clock.Accumulate(1f / 30f);
+            int n = 0;
+            while (clock.TryConsumeTick(out _)) n++;
+            Check("㉕ 30fps 下每帧消费 2 个 tick（60 tick/s 不漂移）",
+                  n == 2, $"1 帧 1/30s 消费 {n} tick（期望 2）");
+
+            var clock2 = new ApexTickClock(1f / 60f, 4);
+            int total = 0;
             for (int i = 0; i < 1440; i++)
             {
-                clock144.Accumulate(1f / 144f);
-                while (clock144.TryConsumeTick(out _)) total++;
+                clock2.Accumulate(1f / 144f);
+                while (clock2.TryConsumeTick(out _)) total++;
             }
-            Check("144fps 下 10 秒整好 600 个 tick（无累积漂移）",
-                  total >= 599 && total <= 600,
-                  $"1440 帧 × 1/144s → {total} tick（期望 599–600）");
+            Check("㉕ 144fps 下 10 秒整好 600 个 tick（无累积漂移）",
+                  total is >= 599 and <= 600, $"1440 帧 × 1/144s → {total} tick（期望 599–600）");
 
-            // 卡顿保护：一帧 1s 只放 4 tick，其余丢弃
-            var clockStall = new ApexTickClock(1f / 60f, 4);
-            clockStall.Accumulate(1f);
-            int stallTicks = 0;
-            while (stallTicks < 100 && clockStall.TryConsumeTick(out _)) stallTicks++;
-            Check("卡顿时最多补 4 tick（其余丢弃，有计数）",
-                  stallTicks <= 4 && clockStall.DroppedTicks > 0,
-                  $"消费 {stallTicks} tick，丢弃 {clockStall.DroppedTicks}（上限 4）");
+            var clock3 = new ApexTickClock(1f / 60f, 4);
+            clock3.Accumulate(1.0f);
+            int consumed = 0;
+            while (clock3.TryConsumeTick(out _)) consumed++;
+            Check("㉕ 卡顿时最多补 4 tick（其余丢弃，有计数）",
+                  consumed == 4 && clock3.DroppedTicks > 0,
+                  $"消费 {consumed} tick，丢弃 {clock3.DroppedTicks}（上限 4）");
         }
 
-        // ═════════ 11. 昂贵探针降到 30/s ═════════
+        // 26. 探针抽样
         {
-            Check("翻越探针抽样间隔为 2（60Hz → 30Hz）",
-                  cfg0.TraversalProbeInterval == 2,
-                  $"TraversalProbeInterval={cfg0.TraversalProbeInterval}");
+            // 挂墙期间"墙还在吗"探针：ClimbWallProbeInterval = 2 ⇒ 30 Hz
+            var world = WallWorld(wallTop: 6f);
+            var core = MakeCore(world);
+            core.Reset(new F3(0f, 1.0f, -1.0f));
+            Settle(core, 40);
+            core.Step(In(mz: 1f, jump: true), core.Config.FixedDelta);
+            Run(core, 10, In(mz: 1f));
 
-            // 地面站定 60 tick：翻越探针应只跑约 30 次
+            if (core.State == MovementState.Climb)
+            {
+                int before = core.ClimbWallProbeCount;
+                Run(core, 60, In(mz: 1f));
+                int probes = core.ClimbWallProbeCount - before;
+                Check("㉖ 挂墙期间墙探针抽样间隔 2（60 tick ≈ 30 次）",
+                      probes is >= 28 and <= 32,
+                      $"实测 {probes} 次（期望 30 ± 2）");
+            }
+            else
+            {
+                Check("㉖ 挂墙期间墙探针抽样间隔 2（60 tick ≈ 30 次）", false,
+                      $"前置失败：没进入 Climb（state={core.State}）");
+            }
+
+            // 附着探针：ClimbProbeInterval = 1 ⇒ 每 tick
+            var core2 = MakeCore(WallWorld(6f));
+            core2.Reset(new F3(3f, 10f, 3f));   // 离墙远，不会真挂上
+            int before2 = core2.ClimbProbeCount;
+            Run(core2, 40, In());
+            int climbProbes = core2.ClimbProbeCount - before2;
+            Check("㉖ 附着探针每 tick 都跑（间隔 1）",
+                  climbProbes == 40, $"实测 {climbProbes} 次（期望 40）");
+        }
+
+        // 27. v0.4 移除自动翻越探测：地面上不再有每 tick 的翻越射线
+        {
             var world = new AnalyticWorld(0f);
             var core = MakeCore(world);
             core.Reset(new F3(0f, 1.0f, 0f));
             Settle(core, 40);
             int before = core.TraversalProbeCount;
-            Run(core, 60, In());
-            int traumaProbes = core.TraversalProbeCount - before;
-
-            Check("60 个地面 tick 只做约 30 次翻越探针",
-                  traumaProbes >= 28 && traumaProbes <= 32,
-                  $"实测 {traumaProbes} 次（期望 30 ± 2，60Hz 全量会是 60）");
-
-            // 空中 40 tick：攀爬探针每 tick 都跑（很便宜）
-            var core2 = MakeCore(WallWorld(6f));
-            core2.Reset(new F3(3f, 10f, 0f));   // 高空、离墙很远（射线打不到），不会真的挂住
-            int before2 = core2.ClimbProbeCount;
-            Run(core2, 40, In());
-            int climbProbes = core2.ClimbProbeCount - before2;
-
-            Check("攀爬探针每 tick 都跑（间隔 1）",
-                  climbProbes == 40,
-                  $"实测 {climbProbes} 次（期望 40）");
+            Run(core, 60, In(mz: 1f));
+            int probes = core.TraversalProbeCount - before;
+            Check("㉗ 自动翻越探测已移除（地面 60 tick 探针数 = 0）",
+                  probes == 0,
+                  $"实测 {probes} 次（v0.3 是 30 次；v0.4 改为只在 W+Space 时显式触发）");
         }
 
         sb.AppendLine();

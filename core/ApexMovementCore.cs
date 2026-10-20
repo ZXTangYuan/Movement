@@ -90,7 +90,6 @@ public sealed class ApexMovementCore
 
     // ── 贴墙爬（climb） ──
     private float _climbTime;
-    private float _climbNonUpwardTimer;
     private float _climbAttachHeight;
     private float _climbBaseY;
     private F3 _climbWallNormal = F3.Zero;
@@ -119,8 +118,6 @@ public sealed class ApexMovementCore
     /// </summary>
     private F3 _climbLastWallHit;
 
-    /// <summary>翻越探针实际执行次数（自检用：验证 30 Hz 抽样真的生效）。</summary>
-    private int _traversalProbeCount;
     /// <summary>攀爬探针实际执行次数（自检用）。</summary>
     private int _climbProbeCount;
 
@@ -139,6 +136,16 @@ public sealed class ApexMovementCore
     // ── 扒墙 / 悬垂（WallHang） ──
     private float _wallHangTime;
     private float _wallHangSlip;
+    /// <summary>
+    /// 握力 0..1（v0.4 新增）：1 = 刚抓住，0 = 脱手。
+    ///
+    /// 这是「扒墙默认化」之后唯一的掉落下限来源 —— 需求要的是
+    /// 「持续一小段时间没有按键输入，就会掉落」：
+    ///   · 完全无输入 → 按 <see cref="MovementConfig.WallHangIdleFallTime"/> 的速度流失
+    ///   · 只按 A/D 横移 → 按 <see cref="MovementConfig.WallHangMaxTime"/> 的速度流失
+    ///   · 按 W 上爬 → 回补（`WallHangClimbRestoresGrip`）
+    /// </summary>
+    private float _wallHangGrip = 1f;
     private float _wallHangCooldown;
     private F3 _wallHangNormal = F3.Zero;
     private F3 _wallHangLastHit;
@@ -146,9 +153,7 @@ public sealed class ApexMovementCore
     /// 脱手后"必须先离开墙面一次才能再挂"的门闩。
     /// 没有它，按住蹲的玩家会在同一位置反复「抓住 → 滑落/超时脱手 → 再抓住」。
     /// </summary>
-    private bool _wallHangNeedRelease;
-    /// <summary>扒墙探针实际执行次数（自检用）。</summary>
-    private int _wallHangProbeCount;
+    private bool _wallGrabNeedW;
     /// <summary>攀爬到顶探针实际执行次数（自检用：验证 30 Hz 抽样）。</summary>
     private int _climbWallProbeCount;
 
@@ -180,6 +185,27 @@ public sealed class ApexMovementCore
 
     // ── 步频相位（帧率无关的走路摇晃） ──
     private float _bobPhase;
+
+    // ── v0.4：步态推导（身高 → 步幅 → 步频） ──
+    /// <summary>
+    /// 本 tick 的步态求值结果。<see cref="GaitModel"/> 按「身高 + 水平速度 +
+    /// 冲刺参考速度 + 蹲伏量」推出步频/步幅/腾空比与各方向抖动半幅，
+    /// 相机只负责把它变成眼位偏移与角度 —— **不再自己拍频率与幅度**。
+    /// </summary>
+    private GaitSample _gait;
+
+    // ── v0.4：台阶倾斜（≤0.25m 台阶"只改方向不改大小"） ──
+    /// <summary>本次台阶过渡的倾角 (rad)：tan(θ) = b / a。</summary>
+    private float _stepTiltAngle;
+    /// <summary>台阶倾斜的剩余时间 (s)；0 = 没有倾斜。</summary>
+    private float _stepTiltTimer;
+
+    // ── v0.4：翻越后的加速宽限（需求"翻越结束快速恢复满速"） ──
+    private float _vaultRecoverTimer;
+    /// <summary>翻越小障碍前记下的水平速度（翻越结束时按 VaultSpeedRetention 还回去）。</summary>
+    private float _vaultExitSpeed;
+    /// <summary>翻越结束时的水平方向。</summary>
+    private F3 _vaultExitDir = F3.Zero;
 
     // ── 统计 ──
     private int _tickCount;
@@ -238,6 +264,13 @@ public sealed class ApexMovementCore
     /// <summary>沿重力方向的速度分量（正 = 向上）。</summary>
     public float VerticalSpeed => F3.Dot(_vel, _up);
 
+    /// <summary>
+    /// 台阶倾斜角（弧度）。上台阶那一 tick 由 <c>tan(theta) = b / a</c> 算出，
+    /// 之后在 <see cref="MovementConfig.StepTiltTime"/> 内线性衰减到 0。
+    /// 0 = 没有正在进行的台阶过渡。HUD / 自检读它。
+    /// </summary>
+    public float StepTiltAngle => _stepTiltAngle;
+
     /// <summary>当前状态快照（相机子系统 / HUD / 测试读它）。</summary>
     public MovementSnapshot Snapshot => new()
     {
@@ -277,13 +310,17 @@ public sealed class ApexMovementCore
         Slipping = _state == MovementState.Slip,
         SlipDirection = _slipSampleValid ? _slipSample.Direction : F3.Zero,
         SlipAirRestrictRemaining = _slipAirRestrictTimer,
-        WallHanging = _state == MovementState.WallHang,
-        WallHangGrip = _state == MovementState.WallHang
-            ? MathF.Max(0f, 1f - _wallHangSlip / MathF.Max(1e-4f, _cfg.WallHangMaxSlipDistance))
+        // 统一状态机里 Climb（按 W 上爬）与 WallHang（扒着）都是「挂在墙上」，
+        // HUD 的 hang= 读数与相机侧倾都按这一条走。
+        WallHanging = _state is MovementState.WallHang or MovementState.Climb,
+        WallHangGrip = _state is MovementState.WallHang or MovementState.Climb
+            ? MathF.Max(0f, _wallHangGrip)
             : 0f,
-        WallHangTime = _state == MovementState.WallHang ? _wallHangTime : 0f,
+        WallHangTime = _state is MovementState.WallHang or MovementState.Climb ? _wallHangTime : 0f,
         BobPhase = _bobPhase,
         TickCount = _tickCount,
+        Gait = _gait,
+        StepTiltAngle = _stepTiltAngle,
     };
 
     public void BindWorld(IMovementWorld world) => _world = world;
@@ -310,7 +347,6 @@ public sealed class ApexMovementCore
         _mantlePhase = MantlePhase.Grab;
         _isWindowTraversal = false;
         _climbTime = 0f;
-        _climbNonUpwardTimer = 0f;
         _climbAttachHeight = 0f;
         _climbBaseY = 0f;
         _climbWallNormal = F3.Zero;
@@ -328,10 +364,11 @@ public sealed class ApexMovementCore
         _slipAirRestrictDir = F3.Zero;
         _wallHangTime = 0f;
         _wallHangSlip = 0f;
+        _wallHangGrip = 1f;
         _wallHangCooldown = 0f;
         _wallHangNormal = F3.Zero;
         _wallHangLastHit = F3.Zero;
-        _wallHangNeedRelease = false;
+        _wallGrabNeedW = false;
         _jumpBuffered = false;
         _jumpBufferTimer = 0f;
         _coyoteTimer = 0f;
@@ -348,6 +385,12 @@ public sealed class ApexMovementCore
         _landingFallDistance = 0f;
         _landingImpactSpeed = 0f;
         _bobPhase = 0f;
+        _gait = default;
+        _stepTiltAngle = 0f;
+        _stepTiltTimer = 0f;
+        _vaultRecoverTimer = 0f;
+        _vaultExitSpeed = 0f;
+        _vaultExitDir = F3.Zero;
         _tickCount = 0;
         _slideHopCount = 0;
         _bunnyHopCount = 0;
@@ -392,6 +435,8 @@ public sealed class ApexMovementCore
         if (_timeSinceLanded < 900f) _timeSinceLanded += dt;
         if (_slipAirRestrictTimer > 0f) _slipAirRestrictTimer = MathF.Max(0f, _slipAirRestrictTimer - dt);
         if (_wallHangCooldown > 0f) _wallHangCooldown = MathF.Max(0f, _wallHangCooldown - dt);
+        if (_stepTiltTimer > 0f) _stepTiltTimer = MathF.Max(0f, _stepTiltTimer - dt);
+        if (_vaultRecoverTimer > 0f) _vaultRecoverTimer = MathF.Max(0f, _vaultRecoverTimer - dt);
 
         if (input.JumpPressed) { _jumpBuffered = true; _jumpBufferTimer = _cfg.JumpBufferTime; }
 
@@ -402,17 +447,18 @@ public sealed class ApexMovementCore
             return;
         }
 
-        // 4) 贴墙爬期间独占推进
-        if (_state == MovementState.Climb)
+        // 4) 贴墙（Climb 上爬 / WallHang 扒墙）期间独占推进
+        //
+        // ★ v0.4：两者合成**一个**状态机 `StepWallGrab`。
+        //
+        //   v0.3 是两套独立入口（Climb 要朝墙动量 + 空中；WallHang 要按住 Ctrl），
+        //   需求方明确要求「扒墙默认化、不需要按任何键」「按住 W 才往上爬，
+        //   松开 W 就进入扒墙」，所以"上爬"和"扒着"本来就只是同一个挂墙状态下的
+        //   两个输入分支，拆成两套状态机只会带来两套不一致的脱离规则。
+        //   现在统一为：贴墙抓住 → 按 W 就是 Climb（向上），不按 W 就是 WallHang（挂着）。
+        if (_state is MovementState.Climb or MovementState.WallHang)
         {
-            StepClimb(input, dt);
-            return;
-        }
-
-        // 4b) 扒墙 / 悬垂期间独占推进（位置是运动学积分，不需要 MoveWithCollision）
-        if (_state == MovementState.WallHang)
-        {
-            StepWallHang(input, dt);
+            StepWallGrab(input, dt);
             return;
         }
 
@@ -428,22 +474,17 @@ public sealed class ApexMovementCore
         // 否则抽样空档里会误判"已离开滑区"而抖动进出状态。
         UpdateSlip(dt);
 
-        // 6) 自动翻越/窗口探测
+        // 6) 自动翻越探测 —— **v0.4 已整体移除**
         //
-        // ★ v0.3 关键修正：**只在地面/滑铲时探测**。
+        // v0.2/v0.3 在这里无条件调 TryTraversal，于是"贴墙按 W"就有一半概率
+        // 直接被抓上墙（这就是需求方反馈的「按一下 W 就开始攀爬」）。
+        // v0.3 把它收紧到"只在地面/滑铲时探测"，但只要按着 W 贴墙**仍然**会自动翻。
         //
-        // v0.2 无条件在这里调 TryTraversal，于是角色还在空中、只要按着 W 贴着墙，
-        // 就会先被判定成"可以翻越"直接抓上去 —— 这就是"贴墙 W 强制攀爬"的一半根因。
-        // 空中该走的是 Climb（见 StepAir），不是 mantle；而 Climb 爬到顶会自己
-        // 过渡到 Hang（扒墙），再按 W 才走 Mantle pull。职责就分清了。
-        //
-        // 另一半是探针抽样（TraversalProbeInterval）：翻越扫描是最贵的一段，
-        // 降到 30 Hz（间隔 2）对玩法无影响。（需求：性能开销大的地方可降到 30 tick/s）
-        if (_cfg.AutoTraverse && (_onGround || _state == MovementState.Slide) && ShouldProbeTraversal())
-        {
-            _traversalProbeCount++;
-            TryTraversal(input);
-        }
+        // v0.4 的三档分级（需求方口径）把这件事彻底讲清楚了：
+        //   · ≤0.25 m  台阶   → 由 MoveWithCollision 的 TryStepUp 自动跨越，不需要探测
+        //   · ≤1.00 m  小障碍 → **必须 W + Space**（在 StepGround 的跳跃分支里触发 Vault）
+        //   · >1.00 m  墙     → 地面上一律撞停，起跳后由空中 → 贴墙抓住 → Climb 接管
+        // 所以这里不再有任何"自动探测"，翻越只由跳跃键显式触发。
 
         // 7) 按状态推进速度
         switch (_state)
@@ -455,14 +496,51 @@ public sealed class ApexMovementCore
             default: StepAir(input, dt); break;
         }
 
+        // 7b) 台阶倾斜的计时器在这里只负责衰减（见下方 9b）
+        //     —— 真正的速度旋转放在 MoveWithCollision / UpdateGroundContact 之后，
+        //        因为"是不是台阶"要等 TryStepUp 扫掠完才知道。
+
         // 8) 位移与碰撞
         MoveWithCollision(dt);
 
         // 9) 落地判定 + 状态迁移
         UpdateGroundContact(dt);
 
-        // 10) 步频相位（帧率无关：按 tick 累加，不按渲染帧）
+        // 9b) 台阶倾斜：把速度**整体旋转**到倾角上（大小不变，只改方向）
+        //
+        // 需求原话：「上台阶时水平速度变为斜向上的速度再变回水平，
+        // **只有方向变化、大小不变**，不触发任何动作」。
+        // 倾斜角 θ 满足 tan(θ) = b / a（b = 台阶高度，a = 脚底中心到脚底边缘的横向距离），
+        // 在 StepTiltTime 内从 θ₀ 线性衰减到 0，于是速度方向"抬起 → 落回水平"。
+        // 放在 UpdateGroundContact 之后：位置已经被贴地吸附钳好，抬起的竖直分量
+        // 不会真的把人顶飞（同一 tick 内吸附已经生效）。
+        ApplyStepTilt();
+
+        // 10) 步态（帧率无关：按 tick 累加，不按渲染帧）
         UpdateBobPhase(dt);
+    }
+
+    /// <summary>
+    /// 把速度按当前台阶倾角旋转：水平分量 × cos θ、竖直分量 += |v_h| × sin θ。
+    ///
+    /// 这样 <c>|v|</c> 完全不变（只改方向），符合需求「只有方向变化、大小不变」。
+    /// θ 在 <see cref="MovementConfig.StepTiltTime"/> 内线性衰减，于是抬起的
+    /// 竖直分量会平滑落回 0，而不是"上一级台阶就被弹飞"。
+    /// </summary>
+    private void ApplyStepTilt()
+    {
+        if (_stepTiltTimer <= 0f || _stepTiltAngle <= 1e-5f) return;
+
+        float t = _cfg.StepTiltTime <= 1e-4f ? 0f : _stepTiltTimer / _cfg.StepTiltTime;
+        if (t <= 0f) return;
+
+        float angle = _stepTiltAngle * t;
+        F3 horiz = F3.ProjectOnPlane(_vel, _up);
+        float hSpeed = horiz.Length();
+        if (hSpeed < 1e-5f) return;
+
+        F3 dir = horiz / hSpeed;
+        _vel = dir * (hSpeed * MathF.Cos(angle)) + _up * (hSpeed * MathF.Sin(angle));
     }
 
     // ───────────────────────── 地面 ─────────────────────────
@@ -473,6 +551,10 @@ public sealed class ApexMovementCore
                     : input.SprintHeld ? _cfg.SprintAccel
                     : _cfg.GroundAccel;
 
+        // 翻越后的加速宽限：需求「翻越结束快速恢复满速」。
+        // 用一个短窗口放大加速度，比"直接塞满速度"自然得多（不会瞬移感）。
+        if (_vaultRecoverTimer > 0f) accel *= _cfg.VaultRecoverAccelBoost;
+
         ApplyFriction(dt, _cfg.Friction);
 
         F3 wishDir = WishDirection(input);
@@ -480,7 +562,12 @@ public sealed class ApexMovementCore
         Accelerate(wishDir, wishSpeed, accel, dt);
 
         // 下坡贴地：把速度投影到地面平面，避免"跳下斜坡"
-        _vel = F3.ProjectOnPlane(_vel, _groundNormal);
+        //
+        // ★ v0.4：台阶倾斜进行中**跳过**这次投影 —— 否则刚被 ApplyStepTilt 抬起来的
+        //   竖直分量会在下一 tick 就被抹平，需求「水平速度变为斜向上的速度再变回水平」
+        //   只能维持一帧。倾斜窗口只有 StepTiltTime（0.12s），过后照常投影。
+        if (_stepTiltTimer <= 0f)
+            _vel = F3.ProjectOnPlane(_vel, _groundNormal);
 
         // 滑铲触发（地面滑铲：只看水平速度是否过 200hu/s 门槛）
         // 注意：**滑铲本身没有冷却**，只有 Slideboost 有 2s 冷却（wiki）。
@@ -490,9 +577,23 @@ public sealed class ApexMovementCore
             return;
         }
 
-        // 跳跃：**必须**在贴地吸附之前处理，否则本 tick 的吸附会把跳跃初速抹掉。
+        // ── 跳跃 / 翻越小障碍 ────────────────────────────────────
+        //
+        // ★ v0.4 三档分级里的第二档：**W + Space = 翻越 ≤ VaultMaxHeight 的小障碍**。
+        //
+        // 为什么放在跳跃分支里而不是每 tick 自动探测：
+        // 需求方明确「按 W 会撞墙然后停止移动，只有按 W 贴墙 + Space 跳起后才会爬墙」。
+        // 所以"按 W"本身不能触发任何抓墙动作 —— 必须由跳跃键显式发起。
+        // 翻越失败（没有障碍 / 障碍太高）就退化成普通跳跃，行为完全不变。
         if (_jumpBuffered)
         {
+            if (input.MoveZ > 0.3f && TryVaultObstacle(input))
+            {
+                _jumpBuffered = false;
+                _jumpBufferTimer = 0f;
+                return;
+            }
+
             DoJump(fromSlide: false, crouchHeld: input.CrouchHeld);
             return;   // 本 tick 不再贴地吸附，交给空中分支下一 tick 接管
         }
@@ -551,29 +652,17 @@ public sealed class ApexMovementCore
         // 土狼跳
         if (_jumpBuffered && _coyoteTimer > 0f) DoJump(fromSlide: false, crouchHeld: input.CrouchHeld);
 
-        // 扒墙 / 悬垂（WallHang）
+        // 贴墙抓住（Climb 上爬 / WallHang 扒着 —— v0.4 合成**一个**入口）
         //
-        // 放在攀爬之前：两者互斥（扒墙要按蹲键，攀爬要朝墙动量），
-        // 但"按住蹲 + 贴墙"这种组合优先理解成"我要挂住"。
-        // 探针与攀爬共用 30 Hz 抽样（ClimbProbeInterval）。
-        if (_state == MovementState.Air && ShouldProbeClimb())
-        {
-            _wallHangProbeCount++;
-            if (TryAttachWallHang(input)) return;
-        }
-
-        // 贴墙爬附着（Climb）
-        //
-        // ★ v0.3：去掉 `input.MoveZ > 0.3f` 这个前置门槛。
-        //
-        // v0.2 只有"按着 W"才去试附着，而 TryAttachClimb 内部又只校验了视角，
-        // 于是形成"按 W + 贴墙 ⇒ 无条件吸住"。wiki L37-38 明确说不需要 W：
-        // 决定粘不粘墙的是**朝墙的动量**。所以现在移交给 TryAttachClimb 自己判
-        // 「面向墙 ∧ 空中 ∧ 有朝墙速度」三件事，W 不再是条件、也不再是放行证。
+        // 判定见 TryAttachWallGrab：空中 + 够得到陡墙 + 视角朝向 + (正在下落 ∨ 按着 W)。
+        //   · 下落中贴墙 ⇒ **自动**抓住（需求「扒墙默认，不需要按任何按键」）
+        //   · 上升中      ⇒ 必须按着 W 才抓（需求「只有 W 贴墙 + Space 跳起后才会爬墙」，
+        //                   同时保证"向上跳经过墙面不会被突然吸住"）
+        // 探针按 ClimbProbeInterval 抽样（默认每 tick），只有空中才跑。
         if (_state == MovementState.Air && ShouldProbeClimb())
         {
             _climbProbeCount++;
-            TryAttachClimb(input);
+            if (TryAttachWallGrab(input)) return;
         }
     }
 
@@ -596,8 +685,15 @@ public sealed class ApexMovementCore
         return iv <= 1 || (_tickCount % iv) == 0;
     }
 
-    /// <summary>翻越探针累计执行次数（只读，自检/性能面板用）。</summary>
-    public int TraversalProbeCount => _traversalProbeCount;
+    /// <summary>
+    /// 翻越探针累计执行次数（只读，自检/性能面板用）。
+    ///
+    /// ★ v0.4：**恒为 0**。「自动翻越探测」已整体移除 —— 需求方要求
+    /// 「按 W 撞墙停住，只有 W+Space 跳起才爬墙」，所以地面上不再有每 tick 的
+    /// 翻越射线；翻越只由跳跃键显式触发（<see cref="TryVaultObstacle"/>）。
+    /// 保留这个属性是为了自检与性能面板的兼容，不代表功能回退。
+    /// </summary>
+    public int TraversalProbeCount => 0;
 
     /// <summary>攀爬探针累计执行次数（只读，自检/性能面板用）。</summary>
     public int ClimbProbeCount => _climbProbeCount;
@@ -625,8 +721,15 @@ public sealed class ApexMovementCore
     /// <summary>打滑体积采样累计执行次数（只读，自检用）。</summary>
     public int SlipProbeCount => _slipProbeCount;
 
-    /// <summary>扒墙探针累计执行次数（只读，自检用）。</summary>
-    public int WallHangProbeCount => _wallHangProbeCount;
+    /// <summary>
+    /// 扒墙探针累计执行次数（只读，自检用）。
+    ///
+    /// ★ v0.4：攀爬与扒墙合并成同一个贴墙状态机后，"挂上去"只有**一个**探针入口
+    /// （<see cref="TryAttachWallGrab"/>，由 <see cref="ShouldProbeClimb"/> 抽样），
+    /// 所以这里与 <see cref="ClimbProbeCount"/> 是同一个计数 —— 语义上它们本来就是
+    /// 同一次射线。保留两个属性是为了自检可读性与旧断言兼容。
+    /// </summary>
+    public int WallHangProbeCount => _climbProbeCount;
 
     /// <summary>
     /// 本 tick 是否处于"离开滑区后的空中方向限制"里（供 HUD / 自检读取）。
@@ -1014,80 +1117,117 @@ public sealed class ApexMovementCore
         return _cfg.JumpFatigueHeightFrac + (1f - _cfg.JumpFatigueHeightFrac) * k;
     }
 
-    // ───────────────────────── 贴墙爬（Climb） ─────────────────────────
+    // ───────────────────────── 贴墙：抓住 / 上爬 / 扒着（v0.4 统一状态机） ─────────────────────────
     //
-    // ## v0.3 重写要点（需求：攀爬改成非强制）
+    // ## 需求方口径（m02704 第 2、3 条，逐条对应实现）
     //
-    // v0.2 的问题：空中只要按着 W 贴着墙就吸上去，吸上就一股劲爬到顶。
-    // v0.3 把它拆成"三个门槛 + 一个状态机 + 一个扒墙过渡"：
+    //   第 2 条「贴墙按 W 不该开始攀爬」
+    //     · 地面上一律不抓（`_onGround` 直接拒）⇒ 按 W 只会撞墙停住。
+    //     · 只有「W 贴墙 + Space 跳起」才会抓：空中 + 按着 W 才允许附着。
     //
-    //   门槛（必须同时满足，见 TryAttachClimb）
-    //     ① 在空中（不在 Ground/Slide/Mantle）
-    //     ② 面向墙壁（视角偏离墙面法线 ≤ 45.57° = arccos 0.7）
-    //     ③ 有朝墙速度（-dot(vel, normal) ≥ ClimbMinApproachSpeed）
+    //   第 3 条「扒墙默认化」
+    //     · 下落时贴墙**自动**抓住，不需要任何按键（`descending` 分支）。
+    //     · 抓住之后：按 W = 一直往上爬；松开 W = 停在墙上（扒墙态）。
+    //     · 完全无输入超过 WallHangIdleFallTime ⇒ 掉落。
+    //     · A/D 横移、W+A/W+D 斜移、S 立刻垂直下落、下落中按 W 可再抓住。
     //
-    //   状态机（见 StepClimb）
-    //     · 按住 W ⇒ 向上爬
-    //     · 松 W 超过 ClimbNoInputGrace ⇒ 脱手落回空中
-    //     · 跳跃 / 蹲 / 后退 / 视角甩开 ⇒ 立即脱离
+    // ## 为什么把 v0.3 的两套状态机合成一套
     //
-    //   扒墙过渡
-    //     · 探到墙顶（前向探针打空）或摸到高度上限，且上方有可站立台面
-    //       ⇒ 先补爬 ClimbHangApproachDistance，再进 MovementState.Hang
-    //     · 没有台面可挂 ⇒ 保持 v0.2 的 End boost 上抛
+    //   v0.3 有 Climb（朝墙动量 + 空中）与 WallHang（按住 Ctrl）两个独立入口，
+    //   于是"贴墙按 W"命中 Climb 的朝墙动量条件就直接吸上去 —— 正是需求方反馈的
+    //   问题。而"按住 W 才上爬 / 松 W 就扒着"本来就只是**同一个挂墙状态下的两个
+    //   输入分支**，拆成两套只会带来两套不一致的脱离规则。v0.4 统一为：
+    //   抓住 → (按 W ? Climb 上爬 : WallHang 扒着)。
     //
-    // ## 证据
-    // wiki Climb：L21/L33 必须离地；L37-38 附着看的是朝墙动量而不是 W；
-    // L40/L208 视角容差 45.57° = arccos(0.7)；L47 向上爬无计时（≥10hu/s 即可）；
-    // L101-105 两个高度上限"谁先到谁生效"；L117 脱离角度限制与附着相同；
-    // L138-140 End boost 28hu；L172-175 重附着须先低于上次 attach point，
-    // 除非新表面角度差 ≥ 25.842°。
-    // 逆向：`climbEnabled` / `climbHeight` / `climbSpeedStart|End` / `climbAccel` /
-    // `m_wallClimbSetUp` / `m_prepClimbPusher` / `wallclimb_vertical_gain_reduction`
-    // 证明攀爬是**带自己的速度曲线与 setup 阶段的状态**，不是一次性位移；
-    // `m_wallHanging` / `IsWallHanging` / `m_wallHangTime` / `ACT_MP_WALLHANG_*` /
-    // `sound_wallHangStart|Slip|Fall|Complete` / `rumbleOnWallHangStart`
-    // 证明"扒墙"是独立状态且有独立的进入/打滑/坠落反馈 —— 对应此处的 Hang 过渡。
+    // ## 保留的逆向依据（A 级字段名，仅作命名对照，不再是行为约束）
+    //
+    //   m_wallHanging / m_wallHangTime / IsWallHanging
+    //   m_wallDangleClimbProgressFloor            ← "还能爬升的进度下限"（本实现的握力）
+    //   ACT_MP_WALLHANG_FRONT/UP/RIGHT/LEFT/IDLE  ← 5 个姿势 = 可上下左右移动
+    //   sound_wallHangStart / Slip / Complete / Fall
+    //   automantle_disable_hang                   ← 能直接翻过去的矮墙不该先挂上去
 
     /// <summary>
-    /// 附着攀爬判定。**三个条件必须同时满足**：空中 + 面向墙 + 有朝墙速度。
-    /// 任何一条不满足就什么都不做（返回 false），绝不"顺手吸上去"。
+    /// 贴墙抓住判定（v0.4 统一入口）。返回 true 表示本 tick 已切到挂墙状态。
+    ///
+    /// 判定 = 「空中 ∧ 够得到陡墙 ∧ 视角朝向墙面 ∧ (正在下落 ∨ 按着 W)」。
+    ///
+    /// 注意这里**不再**要求 v0.3 的"朝墙动量"（<c>ClimbMinApproachSpeed</c>）：
+    /// 贴着墙按 W 起跳时，水平速度在起跳那一 tick 就被墙吃掉，朝墙动量几乎为 0，
+    /// 那个门槛反而把"跳起来该抓"的情况拒掉了。
     /// </summary>
-    private bool TryAttachClimb(in MovementInput input)
+    private bool TryAttachWallGrab(in MovementInput input)
     {
+        if (!_cfg.WallHangEnabled) return false;
         if (_world == null) return false;
 
-        // ① 必须在空中。地面/滑铲上的"贴墙"应该交给翻越（Step ⑥），不是攀爬。
+        // ① 必须离地。地面上的"贴墙按 W"要撞停，不是抓墙（需求第 2 条）。
         if (_onGround) return false;
         if (_state is not (MovementState.Air or MovementState.Slide)) return false;
 
-        // 刚从地面起跳的一小段不贴墙（留出起跳高度；wiki L45 也提到
-        // 从边缘掉落时有未知的附着延迟）。
+        // ①b 脚底下就有地面 ⇒ 不抓（这是"站在墙根/刚落地"，不是"挂在墙上"）。
+        //
+        // 扒墙默认化之后这条是必需的：离开地面那一 tick `_onGround` 还是 false，
+        // 而"空中 + 够得到墙 + 正在下落"三个条件全部满足 —— 于是贴着墙走下一级
+        // 小台阶的人会被凭空吸到墙上去。加一条脚下探针把"脚下是地面"排除掉。
+        if (_cfg.WallGrabMinGroundClearance > 0f)
+        {
+            F3 feetNow = _pos - _up * (_currentHeight * 0.5f);
+            if (_world.Raycast(feetNow, -_up, _cfg.WallGrabMinGroundClearance,
+                               out _, out F3 belowN) &&
+                F3.Dot(belowN, _up) >= _cfg.WalkableNormalDot)
+                return false;
+        }
+
+        // 刚从地面/边缘离地的一小段不抓（留出起跳高度）。
         if (_coyoteTimer > 0f) return false;
+        if (_wallHangCooldown > 0f) return false;
+
+        // ② 输入门：下落自动抓；上升必须按着 W。
+        bool pressingW = input.MoveZ > 0.3f;
+        bool descending = VerticalSpeed < -0.1f;
+
+        // 脱手后"必须按 W 才能再抓"的门闩（见 DetachWallGrab）。
+        // 没有它，「按 S 掉落 → 下落中自动扒住」会立刻把人吸回墙上。
+        if (_wallGrabNeedW && !pressingW) return false;
+        if (!descending && !pressingW) return false;
 
         F3 fwd = Forward();
+        float reach = _cfg.CapsuleRadius + MathF.Max(_cfg.WallHangReach, _cfg.TraversalReach);
 
-        // ② 面向墙壁：视线方向上必须打到陡墙。
-        if (!_world.Raycast(_pos, fwd, _cfg.CapsuleRadius + _cfg.TraversalReach,
-                            out F3 hitPoint, out F3 hitNormal))
+        if (!_world.Raycast(_pos, fwd, reach, out F3 hitPoint, out F3 hitNormal))
+        {
+            // 视野里已经没有墙 ⇒ 确实离开了墙面，解除"必须按 W 才能再抓"的门闩。
+            _wallGrabNeedW = false;
             return false;
+        }
 
-        // 必须是陡墙（法线与 up 的点积 ≤ 0.7 ⇔ 墙面陡于 45.57°）。
+        // ③ 必须是陡墙（法线与 up 的 |点积| ≤ WalkableNormalDot ⇔ 墙面陡于 45.57°）
         if (MathF.Abs(F3.Dot(hitNormal, _up)) > _cfg.WalkableNormalDot) return false;
 
-        // 视角偏离墙面法线的角度 ≤ ClimbAttachMaxViewAngle。
-        // ★ 去掉 v0.2 的 `cosLimit * 0.5f` 魔法系数（那等价于要求 ±30° 以内还不够，
-        //   实际把容差砍到 1/2，配合"按 W 才探测"就变成"贴边就吸"的怪手感）。
+        // ④ 视角容差（与攀爬同源 = arccos(0.7)）
         float facing = -F3.Dot(hitNormal, fwd);
-        float cosLimit = MathF.Cos(_cfg.ClimbAttachMaxViewAngle * MathF.PI / 180f);
+        float cosLimit = MathF.Cos(_cfg.WallHangMaxViewAngle * MathF.PI / 180f);
         if (facing < cosLimit) return false;
 
-        // ③ 有朝墙速度：这才是"我要撞上去"的证据（需求原话）。
-        float approach = -F3.Dot(_vel, hitNormal);
-        if (approach < _cfg.ClimbMinApproachSpeed) return false;
+        // ⑤ 太矮的障碍不挂（对应 automantle_disable_hang 的意图）：
+        //    "脚底往上 0.6 × 小障碍档高度"那一层打不到墙 ⇒ 它矮到该迈过去/翻过去。
+        //
+        //    ★ v0.4 两处修正：
+        //    1) v0.3 探的是 _pos + AutoMantleMaxHeight(2.03m)，于是 1.0…2.03 m 之间的
+        //       障碍既翻不过去（> VaultMaxHeight）又挂不住 —— 玩家撞上去只能干瞪眼。
+        //       按需求方口径「>1m 就是墙，要 W+Space 攀爬+翻越」，门槛降到小障碍档。
+        //    2) 探针高度必须相对**脚底**而不是胶囊中心：跳跃贴墙那一刻脚底才 0.03 m 高，
+        //       按中心算会平白多探 1 m。取 0.6 倍而不是 1 倍，是为了给 1.5 m 这种
+        //       "刚过小障碍档"的墙留出判定余量（0.6 m 处命中 ⇒ 它高过脚底 0.6 m ⇒ 算墙）。
+        if (_cfg.WallHangDisableWhenAutoMantleable)
+        {
+            F3 highOrigin = FeetPosition + _up * (_cfg.VaultMaxHeight * 0.6f);
+            if (!_world.Raycast(highOrigin, fwd, reach, out _, out _)) return false;
+        }
 
-        // ④ 重附着规则（wiki L172-175）：脱离后必须先掉回上次 attach point 以下；
-        //    若换了面（法线夹角 ≥ 25.842°）则豁免。
+        // ⑥ 重附着规则（wiki L172-175）：脱离后必须先掉回上次 attach point 以下；
+        //    换了面（法线夹角 ≥ 25.842°）则豁免。
         float here = F3.Dot(_pos, _up);
         if (_hasClimbed && here > _lastClimbAttachY)
         {
@@ -1098,20 +1238,22 @@ public sealed class ApexMovementCore
         }
 
         // ── 附着成立 ──
-        _state = MovementState.Climb;
+        _wallHangNormal = hitNormal;
+        _wallHangLastHit = hitPoint;
+        _climbWallNormal = hitNormal;
+        _climbLastWallHit = hitPoint;
+
+        _wallHangTime = 0f;
+        _wallHangSlip = 0f;
+        _wallHangGrip = 1f;
         _climbTime = 0f;
-        _climbNonUpwardTimer = 0f;
         _climbNoInputTimer = 0f;
         _climbApproaching = false;
         _climbApproachRemaining = 0f;
-        _climbWallNormal = hitNormal;
         _climbBaseY = here;
         _climbAttachHeight = here;
-        _climbLastWallHit = hitPoint;
 
         // 把身体贴到墙面上（半径 + 一点皮肤）。
-        // 否则"离墙 1m 但仍在探测射程内"也可能挂住，而 StepClimb 的到顶探针
-        // 只有 `CapsuleRadius + 0.35` 的射程，下一 tick 就会误判成"墙没了"。
         // 注意方向：`dot(_pos - hitPoint, normal)` 才是"玩家到墙面的正距离"
         // （法线朝外，玩家在墙外时为正）。v0.3 初版写成 `dot(hitPoint - _pos, ...)`，
         // 结果恒为负 ⇒ 这行贴墙从来没生效过，玩家停在离墙 1m 处，下一 tick 的
@@ -1121,40 +1263,72 @@ public sealed class ApexMovementCore
         _pos += hitNormal * (want - dist);
 
         // 抓住墙的一瞬间动量清零（手已经"挂"住了）。
-        // 需求：这里只是"进入攀爬状态"，不向上爬 —— 往上爬必须按住 W。
         _vel = F3.Zero;
 
-        _ = input;
+        // 按着 W 就直接进"上爬"分支；不按 W 就是扒着不动。
+        _state = pressingW ? MovementState.Climb : MovementState.WallHang;
+
+        _wasAirborne = false;
+        _jumpBuffered = false;
+        _jumpBufferTimer = 0f;
+        _wallGrabNeedW = false;
         return true;
     }
-
-    private void StepClimb(in MovementInput input, float dt)
+    /// <summary>
+    /// 贴墙态推进（Climb 上爬 / WallHang 扒着，**同一个**状态机的两个分支）。
+    ///
+    /// 位置是运动学积分（同 <see cref="StepTraversal"/>），所以 <see cref="Step"/>
+    /// 里是独占分支、不走 MoveWithCollision —— 因此这里必须自己改 `_pos`。
+    ///
+    /// 输入映射（逐条对应需求方口径）：
+    ///   W           → 向上爬（ClimbSpeed 2.0 m/s），状态切 Climb
+    ///   W + A / D   → 左上 / 右上斜移
+    ///   A / D       → 沿墙左右横移（WallHangShimmySpeed），状态留在 WallHang
+    ///   什么都不按  → 停在墙上缓慢下滑，WallHangIdleFallTime 后掉落
+    ///   S           → 立刻松手垂直下落，下落中按 W 可以再抓住
+    ///   Space       → 翻上墙沿；翻不上去就蹬墙跳
+    ///   视角甩开    → 松手
+    /// </summary>
+    private void StepWallGrab(in MovementInput input, float dt)
     {
+        _wallHangTime += dt;
         _climbTime += dt;
 
-        F3 fwd = Forward();
-        F3 intoWall = -_climbWallNormal;
+        // 墙面法线只保留一份（_wallHangNormal），_climbWallNormal 始终跟随 ——
+        // 下游的 TryFindClimbLedge / EnterHangFromClimb 读的是 _climbWallNormal。
+        _climbWallNormal = _wallHangNormal;
+        _climbLastWallHit = _wallHangLastHit;
 
-        // ── 脱离条件 ──────────────────────────────────────────────
-        // ① 跳跃 / 蹲 / 后退
-        if (_jumpBuffered || input.CrouchHeld || input.MoveZ < -0.3f)
+        // ── ① 跳跃：优先翻上墙沿，翻不上去就蹬墙跳 ────────────────
+        if (_jumpBuffered)
         {
-            DetachClimb(jump: _jumpBuffered);
+            if (!TryCompleteWallGrab()) DetachWallGrab(jumped: true);
             return;
         }
 
-        // ② 视角甩开太大（wiki：脱离限制与附着相同，> 45.57° 掉）
-        float facing = -F3.Dot(_climbWallNormal, fwd);
-        float cosLimit = MathF.Cos(_cfg.ClimbAttachMaxViewAngle * MathF.PI / 180f);
+        // ── ② S：立刻松手垂直下落 ────────────────────────────────
+        //    需求：「只要按了 s，就会取消扒墙直接垂直下落，
+        //    下落的过程中按 w 可以继续扒住墙」。
+        //    走 drop 分支（速度清零让重力接管）+ 打开 `_wallGrabNeedW` 门闩，
+        //    否则"还在下落 + 人还贴着墙"会被自动抓取分支立刻吸回去。
+        if (input.MoveZ < -0.3f)
+        {
+            DetachWallGrab(jumped: false, drop: true);
+            return;
+        }
+
+        // ── ③ 视角甩开太大 → 松手（与附着同一容差 = arccos(0.7)） ──
+        F3 fwd = Forward();
+        float facing = -F3.Dot(_wallHangNormal, fwd);
+        float cosLimit = MathF.Cos(_cfg.WallHangMaxViewAngle * MathF.PI / 180f);
         if (facing < cosLimit)
         {
-            DetachClimb(jump: false);
+            DetachWallGrab(jumped: false, drop: true);
             return;
         }
 
-        // ── 补爬阶段（即将扒墙） ──────────────────────────────────
-        // 已经决定要挂上去：这段只走竖直位移，不再做脱离判定，
-        // 否则"补爬的一半"容易被墙顶那条探针打断。
+        // ── ④ 补爬阶段（已经决定要翻上去：只走竖直位移） ──────────
+        //    这段不做脱离判定，否则"补爬的一半"会被墙顶那条探针打断。
         if (_climbApproaching)
         {
             float speed = _cfg.ClimbHangApproachDistance /
@@ -1163,19 +1337,17 @@ public sealed class ApexMovementCore
             _climbApproachRemaining -= stepUp;
 
             _vel = _up * (stepUp / MathF.Max(1e-6f, dt));
-            _pos += _up * stepUp;          // 运动学位移（同 StepTraversal）
+            _pos += _up * stepUp;
 
-            if (_climbApproachRemaining <= 1e-4f)
-                EnterHangFromClimb();
+            if (_climbApproachRemaining <= 1e-4f) EnterHangFromClimb();
             return;
         }
 
-        // ── 墙没了 / 到顶 ─────────────────────────────────────────
+        // ── ⑤ 墙还在吗 / 到顶了吗 ────────────────────────────────
         //
-        // ★ 探针按 ClimbWallProbeInterval 抽样（默认 2 ⇒ 30 Hz）。
-        //   这条射线是**整段攀爬期间每 tick** 都要打的持续开销（一次 Raycast），
+        // ★ 探针按 ClimbWallProbeInterval 抽样（默认 2 ⇒ 60 tick/s 下 30 Hz）。
+        //   这条射线是**整段挂墙期间每 tick** 都要打的持续开销（一次 Raycast），
         //   而墙顶不可能在一个 tick 内消失 —— 抽样对玩法零影响，开销直接砍半。
-        //   非探针 tick 沿用上一次的命中点做贴墙钳制。
         bool wallGone = false;
         F3 wallHit = _climbLastWallHit;
 
@@ -1183,16 +1355,17 @@ public sealed class ApexMovementCore
         {
             _climbWallProbeCount++;
             wallGone =
-                !_world!.Raycast(_pos, intoWall, _cfg.CapsuleRadius + 0.35f,
+                !_world!.Raycast(_pos, -_wallHangNormal, _cfg.CapsuleRadius + 0.35f,
                                  out F3 probedHit, out F3 n2) ||
                 MathF.Abs(F3.Dot(n2, _up)) > _cfg.WalkableNormalDot;
 
-            // 记住最后一次看到的墙面**真实命中点**：一旦到顶，上面那条射线就打空了，
-            // 而"找台面"的向下扫描还需要知道墙在哪个水平平面上 —— 所以墙还在时持续记录。
             if (!wallGone)
             {
                 _climbLastWallHit = probedHit;
+                _wallHangLastHit = probedHit;
                 wallHit = probedHit;
+                _wallHangNormal = n2;
+                _climbWallNormal = n2;
             }
         }
 
@@ -1203,70 +1376,88 @@ public sealed class ApexMovementCore
 
         if (wallGone || overLimit)
         {
-            // 需求：「即将扒墙，则会继续上爬一小部分进入扒墙状态」
+            // 上方有可站立台面 ⇒ 先补爬一小段再进 Hang（需求「继续上爬一小部分进入扒墙状态」）
             if (TryBeginClimbHangApproach()) return;
-
-            // 上方没有可挂的台面（例如墙比人能爬的还高）→ 保持 v0.2 的 End boost
-            DetachClimbAtTop();
+            // 上方什么都没有（墙比人能爬的还高）⇒ End boost 上抛脱离
+            DetachWallGrabAtTop();
             return;
         }
 
-        // ── 攀爬速度（按住 W 才向上） ──────────────────────────────
-        //
-        // ⚠️ 这里**必须自己位移**：`Step()` 在 Climb 状态是提前 return 的
-        //    （第 4 步独占推进），`MoveWithCollision` / `UpdateGroundContact`
-        //    都不会跑。v0.2 只在这里赋 `_vel` 而没有位移，于是"按住 W 爬墙"
-        //    实际上原地不动 —— 这是本次专项测试才暴露出来的真 bug。
-        //    处理方式和 `StepTraversal` 一致：攀爬是**运动学**状态，直接改 `_pos`。
+        // ── ⑥ 输入解析 ────────────────────────────────────────────
         bool pressingW = input.MoveZ > 0.3f;
+        bool pressingLateral = MathF.Abs(input.MoveX) > 0.3f;
+        bool anyInput = pressingW || pressingLateral;
 
-        float verticalSpeed;
+        // ── ⑦ 沿墙移动 ────────────────────────────────────────────
+        //   按 W ⇒ 向上爬；不按 W ⇒ 缓慢下滑（留在墙上，不立刻掉）。
+        // 上爬用 ClimbSpeed（v0.3 起就是 2.0 m/s，README 与集成测试都以它为准）；
+        // 松手后的缓慢下滑用 WallHangSlipSpeed。两者是**一个旋钮一个方向**，不要混。
+        float vUp = pressingW ? _cfg.ClimbSpeed : -_cfg.WallHangSlipSpeed;
+        float vSide = Clamp(input.MoveX, -1f, 1f) * _cfg.WallHangShimmySpeed;
+
+        // ⑦b 下滑到底 ⇒ 直接落地。
+        //
+        // 贴墙态是运动学积分（不走 MoveWithCollision），所以"一路往下滑"会把
+        // 胶囊压进地面：一旦压进去，后续 Sweep 从已重叠的位置起扫会返回
+        // fraction=0，水平移动也被一起挡住（表现为"落地后走不动"）。
+        // 这里在真的下滑之前先探一次脚下，够到地面就改成正常落地。
+        if (vUp < 0f)
+        {
+            F3 feetNow = _pos - _up * (_currentHeight * 0.5f);
+            float slideDown = -vUp * dt;
+            if (_world!.Raycast(feetNow, -_up, slideDown + 0.02f, out F3 groundHit, out F3 groundN) &&
+                F3.Dot(groundN, _up) >= _cfg.WalkableNormalDot)
+            {
+                _pos = groundHit + _up * (_currentHeight * 0.5f);
+                DetachWallGrab(jumped: false, drop: true);
+                return;
+            }
+        }
+
+        F3 right = F3.Cross(fwd, _up).Normalized();
+        _pos += _up * (vUp * dt) + right * (vSide * dt);
+
+        // 状态随输入切换：按着 W 就是"在爬"，松开就是"扒着"。
+        _state = pressingW ? MovementState.Climb : MovementState.WallHang;
+
+        // ── ⑧ 握力（对应 m_wallDangleClimbProgressFloor） ─────────
+        //
+        //   · 按 W 上爬   ⇒ 把手再抓高一点，握力回满
+        //   · 只横移      ⇒ 缓慢消耗（WallHangLateralFallTime）
+        //   · 完全无输入  ⇒ 快速消耗（WallHangIdleFallTime）⇒ 掉落
         if (pressingW)
         {
-            _climbNoInputTimer = 0f;
-            _climbNonUpwardTimer = 0f;
-            verticalSpeed = _cfg.ClimbSpeed;
+            if (_cfg.WallHangClimbRestoresGrip)
+            {
+                _wallHangGrip = MathF.Min(1f, _wallHangGrip +
+                    dt / MathF.Max(1e-3f, _cfg.WallHangGripRestoreTime));
+            }
+            _wallHangSlip = MathF.Max(0f, _wallHangSlip - _cfg.WallHangSlipSpeed * dt);
+        }
+        else if (anyInput)
+        {
+            _wallHangGrip -= dt / MathF.Max(1e-3f, _cfg.WallHangLateralFallTime);
+            _wallHangSlip += _cfg.WallHangSlipSpeed * dt;
         }
         else
         {
-            // 松 W：先向下滑一点点，给一个 ClimbNoInputGrace 的宽限窗口；
-            // 宽限用完就真正脱手下落（需求：「短时间没按 W 则取消攀爬开始下落」）。
-            _climbNoInputTimer += dt;
-            if (_climbNoInputTimer >= _cfg.ClimbNoInputGrace)
-            {
-                DetachClimb(jump: false);
-                return;
-            }
-
-            verticalSpeed = -_cfg.ClimbSpeed * 0.35f;
-
-            // 仍然保留 wiki 的"非向上爬 1s 计时"作为后手：
-            // 若玩家一直给着侧向输入却不向上，1 秒后也该掉（wiki L59-60）。
-            bool hasLateral = MathF.Abs(input.MoveX) > 0.3f;
-            if (hasLateral)
-            {
-                _climbNonUpwardTimer += dt;
-                if (_climbNonUpwardTimer >= _cfg.ClimbNonUpwardTimer)
-                {
-                    DetachClimb(jump: false);
-                    return;
-                }
-            }
+            _wallHangGrip -= dt / MathF.Max(1e-3f, _cfg.WallHangIdleFallTime);
+            _wallHangSlip += _cfg.WallHangSlipSpeed * dt;
         }
 
-        _vel = _up * verticalSpeed;
-        _pos += _up * (verticalSpeed * dt);
-
-        // 每 tick 把身体重新贴回墙面（半径 + 一点皮肤），
-        // 避免附着瞬间还离墙 1m 时 `wallGone` 立刻误判成"到顶"。
-        if (!wallGone)
+        if (_wallHangGrip <= 0f || _wallHangSlip >= _cfg.WallHangMaxSlipDistance)
         {
-            // 射线沿 intoWall 前进 t 命中 ⇒ t 就是"眼睛到墙面的正距离"。
-            float dist = F3.Dot(_pos - wallHit, _climbWallNormal);
-            float want = _cfg.CapsuleRadius + 0.02f;
-            if (dist > want)
-                _pos -= _climbWallNormal * (dist - want);
+            DetachWallGrab(jumped: false, drop: true);
+            return;
         }
+
+        // ── ⑨ 把身体贴回墙面（半径 + 一点皮肤） ──────────────────
+        float dist = F3.Dot(_pos - wallHit, _wallHangNormal);
+        float want = _cfg.CapsuleRadius + 0.02f;
+        if (dist > want) _pos -= _wallHangNormal * (dist - want);
+
+        // 挂墙时对外速度恒为 0（HUD 上应看到 speed=0.00 / vy=0.00）
+        _vel = F3.Zero;
     }
 
     /// <summary>
@@ -1400,39 +1591,72 @@ public sealed class ApexMovementCore
 
         _climbApproaching = false;
         _climbApproachRemaining = 0f;
-        _climbNonUpwardTimer = 0f;
         _climbNoInputTimer = 0f;
         _climbWallNormal = F3.Zero;
         _wasAirborne = false;
     }
 
-    /// <summary>普通脱离：带出当前垂直速度，回到空中。</summary>
-    private void DetachClimb(bool jump)
+    /// <summary>
+    /// 松手 / 脱离：回到空中。三种语义合成一个出口 ——
+    ///
+    /// <list type="bullet">
+    ///   <item><paramref name="jumped"/>：蹬墙跳（离墙 + 向上）</item>
+    ///   <item><paramref name="drop"/>：主动松手**垂直下落**（速度清零让重力接管）</item>
+    ///   <item>两者都不给：普通脱离（保留水平速度）</item>
+    /// </list>
+    ///
+    /// 所有路径都会打开 <see cref="_wallGrabNeedW"/> 门闩：脱离之后必须**按 W**
+    /// 才能再抓住，否则"掉落 + 人还贴着墙"会被下落自动抓取立刻吸回墙上，
+    /// 表现为「松手掉一下就又挂回去」，S 键等于没用。
+    /// </summary>
+    private void DetachWallGrab(bool jumped, bool drop = false)
     {
-        float carry = _vel.Y;
         RememberClimbSurface();
+
         _state = MovementState.Air;
-        _vel = _up * carry + F3.ProjectOnPlane(_vel, _up);
-        _climbNonUpwardTimer = 0f;
+        // 主动松手（S）用更短的再抓冷却：需求要的是「下落的过程中按 W 可以继续扒住墙」，
+        // 0.35s 的通用冷却会让这个动作迟钝半拍。按 W 时 0.12s ≈ 两个 tick 就能抓回。
+        _wallHangCooldown = drop ? 0.12f : _cfg.WallHangReattachCooldown;
+        _wallHangTime = 0f;
+        _wallHangSlip = 0f;
+        _climbTime = 0f;
         _climbNoInputTimer = 0f;
         _climbApproaching = false;
         _climbApproachRemaining = 0f;
-        _climbWallNormal = F3.Zero;
         _wasAirborne = true;
         _airPeakHeight = F3.Dot(_pos, _up);
 
-        if (jump)
+        // 唯一解除点是 TryAttachWallGrab 里"前向射线打空"（人真的离开墙面了）。
+        _wallGrabNeedW = true;
+
+        if (jumped && _wallHangNormal.LengthSq() > 1e-8f)
         {
-            _vel = F3.ProjectOnPlane(_vel, _up) + _up * _cfg.JumpVelocity;
+            // 蹬墙跳：离墙 + 向上
+            _vel = _wallHangNormal * (_cfg.JumpVelocity * 0.35f) +
+                   _up * (_cfg.JumpVelocity * 0.8f);
             _jumpBuffered = false;
             _jumpBufferTimer = 0f;
-            _jumpFatigueState = true;   // wiki：从 Climb 跳出去会触发疲劳
             _justJumped = true;
+            _jumpFatigueState = true;
+        }
+        else if (drop)
+        {
+            // 垂直下落：速度清零，只留重力。
+            _vel = F3.Zero;
+            _jumpBuffered = false;
+            _jumpBufferTimer = 0f;
+            _jumpFatigueState = false;
         }
         else
         {
-            _jumpFatigueState = false;  // wiki：不带跳跃脱离 Climb 会关闭疲劳
+            _vel = F3.ProjectOnPlane(_vel, _up);
+            _jumpFatigueState = false;
         }
+
+        _wallHangNormal = F3.Zero;
+        _climbWallNormal = F3.Zero;
+        _wallHangLastHit = F3.Zero;
+        _climbLastWallHit = F3.Zero;
     }
 
     /// <summary>
@@ -1449,300 +1673,208 @@ public sealed class ApexMovementCore
         }
     }
 
-    /// <summary>爬到顶：给 End boost（+28hu）并落到台面上。</summary>
-    private void DetachClimbAtTop()
+    /// <summary>爬到顶但上方没有可挂的台面：给 End boost（+28hu）上抛脱离。</summary>
+    private void DetachWallGrabAtTop()
     {
         RememberClimbSurface();
         _state = MovementState.Air;
         _vel = _up * MathF.Sqrt(2f * _cfg.Gravity * _cfg.ClimbEndBoost);
-        _climbNonUpwardTimer = 0f;
+        _climbTime = 0f;
         _climbNoInputTimer = 0f;
         _climbApproaching = false;
         _climbApproachRemaining = 0f;
         _climbWallNormal = F3.Zero;
+        _wallHangNormal = F3.Zero;
+        _wallHangLastHit = F3.Zero;
+        _climbLastWallHit = F3.Zero;
         _jumpFatigueState = false;
         _wasAirborne = true;
         _airPeakHeight = F3.Dot(_pos, _up);
-    }
-
-    // ───────────────────────── 扒墙 / 悬垂（WallHang） ─────────────────────────
-    //
-    // 与 Climb 的分工（这是 v0.3 完整版新增的一套**独立**状态机）：
-    //
-    //   Climb    —— 有朝墙动量 → 抓着墙往上爬，松 W 就掉。
-    //   WallHang —— 停在墙上（悬垂），可以沿墙上下左右挪，久了脱手。
-    //
-    // 逆向依据（docs/reverse-engineering-v0.2.md §5.11，A 级字段名）：
-    //   m_wallHanging / m_wallHangTime / IsWallHanging
-    //   m_wallDangleClimbProgressFloor          ← "还能爬升的进度下限"（握力）
-    //   ACT_MP_WALLHANG_FRONT/UP/RIGHT/LEFT/IDLE ← 5 个姿势 = 可上下左右移动
-    //   sound_wallHangStart / Slip / Complete / Fall ← 挂上/下滑/完成/掉落
-    //   spread_wallhanging                       ← 挂着时仍可射击（本插件无武器，仅语义）
-    //   automantle_disable_hang                  ← 能自动翻越的矮墙不该先挂上去
-    //
-    // 设计取舍（C 级）：进入条件是**显式按蹲键**，而不是"贴墙自动挂" ——
-    // 延续需求里的"非强制"原则：贴着墙跳一下不该被环境抓走。
-
-    /// <summary>
-    /// 尝试进入扒墙。返回 true 表示本 tick 已切到 <see cref="MovementState.WallHang"/>。
-    ///
-    /// 五条同时满足：① 空中 ② （默认）按住蹲键 ③ 前方够得到一面陡墙
-    /// ④ 视角夹角 ≤ <see cref="MovementConfig.WallHangMaxViewAngle"/> ⑤ 不在冷却里。
-    /// 另外 <see cref="MovementConfig.WallHangDisableWhenAutoMantleable"/> 时，
-    /// 矮到能自动翻越的墙不挂（对应 <c>automantle_disable_hang</c>）。
-    /// </summary>
-    private bool TryAttachWallHang(in MovementInput input)
-    {
-        if (!_cfg.WallHangEnabled) return false;
-        if (_wallHangCooldown > 0f) return false;
-        if (_cfg.WallHangRequiresCrouch && !input.CrouchHeld) return false;
-        if (_world == null) return false;
-
-        F3 fwd = Forward();
-        float reach = _cfg.CapsuleRadius + _cfg.WallHangReach;
-
-        if (!_world.Raycast(_pos, fwd, reach, out F3 hitPoint, out F3 hitNormal))
-        {
-            // 视野里已经没有墙 ⇒ 玩家确实离开了墙面，"必须重新接近才能再挂"的
-            // 状态在这里解除（这是唯一解除点，见下面的 _wallHangNeedRelease）。
-            _wallHangNeedRelease = false;
-            return false;
-        }
-
-        // 刚松手 / 刚脱手：必须先离开这面墙一次，才能重新挂上。
-        //
-        // 不加这条会出大问题：挂着不动会因握力耗尽而脱手，但玩家还按着蹲、人还贴着墙，
-        // 冷却一过（0.35s）就又被抓回来 —— 表现为「挂满 6s 掉一下、立刻又挂回去」，
-        // 既不符合"脱手"的语义，也让 m_wallHangTime 永远走不到上限。
-        if (_wallHangNeedRelease) return false;
-
-        // 必须是陡墙（法线与 up 的 |点积| ≤ WalkableNormalDot ⇔ 墙面陡于 45.57°）
-        if (MathF.Abs(F3.Dot(hitNormal, _up)) > _cfg.WalkableNormalDot) return false;
-
-        // 视角容差（与攀爬同源 = arccos(0.7)）
-        float facing = -F3.Dot(hitNormal, fwd);
-        float cosLimit = MathF.Cos(_cfg.WallHangMaxViewAngle * MathF.PI / 180f);
-        if (facing < cosLimit) return false;
-
-        // 对应 automantle_disable_hang：墙顶低于"自动翻越上限"时，先别挂 ——
-        // 用一条射线近似判断：在 AutoMantleMaxHeight 高度上打不到墙 ⇒ 墙比它矮。
-        if (_cfg.WallHangDisableWhenAutoMantleable)
-        {
-            F3 highOrigin = _pos + _up * _cfg.AutoMantleMaxHeight;
-            if (!_world.Raycast(highOrigin, fwd, reach, out _, out _))
-                return false;
-        }
-
-        // ── 附着成立 ──
-        _state = MovementState.WallHang;
-        _wallHangTime = 0f;
-        _wallHangSlip = 0f;
-        _wallHangNormal = hitNormal;
-        _wallHangLastHit = hitPoint;
-
-        // 贴到墙面上（半径 + 皮肤），否则下一 tick 的"墙还在吗"探针会打空
-        float dist = F3.Dot(_pos - hitPoint, hitNormal);
-        float want = _cfg.CapsuleRadius + 0.02f;
-        _pos += hitNormal * (want - dist);
-
-        // 挂住 = 动量清零（下落被手接住）
-        _vel = F3.Zero;
-        _wasAirborne = false;
-        _jumpBuffered = false;
-        _jumpBufferTimer = 0f;
-        return true;
+        _wallGrabNeedW = true;
     }
 
     /// <summary>
-    /// 扒墙态推进。位置是**运动学**积分（同 Climb / Traversal），所以
-    /// <see cref="Step"/> 里是独占分支、不走 MoveWithCollision。
-    ///
-    /// 行为映射：
-    ///   W / S      → 沿墙上爬 / 下移（`ACT_MP_WALLHANG_UP`）
-    ///   A / D      → 沿墙左右横移（`ACT_MP_WALLHANG_LEFT/RIGHT`）
-    ///   不动       → 缓慢下滑（`sound_wallHangSlip`），滑过握力下限就掉
-    ///   Space      → 翻上去（`sound_wallHangComplete`）
-    ///   松开蹲键   → 松手（`sound_wallHangFall`）
+    /// 从挂墙"翻上去"：找到台沿就转 <see cref="MovementState.Hang"/>，
+    /// 复用已经验证过的 Hang → Mantle pull 路径（对应 sound_wallHangComplete）。
     /// </summary>
-    private void StepWallHang(in MovementInput input, float dt)
-    {
-        _wallHangTime += dt;
-
-        // ── 主动松手 ──────────────────────────────────────────────
-        if (_cfg.WallHangRequiresCrouch && !input.CrouchHeld)
-        {
-            DetachWallHang(jumped: false);
-            return;
-        }
-
-        // ── 向上翻越（Complete） / 主动下落 ────────────────────────
-        if (_jumpBuffered)
-        {
-            if (!TryCompleteWallHang())
-                DetachWallHang(jumped: true);
-            return;
-        }
-
-        if (input.MoveZ < -0.6f)
-        {
-            DetachWallHang(jumped: false);
-            return;
-        }
-
-        // ── 挂太久脱手（m_wallHangTime 上限） ──────────────────────
-        if (_wallHangTime >= _cfg.WallHangMaxTime)
-        {
-            DetachWallHang(jumped: false);
-            return;
-        }
-
-        // ── 视角甩开太大 → 松手（与攀爬同一容差） ──────────────────
-        F3 fwd = Forward();
-        float facing = -F3.Dot(_wallHangNormal, fwd);
-        float cosLimit = MathF.Cos(_cfg.WallHangMaxViewAngle * MathF.PI / 180f);
-        if (facing < cosLimit)
-        {
-            DetachWallHang(jumped: false);
-            return;
-        }
-
-        // ── 沿墙移动 ──────────────────────────────────────────────
-        F3 right = F3.Cross(fwd, _up).Normalized();
-        bool pressingW = input.MoveZ > 0.3f;
-
-        float vUp = 0f;
-        if (pressingW) vUp = _cfg.WallHangClimbSpeed;
-        else if (input.MoveZ < -0.3f) vUp = -_cfg.WallHangClimbSpeed * 0.6f;
-
-        float vSide = Clamp(input.MoveX, -1f, 1f) * _cfg.WallHangShimmySpeed;
-
-        _pos += _up * (vUp * dt) + right * (vSide * dt);
-
-        // ── 握力（m_wallDangleClimbProgressFloor） ────────────────
-        //
-        // 挂着不动会往下滑；按 W 往上爬能把手"再抓高一点"，把下滑量收回来。
-        if (pressingW)
-        {
-            if (_cfg.WallHangClimbRestoresGrip)
-                _wallHangSlip = MathF.Max(0f, _wallHangSlip - _cfg.WallHangSlipSpeed * dt);
-        }
-        else
-        {
-            _wallHangSlip += _cfg.WallHangSlipSpeed * dt;
-            _pos -= _up * (_cfg.WallHangSlipSpeed * dt);
-
-            if (_wallHangSlip >= _cfg.WallHangMaxSlipDistance)
-            {
-                DetachWallHang(jumped: false);
-                return;
-            }
-        }
-
-        // ── 墙还在吗（探针按 ClimbWallProbeInterval 抽样，默认 30 Hz） ──
-        bool wallGone;
-        if (ShouldProbeClimbWall())
-        {
-            _climbWallProbeCount++;
-            wallGone =
-                !_world!.Raycast(_pos, -_wallHangNormal, _cfg.CapsuleRadius + 0.35f,
-                                 out F3 wallHit, out F3 n2) ||
-                MathF.Abs(F3.Dot(n2, _up)) > _cfg.WalkableNormalDot;
-
-            if (!wallGone)
-            {
-                _wallHangLastHit = wallHit;
-                _wallHangNormal = n2;
-
-                // 每 tick 把身体重新贴回墙面
-                float dist = F3.Dot(_pos - wallHit, _wallHangNormal);
-                float want = _cfg.CapsuleRadius + 0.02f;
-                if (dist > want) _pos -= _wallHangNormal * (dist - want);
-            }
-        }
-        else
-        {
-            // 非探针 tick：沿用上一帧的结论（这里只需要"贴墙"）
-            float dist = F3.Dot(_pos - _wallHangLastHit, _wallHangNormal);
-            float want = _cfg.CapsuleRadius + 0.02f;
-            if (dist > want) _pos -= _wallHangNormal * (dist - want);
-            wallGone = false;
-        }
-
-        if (wallGone)
-        {
-            // 到墙顶了：能翻就翻，不能翻就松手
-            if (!TryCompleteWallHang())
-                DetachWallHang(jumped: false);
-            return;
-        }
-
-        // 挂着的时候速度对外恒为 0（HUD 上应该看到 speed=0.00 / vy=0.00）
-        _vel = F3.Zero;
-    }
-
-    /// <summary>
-    /// 从扒墙"完成"上墙：找到台沿就转 <see cref="MovementState.Hang"/>，
-    /// 复用攀爬到顶那条已经验证过的 Hang → Mantle pull 路径。
-    /// </summary>
-    private bool TryCompleteWallHang()
+    private bool TryCompleteWallGrab()
     {
         if (!_cfg.EnableMantleHang) return false;
         if (_wallHangNormal.LengthSq() < 1e-8f) return false;
 
         // TryFindClimbLedge 读的是 _climbWallNormal / _climbLastWallHit，
-        // 这里把扒墙的墙面信息借给它用。
-        F3 savedNormal = _climbWallNormal;
-        F3 savedHit = _climbLastWallHit;
-
+        // 统一状态机里它们已经与 _wallHangNormal 同步，这里再兜一次。
         _climbWallNormal = _wallHangNormal;
         _climbLastWallHit = _wallHangLastHit;
 
-        bool found = TryFindClimbLedge(out F3 ledgeTop);
-        if (found)
-        {
-            _climbHangTop = ledgeTop;
-            EnterHangFromClimb();
+        if (!TryFindClimbLedge(out F3 ledgeTop)) return false;
 
-            // 完成时给一点前推，避免"翻上去之后贴着墙站着"
-            _vel += -_wallHangNormal * _cfg.WallHangCompleteForwardSpeed;
+        _climbHangTop = ledgeTop;
+        EnterHangFromClimb();
 
-            _wallHangNormal = F3.Zero;
-            _wallHangTime = 0f;
-            _wallHangSlip = 0f;
-            return true;
-        }
-
-        _climbWallNormal = savedNormal;
-        _climbLastWallHit = savedHit;
-        return false;
-    }
-
-    /// <summary>松手：回到空中，带一个可选的"蹬墙跳"。</summary>
-    private void DetachWallHang(bool jumped)
-    {
-        _state = MovementState.Air;
-        _wallHangCooldown = _cfg.WallHangReattachCooldown;
-        _wallHangTime = 0f;
-        _wallHangSlip = 0f;
-        _wallHangNeedRelease = true;   // 必须先离开墙面一次才能再挂（见 TryAttachWallHang）
-        _wasAirborne = true;
-        _airPeakHeight = F3.Dot(_pos, _up);
-
-        if (jumped && _wallHangNormal.LengthSq() > 1e-8f)
-        {
-            // 蹬墙跳：离墙 + 向上
-            _vel = _wallHangNormal * (_cfg.JumpVelocity * 0.35f) + _up * (_cfg.JumpVelocity * 0.8f);
-            _jumpBuffered = false;
-            _jumpBufferTimer = 0f;
-            _justJumped = true;
-            _jumpFatigueState = true;
-        }
-        else
-        {
-            _vel = F3.Zero;
-        }
+        // 完成时给一点前推，避免"翻上去之后贴着墙站着"
+        _vel += -_wallHangNormal * _cfg.WallHangCompleteForwardSpeed;
 
         _wallHangNormal = F3.Zero;
+        _wallHangTime = 0f;
+        _wallHangSlip = 0f;
+        _wallHangLastHit = F3.Zero;
+        _climbLastWallHit = F3.Zero;
+        return true;
+    }
+
+    // ───────────────────────── 三档障碍分级（v0.4） ─────────────────────────
+    //
+    // 需求方口径（逐字）：
+    //
+    //   >1 m     = 墙      直接撞上去、不翻越；需按 W+Space 跳过，或触发攀爬+翻越；
+    //                      攀爬时水平速度掉为 0，影响前进速度。
+    //   ≤1 m     = 小障碍  靠近按 W+Space 直接翻越，**不触发攀爬**，水平速度削减较小，
+    //                      翻越结束快速恢复满速。
+    //   ≤0.25 m  = 台阶    直接平滑经过、无速度衰减；水平速度变斜向上再变回水平，
+    //                      只有方向变化、大小不变，不触发任何动作；tan(θ) = b / a。
+    //
+    // 三档在代码里的落点：
+    //   · 台阶   → MoveWithCollision 的 TryStepUp（OverwalkableHeight = 0.25）
+    //              + ApplyStepTilt（只旋转速度、不改大小）
+    //   · 小障碍 → 本函数 TryVaultObstacle（只在 StepGround 的跳跃分支里调用）
+    //   · 墙     → 地面撞停（MoveWithCollision 挡下）+ 空中 → TryAttachWallGrab
+
+    /// <summary>
+    /// 翻越 **≤ <see cref="MovementConfig.VaultMaxHeight"/> 的小障碍**。
+    ///
+    /// 与 <see cref="TryTraversal"/> 的区别（这也是它单独存在的原因）：
+    ///
+    /// | | TryTraversal（v0.2 遗留，全档位） | TryVaultObstacle（v0.4 第二档） |
+    /// |---|---|---|
+    /// | 触发 | 外部显式调用 / 每 tick 自动探测 | **只由跳跃键触发**（W + Space） |
+    /// | 高度 | 0.05 m … MantleMaxHeight | `OverwalkableHeight` … `VaultMaxHeight` |
+    /// | 速度 | 归零（`BeginMantle` 里清空） | 翻完按 `VaultSpeedRetention` **还回去** |
+    ///
+    /// 需求「不触发攀爬」的落实方式：本函数**只**创建 <see cref="MovementState.Vault"/>，
+    /// 且高度上限压在 1 m，绝不可能走到 Climb / WallHang 那条链上。
+    ///
+    /// 失败（前方没障碍 / 障碍高于 1 m / 太矮不归翻越管）时返回 false，
+    /// 调用方退化成普通跳跃 —— 行为与 v0.3 完全一致。
+    /// </summary>
+    private bool TryVaultObstacle(in MovementInput input)
+    {
+        if (_world == null) return false;
+        if (_state != MovementState.Ground) return false;
+        if (_vaultRecoverTimer > 0f) return false;      // 刚翻完，别连环翻
+
+        // 开口（窗）优先：W+Space 对着窗口时走"穿过去"，而不是爬上去。
+        // v0.4 把自动翻越探测删掉了（需求：不要走着走着自动翻），
+        // 窗口翻越就挂在这里，否则 Window 状态会变成死代码。
+        if (_cfg.WindowTraversalEnabled && TryWindowTraversal(input)) return true;
+
+        F3 fwd = Forward();
+        F3 feetPos = FeetPosition;
+        float reach = _cfg.CapsuleRadius + _cfg.TraversalReach;
+
+        // 探针放在"小障碍高度的一半"处：太低会被地面回波命中，
+        // 太高（> VaultMaxHeight）会直接越过矮障碍打空。
+        F3 wallProbe = feetPos + _up * (_cfg.VaultMaxHeight * 0.5f);
+        if (!_world.Raycast(wallProbe, fwd, reach, out F3 hitPoint, out F3 hitNormal))
+            return false;
+
+        // 只处理竖直立面（法线水平）
+        if (MathF.Abs(F3.Dot(hitNormal, _up)) > 0.5f) return false;
+
+        float facing = -F3.Dot(hitNormal, fwd);
+        if (facing < MathF.Cos(_cfg.MantleMaxViewAngle * MathF.PI / 180f)) return false;
+
+        F3 intoWall = -hitNormal;
+
+        // ── 多点向下扫描找台面（与 TryTraversal 同源，但窗口压到小障碍档） ──
+        const int samples = 5;
+        float maxInward = _cfg.CapsuleRadius * 2f + 0.6f;
+        float scanUp = _cfg.VaultMaxHeight + 0.3f;
+        float scanLen = _cfg.VaultMaxHeight + 0.8f;
+
+        F3 bestTop = F3.Zero;
+        float bestHeight = float.MinValue;
+        bool foundTop = false;
+
+        for (int i = 1; i <= samples; i++)
+        {
+            float inward = maxInward * i / samples;
+            F3 from = hitPoint + intoWall * inward + _up * scanUp;
+
+            if (!_world.Raycast(from, -_up, scanLen, out F3 top, out F3 topNormal))
+                continue;
+            if (F3.Dot(topNormal, _up) < _cfg.WalkableNormalDot) continue;
+
+            float h = F3.Dot(top - feetPos, _up);
+
+            // 台阶档（≤ OverwalkableHeight）：不归翻越管 —— TryStepUp 自己会跨过去，
+            // 这里插一脚反而会变成"走个小台阶就翻个跟头"。
+            if (h <= _cfg.OverwalkableHeight) continue;
+            // 高于小障碍上限 ⇒ 这是墙，交给撞停 / 抓墙，不翻。
+            if (h > _cfg.VaultMaxHeight) continue;
+
+            if (h > bestHeight)
+            {
+                bestHeight = h;
+                bestTop = top;
+                foundTop = true;
+            }
+        }
+
+        if (!foundTop) return false;
+
+        // ── 回扫内边沿（决定"翻过去落在哪"） ──
+        float innerEdge = 0f;
+        bool foundEdge = false;
+        for (int i = samples; i >= 1; i--)
+        {
+            float inward = maxInward * i / samples;
+            F3 from = hitPoint + intoWall * inward + _up * scanUp;
+
+            if (_world.Raycast(from, -_up, scanLen, out F3 top, out F3 topNormal) &&
+                F3.Dot(topNormal, _up) > _cfg.WalkableNormalDot &&
+                MathF.Abs(F3.Dot(top - feetPos, _up) - bestHeight) < 0.05f)
+            {
+                innerEdge = inward;
+                foundEdge = true;
+            }
+            else if (foundEdge)
+            {
+                break;      // 台面到此为止
+            }
+        }
+
+        // 落点：越过台面落到**另一侧**（翻越不是"站上去"，是"翻过去"）
+        float inwardOffset = (foundEdge ? innerEdge : 0.5f) +
+                             _cfg.CapsuleRadius + _cfg.MantleForwardOffset * 0.5f;
+        F3 end = bestTop + intoWall * inwardOffset + _up * (_currentHeight * 0.5f);
+
+        if (OverlapsWithSkin(end)) return false;
+
+        // ── 记住翻越前的水平速度：翻完按 VaultSpeedRetention 还回去 ──
+        //
+        // 注意：**不能只看当前速度**。走到障碍前面时 `MoveWithCollision` 已经把
+        // 速度投影到障碍立面上，水平速度基本被吃成 0 —— 拿它乘保留率的话，
+        // 翻越结束人就几乎原地不动，和需求「水平速度削减较小、翻越结束快速恢复满速」
+        // 正好相反。所以用**意图速度**（WishSpeed）兜底。
+        F3 horiz = F3.ProjectOnPlane(_vel, _up);
+        float hSpeed = horiz.Length();
+
+        float wish = WishSpeed(input);
+        if (wish > hSpeed)
+        {
+            F3 wishDir = WishDirection(input);
+            if (wishDir.LengthSq() < 1e-8f) wishDir = fwd;
+            horiz = wishDir * wish;
+            hSpeed = wish;
+        }
+
+        _vaultExitSpeed = hSpeed * _cfg.VaultSpeedRetention;
+        _vaultExitDir = hSpeed > 1e-5f ? horiz / hSpeed : fwd;
+
+        BeginMantle(MantleClass.Below, end,
+                    _cfg.MantleDurationFor(MantleClass.Below), asVault: true);
+        return true;
     }
 
     // ───────────────────────── 翻越 / 窗口 ─────────────────────────
@@ -2052,12 +2184,23 @@ public sealed class ApexMovementCore
         {
             _pos = _traversalEnd;
             _vel = F3.Zero;
+            bool wasVault = _state == MovementState.Vault;
             _state = MovementState.Ground;
             _traversalCooldown = _cfg.TraversalCooldown;
             // wiki：Mantling resets Jump fatigue
             _jumpFatigueState = false;
             _timeSinceLanded = 0f;
             _wasAirborne = false;
+
+            // v0.4：翻越小障碍后把水平速度**还回去**（需求「水平速度削减较小，
+            // 翻越结束快速恢复满速」）：
+            //   · 立刻恢复 VaultSpeedRetention（默认 0.85）倍
+            //   · 之后 VaultRecoverTime 内 StepGround 用 VaultRecoverAccelBoost 加速回满速
+            if (wasVault)
+            {
+                _vel = _vaultExitDir * _vaultExitSpeed;
+                _vaultRecoverTimer = _cfg.VaultRecoverTime;
+            }
             return;
         }
 
@@ -2350,6 +2493,23 @@ public sealed class ApexMovementCore
 
         _pos = landed + _up * 0.001f;
         _groundNormal = nD;
+
+        // ── 台阶倾斜（需求「水平速度变为斜向上的速度再变回水平，
+        //    只有方向变化、大小不变」；tan θ = b / a） ──
+        //
+        //   b = 实际抬升高度（landedH - startH）
+        //   a = 玩家脚底中心到脚底边缘的横向距离 = 胶囊半径（StepTiltFootRadius 可覆盖）
+        //
+        // 只记录角度与时长，真正的速度旋转在 ApplyStepTilt 里做 —— 这样
+        // `|v|` 严格不变，且倾角在 StepTiltTime 内线性衰减回 0。
+        float a = _cfg.StepTiltFootRadius > 0f ? _cfg.StepTiltFootRadius : _cfg.CapsuleRadius;
+        float b = landedH - startH;
+        if (a > 1e-4f && b > 1e-4f)
+        {
+            _stepTiltAngle = MathF.Atan(b / a);
+            _stepTiltTimer = _cfg.StepTiltTime;
+        }
+
         return true;
     }
 
@@ -2485,18 +2645,56 @@ public sealed class ApexMovementCore
         _airPeakHeight = F3.Dot(_pos, _up);
     }
 
-    /// <summary>步频相位：按 tick 固定推进，保证任意帧率下相位一致。</summary>
+    /// <summary>
+    /// 步态采样 + 步频相位推进（v0.4 重写）。
+    ///
+    /// ## v0.3 的公式错在哪
+    ///
+    /// 旧公式是 `步频 = 1.2 + speed × 0.55` Hz —— 与**角色身高无关**、与**步幅无关**，
+    /// 也完全没有"奔跑有腾空相"这件事。代入本插件速度：
+    ///   行走 4.41 m/s → 3.62 Hz；冲刺 6.60 m/s → 4.83 Hz。
+    /// 人类冲刺步频上限约 3.3 Hz（博尔特 ≈ 4.4 步/秒但那是 2.6 m 步幅的精英短跑），
+    /// 4.83 Hz 等于每秒迈 5 步 —— 镜头当然像在抖腿。这就是"抖动频率和幅度还是太剧烈"
+    /// 的量化根因。
+    ///
+    /// ## v0.4 的推导链（详见 <see cref="GaitModel"/>）
+    ///
+    ///   身高 → 腿长（0.53 H）
+    ///        → Froude 相似律给出"舒适步行速度" vPref = 0.45·√(g·L) 与"走跑转换速度"
+    ///          vRun = 1.9·vPref（用**地球**重力 9.81，不是游戏重力 20.78 —— 步态是
+    ///          人的生物力学，跟游戏把重力放大到 2 倍无关）
+    ///        → 步行段步频走幂律、奔跑段步频线性上升（并带腾空相）
+    ///        → 步幅 = 速度 / 步频
+    ///        → 垂直起伏 = 腿长·(1-cosθ)·吸收系数 + 腾空期弹道下沉
+    ///        → 镜头的幅度 / 点头 / 侧倾全部由这个起伏换算
+    ///
+    /// 相位推进用**步频**（Hz）而不是速度线性式，所以"走快一点"和"跑起来"
+    /// 在频率上是连续的，不会在走跑转换点突然跳一下。
+    /// </summary>
     private void UpdateBobPhase(float dt)
     {
-        if (_state is MovementState.Ground or MovementState.Slide)
+        bool onGaitState = _state is MovementState.Ground or MovementState.Slide;
+
+        // 滑铲时**不按真实滑行速度**取步态：
+        // 滑铲不是"跑"，是蹲着滑行，需求也要求"镜头与下蹲状态一致"。
+        // 若拿 10 m/s 去算步频，会得到 4 Hz 的抖动，正好是要消除的东西。
+        float speed = 0f;
+        if (onGaitState)
+            speed = _state == MovementState.Slide ? _cfg.CrouchWalkSpeed : HorizontalSpeed;
+
+        _gait = GaitModel.Evaluate(
+            speed,
+            _cfg.StandHeight,
+            MathF.Max(_cfg.WalkSpeed, _cfg.SprintSpeed),
+            _state == MovementState.Slide ? 1f : _crouchAmount,
+            _cfg.Gait);
+
+        if (!onGaitState) return;
+
+        if (_gait.CadenceHz > 0.05f)
         {
-            float speed = HorizontalSpeed;
-            if (speed > 0.2f)
-            {
-                // 步频与速度成正比（走得越快，晃得越快）
-                _bobPhase += dt * (1.2f + speed * 0.55f) * MathF.PI * 2f;
-                _bobPhase %= MathF.PI * 2f;
-            }
+            _bobPhase += dt * _gait.CadenceHz * MathF.PI * 2f;
+            _bobPhase %= MathF.PI * 2f;
         }
     }
 

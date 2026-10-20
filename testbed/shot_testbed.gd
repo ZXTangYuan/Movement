@@ -1,15 +1,20 @@
 extends Node
-## 测试场地截图工具（v0.2）：加载场地 → 多视角出图 → 退出。
+## 测试场地截图工具（v0.4）：加载场地 → 多视角出图 → 退出。
 ##
 ## 用法（**必须有窗口/真实渲染**，headless 拍不出画面）：
 ##   godot --path . --rendering-driver vulkan --resolution 1920x1080 \
 ##       res://addons/apex_movement/testbed/shot_testbed.tscn
 ##
-## 出图分两类：
-##   1. 自由机位（_shots）—— 俯视/侧视看场地构建对不对
-##   2. 玩家第一人称（_player_shots）—— 用 ApexPlayer 自己的相机，
-##      覆盖 **FOV 调节 / 走路摇晃 / 滑铲侧倾 / 攀爬相机滞后** 四个 v0.2 新增项，
-##      每张图的 HUD 都会打印当时的 fov / roll / state，作为可读的视觉证据。
+## 出图分三类（共 24 张）：
+##   1. 自由机位（_shots，10 张）—— 俯视/侧视看场地构建对不对
+##   2. 玩家视角（_player_shots，12 张）—— 用 ApexPlayer 自己的相机，
+##      覆盖 **FOV 调节 / 步态摇晃 / 滑铲（等同下蹲）/ 攀爬扒墙 / 打滑 / 上台阶**，
+##      每张图的 HUD 都会打印当时的 fov / roll / state / gait / step，作为可读的视觉证据。
+##   3. 调试菜单（2 张）—— 按 `\` 打开，再用滑条把 FOV 拖到 110°。
+##
+## 抓帧方式：先 `Engine.time_scale = 0` 冻结物理，再等 24 个 process_frame +
+## 一次 `RenderingServer.frame_post_draw` 才取图 —— Vulkan 呈现队列会落后十几帧，
+## 只等一次 frame_post_draw 会截到"上一秒"的画面（曾经 HUD 写 8.00、图上却是 3.00）。
 ##
 ## 输出到 user://（Godot 用户目录），路径会打印在控制台。
 
@@ -24,6 +29,7 @@ var _proxy: Node3D
 ##   斜坡区     x∈[-48,-2]   z∈[-55,-35]
 ##   攀爬阶梯   x∈[-34,22]   z=35   （4 档：Below/Level/Above/High）
 ##   翻越低墙   x∈[-20,-8]   z=50
+##   台阶区     x∈[-30,-6]   z=-70 / x=10 z∈[-70,-60]（v0.4 新增）
 ##   窗口框架   x∈[20,32]    z=68
 ##   贴墙爬     x=50         z∈[-12,12]
 ##   低天花板   x=-60        z∈[15,25]
@@ -35,6 +41,7 @@ var _shots := [
 	{ "name": "ramps",        "pos": Vector3(-25, 30, 5),  "look": Vector3(-25, 8, -45), "fov": 60.0 },
 	{ "name": "mantle_steps", "pos": Vector3(-6, 18, 76),  "look": Vector3(-6, 3, 35),   "fov": 72.0 },
 	{ "name": "vault_walls",  "pos": Vector3(-14, 10, 70), "look": Vector3(-14, 1, 50),  "fov": 60.0 },
+	{ "name": "step_stairs",  "pos": Vector3(0, 14, -46),  "look": Vector3(-4, 1, -66),  "fov": 64.0 },
 	{ "name": "window_frames","pos": Vector3(26, 9, 58),   "look": Vector3(26, 2, 68),   "fov": 62.0 },
 	{ "name": "climb_wall",   "pos": Vector3(40, 12, 22),  "look": Vector3(50, 4, 0),    "fov": 62.0 },
 	{ "name": "slide_lane",   "pos": Vector3(-70, 22, 55), "look": Vector3(-70, 0, 0),   "fov": 65.0 },
@@ -261,6 +268,77 @@ func _player_shots() -> void:
 	print("WALLHANG HUD: " + _player.DebugHudLine.replace("\n", " | "))
 	_proxy.visible = false
 	_press_key(KEY_CTRL, false)
+	await _wait_frames(10)
+
+	# ── ⑬ 台阶（v0.4 新增：三档障碍第一档 <=0.25m）────────────────
+	#   连续台阶 x=10、z 从 -60 起每 2m 一级、每级 +0.20m。玩家朝 -Z 走上去。
+	#   硬证据在 HUD 的 `step=` 字段：它是 core 里 tan(theta)=b/a 算出的**当刻**台阶倾角，
+	#   只在 StepTiltTime(0.12s) 窗口内非零 —— 抓得到就说明"水平速度被抬成斜向上"确实发生了。
+	#   （_save 会先冻结时间，所以抓到的那一帧倾角不会再变。）
+	_cam.current = false
+	pcam.current = true
+	_player.DebugTeleport(10.0, 1.2, -54.0)
+	_player.DebugSetYaw(0.0)                     # yaw=0 ⇒ 前向 -Z，正对台阶
+	await _settle()
+	_press_key(KEY_W, true)
+	var saw_tilt := 0.0
+	for i in 400:
+		await get_tree().physics_frame
+		var tilt: float = _player.DebugStepTiltDeg
+		if tilt > saw_tilt:
+			saw_tilt = tilt
+		if tilt > 1.0 and _player.DebugFeetY > 0.15:
+			break
+	print("STEPS tilt=%.1fdeg feet=%.2f state=%s speed=%.2f" %
+		[saw_tilt, _player.DebugFeetY, _player.DebugState, _player.DebugSpeed])
+	await _save("shot_player_steps")
+	print("STEPS HUD: " + _player.DebugHudLine.replace("\n", " | "))
+	_press_key(KEY_W, false)
+	await _wait(0.4)
+
+	# ── ⑫ 调试菜单（v0.4 新增：按 \ 打开 / 再按 \ 关闭）──
+	#   这一张证明三件事：① 面板确实存在且能被 \ 叫出来；
+	#   ② 面板里能改 FOV；③ 改完 FOV 立刻反映在 HUD 与画面上。
+	#   背景用自由机位的俯视构图（玩家第一人称在这个位置只有一片空场地，
+	#   面板挡住左上角后几乎看不到东西）。调试菜单是玩家节点上的 CanvasLayer，
+	#   换任何相机都照常绘制。
+	#   站在 22m 落差平台顶上朝 -Z 看，视野里有成排的攀爬阶梯/翻越低墙/落差平台
+	#   ⇒ 两张图（FOV 90 vs 110）能直接对比"视野变宽"，而面板是玩家节点上的
+	#   CanvasLayer，跟着玩家相机一起出图。
+	# ★ ⑪ 借用了自由相机拍第三人称，这里必须切回玩家相机 ——
+	#   否则改的是玩家相机的 FOV、画面上却是那台不动的自由相机，
+	#   两张图会一模一样（曾经踩过这个坑）。
+	_cam.current = false
+	pcam.current = true
+	_player.DebugTeleport(0.0, 1.2, 26.0)
+	_player.DebugSetYaw(PI)                       # yaw=PI ⇒ 前向 +Z，正对攀爬阶梯（z=35）
+	await _settle()
+	print("DEBUGMENU feet=%.2f state=%s" % [_player.DebugFeetY, _player.DebugState])
+	_press_key(KEY_BACKSLASH, true)
+	await _wait_frames(2)
+	_press_key(KEY_BACKSLASH, false)
+	await _wait_frames(20)
+	# 注意：不能用 DebugMenu.Visible —— C# 自定义类暴露给 GDScript 的属性表里
+	# 没有继承来的 CanvasLayer.visible，会报 "Invalid access to property 'Visible'"。
+	# 改读 ApexPlayer 上的普通 bool 属性（和 DebugState 同一条反射路径）。
+	var menu_open: bool = _player.DebugMenuOpen
+	print("DEBUGMENU open=%s fov=%.1f cam.fov=%.1f" % [menu_open, _player.DebugFov, pcam.fov])
+	await _save("shot_debug_menu")
+
+	# 把 FOV 滑条推到 110°（走的是和玩家拖动同一条回调链）
+	if menu_open:
+		_player.DebugMenu.SetFovSliderValue(110.0)
+		await _wait(0.6)
+		print("DEBUGMENU fov->110 target=%.1f cam.fov=%.1f aspect=%.2f" % [_player.DebugFov, pcam.fov, pcam.keep_aspect])
+		await _save("shot_debug_menu_fov110")
+
+	# 再按一次 \ 关闭，确认能收起来
+	_press_key(KEY_BACKSLASH, true)
+	await _wait_frames(2)
+	_press_key(KEY_BACKSLASH, false)
+	await _wait_frames(20)
+	print("DEBUGMENU closed open=%s" % _player.DebugMenuOpen)
+	_player.DebugSetFov(90.0)
 	await _wait_frames(10)
 
 

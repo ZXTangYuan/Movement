@@ -1,5 +1,5 @@
 extends Node
-## ApexMovement **真实物理**集成测试（v0.2）。
+## ApexMovement **真实物理**集成测试（v0.4）。
 ##
 ## 为什么需要它：`determinism_test.tscn` 里的 FeatureTest 跑在 AnalyticWorld
 ## （纯数学测试替身）上，覆盖不到 Godot 桥接层与相机应用层。历史事故：
@@ -35,7 +35,7 @@ var _report: PackedStringArray = PackedStringArray()
 
 
 func _ready() -> void:
-	print("=== APEX MOVEMENT 集成测试 v0.2（真实物理） ===")
+	print("=== APEX MOVEMENT 集成测试 v0.4（真实物理） ===")
 	var packed: PackedScene = load(TESTBED)
 	if packed == null:
 		push_error("测试场地加载失败")
@@ -207,8 +207,13 @@ func _case_slide() -> void:
 	_expect("滑铲触发", sliding, "state=%s speed=%.2f" % [_player.DebugState, speed])
 	_expect("Slideboost 生效（>400hu/s 上限内）", speed > EXPECT_SPRINT + 1.0,
 		"speed=%.2f（冲刺 %.2f）" % [speed, EXPECT_SPRINT])
-	_expect("滑铲相机侧倾（slide_viewTilt）", absf(roll) > 0.5, "roll=%.2f°" % roll)
-	_expect("滑铲抬 FOV", fov > 91.0, "fov=%.2f°（基础 90）" % fov)
+	# v0.4 需求：滑铲画面与下蹲一致 —— 不再有滑铲专属侧倾（曾 5°）与 FOV 加宽（曾 +6°）。
+	# 残下的 0.74° / 92.37° 是"冲刺余量"（SprintMaxRollDeg 1.5°、FovSprintAdd 3° 的 blend 尾），
+	# 所以断言改成上限：绝不能超过冲刺档本身。
+	_expect("滑铲不再有专属侧倾（只剩冲刺余量 ≤1.5°）", absf(roll) <= 1.55,
+		"roll=%.2f°（上限 SprintMaxRollDeg 1.5）" % roll)
+	_expect("滑铲不再抬 FOV（只剩冲刺余量 ≤93°）", fov <= 93.05,
+		"fov=%.2f°（上限 90+3）" % fov)
 
 	_press(KEY_CTRL, false)
 	_press(KEY_W, false)
@@ -242,13 +247,13 @@ func _case_slide_hop_chain() -> void:
 
 
 func _case_mantle_classes() -> void:
-	# 四档翻越：0.9m→Below，1.7m→Level，3.0m→Above，6.0m→High
+	# 四档高度：0.9m→小障碍档（Vault/Below 直接翻），1.7/3.0/6.0m→墙档（W+Space 抓墙爬上去）。
 	# 台阶梯：x 从 -34 起、步长 8，z=35
 	var specs := [
 		{ "x": -26.0, "h": 0.9, "want": "Below" },
-		{ "x": -10.0, "h": 1.7, "want": "Level" },
-		{ "x": 6.0,   "h": 3.0, "want": "Above" },
-		{ "x": 22.0,  "h": 6.0, "want": "High" },
+		{ "x": -10.0, "h": 1.7, "want": "" },
+		{ "x": 6.0,   "h": 3.0, "want": "" },
+		{ "x": 22.0,  "h": 6.0, "want": "" },
 	]
 	for s in specs:
 		_release_all()
@@ -256,19 +261,38 @@ func _case_mantle_classes() -> void:
 		_player.DebugSetYaw(PI)               # 朝 +Z
 		await _frames(40)
 
+		# v0.4：翻越/攀爬必须 "W + Space" 才触发（走着撞墙只会撞停）。
+		# 只在**地面上**点跳：已经挂上墙之后再按 Space 会变成蹬墙跳/到顶翻越，会毁掉攀爬。
+		var h: float = float(s["h"])
 		_press(KEY_W, true)
 		var seen_class := ""
 		var max_feet := 0.0
-		for i in range(180):
+		var on_top := false
+		for i in range(420):
 			await get_tree().physics_frame
+			if _player.DebugState == "Ground" and i % 20 == 10:
+				_press(KEY_SPACE, true)
+			elif i % 20 == 12:
+				_press(KEY_SPACE, false)
 			max_feet = max(max_feet, _player.DebugFeetY)
 			if seen_class == "" and _player.DebugState in ["Mantle", "Vault"]:
 				seen_class = _player.DebugMantleClass
+			if _player.DebugState == "Ground" and _player.DebugFeetY > h - 0.2:
+				on_top = true
+				break
 		_press(KEY_W, false)
+		_press(KEY_SPACE, false)
 
-		_expect("翻越分档 %s（%.1fm 台面）" % [s["want"], s["h"]],
-			seen_class == s["want"],
-			"实测档位=%s，脚底最高 %.2f" % [seen_class, max_feet])
+		if s["want"] != "":
+			# 小障碍档：直接翻越，档位必须是 Below
+			_expect("小障碍 %.1fm：W+Space 直接翻越（档位 %s）" % [h, s["want"]],
+				seen_class == s["want"] and on_top,
+				"实测档位=%s，脚底最高 %.2f，站上台面=%s" % [seen_class, max_feet, on_top])
+		else:
+			# 墙档：抓住 → 上爬 → 到顶翻上，脚底要到台面高度
+			_expect("墙 %.1fm：W+Space 抓墙 → 按住 W 爬到台面上" % h,
+				on_top and absf(max_feet - h) < 0.25,
+				"脚底最高 %.2f（台面 %.2f），站上台面=%s" % [max_feet, h, on_top])
 		await _frames(30)
 
 
@@ -279,12 +303,23 @@ func _case_mantle_6m() -> void:
 	_player.DebugSetYaw(PI)                   # 朝 +Z
 	await _frames(40)
 
+	# v0.4：先在地面点一次 Space 起跳抓墙，之后一路按住 W 往上爬。
 	_press(KEY_W, true)
 	var max_feet: float = 0.0
-	for i in range(300):
+	var jumped := false
+	for i in range(420):
 		await get_tree().physics_frame
+		if not jumped and _player.DebugState == "Ground" and i % 20 == 10:
+			_press(KEY_SPACE, true)
+		elif i % 20 == 12:
+			_press(KEY_SPACE, false)
+		if _player.DebugState in ["Climb", "WallHang"]:
+			jumped = true
 		max_feet = max(max_feet, _player.DebugFeetY)
+		if max_feet > EXPECT_MANTLE_H - 0.15 and _player.DebugState == "Ground":
+			break
 	_press(KEY_W, false)
+	_press(KEY_SPACE, false)
 
 	_expect_near("6m 攀爬（High 档）", max_feet, EXPECT_MANTLE_H, 0.25)
 	await _frames(40)
@@ -342,12 +377,13 @@ func _case_climb_gate() -> void:
 		_expect("按住 W 持续上爬（0.75s 至少 +0.8m）", feet1 - feet0 > 0.8,
 			"Δfeet=%.3f（ClimbSpeed 2.0 m/s）" % (feet1 - feet0))
 
-		# ③ 松开 W ⇒ 宽限 0.22s 后取消攀爬、开始下落
+		# ③ 松开 W ⇒ 进入扒墙（WallHang），并开始缓慢下滑（v0.4 需求第 3 条）
 		_press(KEY_W, false)
-		await _frames(30)
-		_expect("松开 W 后取消攀爬并下落",
-			_player.DebugState != "Climb" and _player.DebugVerticalSpeed < 0.0,
-			"state=%s vy=%.3f" % [_player.DebugState, _player.DebugVerticalSpeed])
+		var slide_from: float = _player.DebugFeetY
+		await _frames(40)
+		_expect("松开 W 后转入扒墙（WallHang）并缓慢下滑",
+			_player.DebugState == "WallHang" and _player.DebugFeetY < slide_from,
+			"state=%s feet %.3f → %.3f" % [_player.DebugState, slide_from, _player.DebugFeetY])
 	else:
 		_press(KEY_W, false)
 	await _frames(40)
@@ -378,16 +414,22 @@ func _case_vault_wall() -> void:
 	_player.DebugSetYaw(PI)                   # 朝 +Z
 	await _frames(40)
 
+	# v0.4：小障碍档（≤1m）是 W + Space 直接翻越，不是走着自动翻。
 	_press(KEY_W, true)
 	var max_z: float = -1e9
-	for i in range(240):
+	for i in range(300):
 		await get_tree().physics_frame
+		if _player.DebugState == "Ground" and i % 20 == 10:
+			_press(KEY_SPACE, true)
+		elif i % 20 == 12:
+			_press(KEY_SPACE, false)
 		max_z = max(max_z, _player.global_position.z)
 		if max_z > 53.5:
 			break
 	_press(KEY_W, false)
+	_press(KEY_SPACE, false)
 
-	_expect("翻越 0.8m 矮墙", max_z > 53.0, "max_z=%.2f（墙 z=47..53）" % max_z)
+	_expect("翻越 0.8m 矮墙（W+Space）", max_z > 53.0, "max_z=%.2f（墙 z=47..53）" % max_z)
 	await _frames(40)
 
 
@@ -398,17 +440,23 @@ func _case_window() -> void:
 	_player.DebugSetYaw(PI)                   # 朝 +Z
 	await _frames(40)
 
+	# v0.4：窗口翻越同样挂在 W + Space 上（自动翻越探测已移除）。
 	_press(KEY_W, true)
 	var saw_window := false
 	var max_z: float = -1e9
-	for i in range(240):
+	for i in range(300):
 		await get_tree().physics_frame
+		if _player.DebugState == "Ground" and i % 20 == 10:
+			_press(KEY_SPACE, true)
+		elif i % 20 == 12:
+			_press(KEY_SPACE, false)
 		if _player.DebugState == "Window":
 			saw_window = true
 		max_z = max(max_z, _player.global_position.z)
 		if max_z > 69.5:
 			break
 	_press(KEY_W, false)
+	_press(KEY_SPACE, false)
 
 	_expect("窗口翻越（TRAVERSAL_WINDOW）", saw_window, "state=Window 出现=%s" % saw_window)
 	_expect("穿过窗口开口", max_z > 68.0, "max_z=%.2f（窗 z≈68）" % max_z)

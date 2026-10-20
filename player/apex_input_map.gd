@@ -21,6 +21,10 @@ const ACTIONS := {
 	"apex_fov_down": [KEY_BRACKETLEFT, KEY_MINUS],
 	"apex_holster": [KEY_H],
 	"apex_reset": [KEY_R],
+	# ── v0.4 新增 ──
+	# 运行时调试菜单开关（需求：「按 "\" 键进入调试菜单……再按 "\" 关闭」）。
+	# 用 physical_keycode 注册，所以换成非 US 键盘布局也仍然是"那个物理位置"。
+	"apex_debug_menu": [KEY_BACKSLASH],
 }
 
 

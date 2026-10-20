@@ -169,9 +169,31 @@ public sealed class CameraEffectsConfig
     public float TraversalAngleLag = 0.35f;
 
     // ═══════════════════════════ 走路摇晃（bob） ═══════════════════════════
+    //
+    // ★ v0.4 起，下面这一组 **不再被 ApexCameraRig 读取**。
+    //
+    // 需求原话：「通过步行和奔跑的速度，以及角色身高对应的步幅步频来获得对应的
+    // 镜头抖动频率和幅度，奔跑状态的步幅和步频需要考虑现实人物奔跑的略微腾空。」
+    //
+    // 于是幅度与频率全部改由 `core/GaitModel.cs` 按生物力学推导
+    // （身高 → 腿长 → Froude 速度 → 步频 → 步幅 → 腾空比 → 质心起伏），
+    // 求解器把结果放进 `MovementSnapshot.Gait`，相机直接读。
+    //
+    // 保留这些字段是为了配置兼容（老配置文件、老测试仍能编译），
+    // 改它们不会影响画面 —— 想调摇晃幅度请用 <see cref="BobGaitScale"/>。
+    // ═══════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// [C] 走路摇晃的垂直幅度 (m)。
+    /// [C] **步态摇晃倍率**（v0.4 新增，这是唯一仍然生效的摇晃幅度旋钮）。
+    ///
+    /// 1.0 = 步态模型推导出的物理值（舒适档：垂直 ~2 cm 半幅、点头 ≤0.8°）；
+    /// 0.0 = 完全关掉走路摇晃；2.0 = 翻倍（用于对比/调试）。
+    /// 运行时可通过调试菜单（`\` 键）实时拖动。
+    /// </summary>
+    public float BobGaitScale = 1.0f;
+
+    /// <summary>
+    /// [C] 走路摇晃的垂直幅度 (m)。**v0.4 起不再生效**（改由步态模型推导）。
     ///
     /// ⚠️ **Apex 没有 `cl_bob` 类 cvar**（逆向负结论），走路摇晃来自第一人称动画，
     /// 因此这里**没有任何证据可依**，纯手感参数。
@@ -180,13 +202,13 @@ public sealed class CameraEffectsConfig
     /// </summary>
     public float BobAmplitude = 0.026f;
 
-    /// <summary>[C] 走路摇晃的横向幅度 (m)。v0.3：0.022 → 0.016。</summary>
+    /// <summary>[C] 走路摇晃的横向幅度 (m)。**v0.4 起不再生效**。v0.3：0.022 → 0.016。</summary>
     public float BobLateralAmplitude = 0.016f;
 
-    /// <summary>[C] 冲刺时摇晃幅度倍率。</summary>
+    /// <summary>冲刺时摇晃幅度倍率。**v0.4 起不再生效**（腾空比已含在步态模型里）。</summary>
     public float BobSprintMultiplier = 1.6f;
 
-    /// <summary>[C] 摇晃的俯仰幅度 (deg)。v0.3：0.35 → 0.24。</summary>
+    /// <summary>[C] 摇晃的俯仰幅度 (deg)。**v0.4 起不再生效**。v0.3：0.35 → 0.24。</summary>
     public float BobPitchDeg = 0.24f;
 
     /// <summary>[C] 摇晃的滚转幅度 (deg)。v0.3：0.30 → 0.20。</summary>

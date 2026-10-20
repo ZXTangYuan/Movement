@@ -17,7 +17,7 @@ public static class CameraTest
         float speed = 0f, bool onGround = true, bool sprinting = false, bool sliding = false,
         float crouch = 0f, float height = 1.95f, float bobPhase = 0f, int tick = 0,
         MovementState state = MovementState.Ground, float traversalProgress = -1f,
-        LandingTier landing = LandingTier.None, F3? pos = null)
+        LandingTier landing = LandingTier.None, F3? pos = null, GaitSample gait = default)
     {
         return new MovementSnapshot
         {
@@ -39,7 +39,16 @@ public static class CameraTest
             LandingTier = landing,
             BobPhase = bobPhase,
             TickCount = tick,
+            Gait = gait,
         };
+    }
+
+    /// <summary>按真实步态模型造一个"以 speed 走路/奔跑"的快照（v0.4：相机只读步态）。</summary>
+    private static MovementSnapshot GaitSnap(float speed, float bobPhase, float crouch = 0f,
+                                             MovementState state = MovementState.Ground)
+    {
+        var gait = GaitModel.Evaluate(speed, 1.95f, 6.604f, crouch, GaitParams.Default);
+        return Snap(speed: speed, bobPhase: bobPhase, crouch: crouch, state: state, gait: gait);
     }
 
     public static (bool Pass, string Report) Run()
@@ -78,7 +87,7 @@ public static class CameraTest
             Check("冲刺抬 FOV", o.Fov > 90.5f && o.Fov < 96f, $"fov={o.Fov:F2}（基础 90 + 冲刺 3）");
         }
 
-        // ═════════ 3. 滑铲抬 FOV 更多 ═════════
+        // ═════════ 3. 滑铲不抬 FOV（v0.4：滑铲镜头完全等同下蹲）═════════
         {
             var rig = new ApexCameraRig();
             rig.Update(Snap(), dt);
@@ -86,7 +95,8 @@ public static class CameraTest
             for (int i = 0; i < 90; i++)
                 o = rig.Update(Snap(speed: 10f, sliding: true, crouch: 1f, height: 0.975f,
                                     state: MovementState.Slide), dt);
-            Check("滑铲抬 FOV", o.Fov > 94f, $"fov={o.Fov:F2}（基础 90 + 滑铲 6）");
+            Check("滑铲不抬 FOV（与下蹲一致）", MathF.Abs(o.Fov - 90f) < 0.2f,
+                  $"fov={o.Fov:F2}（基础 90；v0.4 已移除滑铲加宽）");
         }
 
         // ═════════ 4. FOV 被夹在 [FovMin, FovMax] ═════════
@@ -117,24 +127,24 @@ public static class CameraTest
         // ═════════ 6. tan 空间插值 vs 线性插值（中间值不同，终值相同）═════════
         {
             // 用较大的 FOV 变化量（90 → 115）才看得出 tan 空间与线性空间的差别。
-            // 先把 slideBlend 预热到饱和（FovSmoothing=0 让 FOV 不动），再打开平滑做对比。
-            var cfgT = new CameraEffectsConfig { FovSpace = FovInterpSpace.Tangent, FovSmoothing = 0f, FovSlideAdd = 25f };
-            var cfgL = new CameraEffectsConfig { FovSpace = FovInterpSpace.Linear, FovSmoothing = 0f, FovSlideAdd = 25f };
+            // 先把 sprintBlend 预热到饱和（FovSmoothing=0 让 FOV 不动），再打开平滑做对比。
+            var cfgT = new CameraEffectsConfig { FovSpace = FovInterpSpace.Tangent, FovSmoothing = 0f, FovSprintAdd = 25f };
+            var cfgL = new CameraEffectsConfig { FovSpace = FovInterpSpace.Linear, FovSmoothing = 0f, FovSprintAdd = 25f };
             var rigT = new ApexCameraRig(cfgT);
             var rigL = new ApexCameraRig(cfgL);
             rigT.Update(Snap(), dt); rigL.Update(Snap(), dt);
 
-            var slide = Snap(speed: 10f, sliding: true, sprinting: false);
-            for (int i = 0; i < 120; i++) { rigT.Update(slide, dt); rigL.Update(slide, dt); }
+            var sprint = Snap(speed: 10f, sprinting: true);
+            for (int i = 0; i < 120; i++) { rigT.Update(sprint, dt); rigL.Update(sprint, dt); }
 
             cfgT.FovSmoothing = 6f;
             cfgL.FovSmoothing = 6f;
 
             CameraOutput oT = default, oL = default;
-            for (int i = 0; i < 4; i++) { oT = rigT.Update(slide, dt); oL = rigL.Update(slide, dt); }
+            for (int i = 0; i < 4; i++) { oT = rigT.Update(sprint, dt); oL = rigL.Update(sprint, dt); }
             float diffMid = MathF.Abs(oT.Fov - oL.Fov);
 
-            for (int i = 0; i < 400; i++) { oT = rigT.Update(slide, dt); oL = rigL.Update(slide, dt); }
+            for (int i = 0; i < 400; i++) { oT = rigT.Update(sprint, dt); oL = rigL.Update(sprint, dt); }
             float diffEnd = MathF.Abs(oT.Fov - oL.Fov);
 
             Check("tan 空间插值与线性不同但收敛一致",
@@ -251,8 +261,9 @@ public static class CameraTest
             }
             float slow = RollAt(5f);
             float fast = RollAt(10f);
-            Check("滑铲侧倾随速度增大", fast > slow + 0.5f && fast > 1f,
-                  $"5m/s→{slow:F2}°，10m/s→{fast:F2}°（最大 {new CameraEffectsConfig().SlideMaxRollDeg}°）");
+            Check("滑铲不侧倾（与下蹲一致）",
+                  MathF.Abs(slow) < 0.05f && MathF.Abs(fast) < 0.05f,
+                  $"5m/s→{slow:F2}°，10m/s→{fast:F2}°（v0.4 已移除滑铲侧倾）");
         }
 
         // ═════════ 11. 冲刺侧倾 ═════════
@@ -265,7 +276,7 @@ public static class CameraTest
             Check("冲刺侧倾（sprinttiltMaxRoll）", deg > 0.5f && deg < 3f, $"roll={deg:F2}°");
         }
 
-        // ═════════ 12. 走路摇晃：静止无 bob，移动有 bob ═════════
+        // ═════════ 12. 走路摇晃：静止无 bob，移动有 bob（幅度来自步态模型）═════════
         {
             var rig = new ApexCameraRig();
             rig.Update(Snap(), dt);
@@ -277,21 +288,26 @@ public static class CameraTest
             float maxBob = 0f;
             for (int i = 0; i < 60; i++)
             {
-                var o = rig2.Update(Snap(speed: 5.4f, bobPhase: i * 0.4f), dt);
+                var o = rig2.Update(GaitSnap(5.4f, i * 0.4f), dt);
                 maxBob = MathF.Max(maxBob, MathF.Abs(F3.Dot(o.EyeOffset, F3.Up)));
             }
             Check("走路摇晃（静止无 / 移动有）",
-                  MathF.Abs(F3.Dot(idle.EyeOffset, F3.Up)) < 1e-4f && maxBob > 0.005f,
+                  MathF.Abs(F3.Dot(idle.EyeOffset, F3.Up)) < 1e-4f && maxBob > 0.002f,
                   $"静止 bob={F3.Dot(idle.EyeOffset, F3.Up):E2}，移动最大 bob={maxBob:F4} m");
+
+            // 舒适档上限：垂直起伏不超过 ~2.5 cm（5.4 m/s 时步态模型给出 ~1.4 cm）
+            Check("摇晃幅度落在舒适档（≤2.5 cm）", maxBob <= 0.025f,
+                  $"最大 bob={maxBob * 100f:F2} cm（上限 2.5 cm）");
         }
 
-        // ═════════ 13. 空中无 bob ═════════
+        // ═════════ 13. 空中无 bob（步态样本为零）═════════
         {
             var rig = new ApexCameraRig();
             rig.Update(Snap(), dt);
             float maxBob = 0f;
             for (int i = 0; i < 60; i++)
             {
+                // 空中：核心不给步态（Gait=default）⇒ 相机不摇
                 var o = rig.Update(Snap(speed: 5.4f, onGround: false, bobPhase: i * 0.4f), dt);
                 maxBob = MathF.Max(maxBob, MathF.Abs(F3.Dot(o.EyeOffset, F3.Up)));
             }

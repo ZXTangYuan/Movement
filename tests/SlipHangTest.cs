@@ -266,16 +266,29 @@ public static class SlipHangTest
 
         // ═══════════════════════ 扒墙 / 悬垂 ═══════════════════════
 
-        // ── 8. 非强制：空中贴墙但不按蹲 → 不挂 ──
+        // ── 8. 扒墙默认化（v0.4）：空中下落贴墙 + 不按任何键 → 自动挂住 ──
         {
             var world = WallWorld(wallTop: 20f);
             var core = MakeCore(world);
             core.Reset(new F3(0f, 5f, -1f));
             Run(core, 40, In());          // 什么都不按
 
-            Check("空中贴墙但不按蹲 → 不会自动挂住（非强制）",
-                  core.State != MovementState.WallHang,
+            Check("空中下落贴墙 + 不按任何键 → 自动挂住（扒墙默认化）",
+                  core.State == MovementState.WallHang,
                   $"state={core.State}");
+        }
+
+        // ── 8b. 但**上升**中不打断（需求：向上跳经过墙面不该被吸住） ──
+        {
+            var world = WallWorld(wallTop: 20f);
+            var core = MakeCore(world);
+            core.Reset(new F3(0f, 5f, -1f));
+            core.SetVelocity(new F3(0f, 4f, 0f));
+            Run(core, 6, In());           // 上升段（顶点约 11.5 tick）
+
+            Check("空中**上升**贴墙 + 不按 W → 不挂（上升不打断）",
+                  core.State == MovementState.Air,
+                  $"state={core.State} vy={core.VerticalSpeed:F2}");
         }
 
         // ── 9. 按蹲 + 贴墙 → 挂住，速度归零 ──
@@ -300,15 +313,15 @@ public static class SlipHangTest
                   $"WallHanging={core.Snapshot.WallHanging} grip={core.Snapshot.WallHangGrip:F2}");
         }
 
-        // ── 10. 松开蹲键 → 松手回空中 ──
+        // ── 10. 松手键不再存在（v0.4）：松开所有键仍然挂着，靠无输入计时掉落 ──
         {
             var world = WallWorld(wallTop: 20f);
             var core = AttachHang(world);
-            Run(core, 3, In());           // 松开蹲
+            Run(core, 3, In());           // 什么都不按
 
-            Check("松开蹲键 → 立刻松手（回 Air）",
-                  core.State == MovementState.Air,
-                  $"state={core.State}");
+            Check("松开所有键 → 仍然挂在墙上（不会因为松键就掉）",
+                  core.State == MovementState.WallHang,
+                  $"state={core.State}（无输入 WallHangIdleFallTime={cfg0.WallHangIdleFallTime:F1}s 后掉落）");
         }
 
         // ── 11. 按 W 沿墙上爬 ──
@@ -316,12 +329,13 @@ public static class SlipHangTest
             var world = WallWorld(wallTop: 20f);
             var core = AttachHang(world);
             float y0 = core.Position.Y;
-            Run(core, 60, In(mz: 1f, crouch: true));
+            Run(core, 60, In(mz: 1f));
             float y1 = core.Position.Y;
 
-            Check("挂住时按 W → 沿墙上爬（≈1 m/s）",
-                  core.State == MovementState.WallHang && y1 - y0 > 0.8f && y1 - y0 < 1.3f,
-                  $"Δy={y1 - y0:F2}（期望 ≈ 1.00，state={core.State}）");
+            // v0.4：贴墙统一状态机，W 上爬用 ClimbSpeed（2.0 m/s），不再有独立的 1.0 m/s 档
+            Check("挂住时按 W → 沿墙上爬（ClimbSpeed 2.0 m/s），状态切 Climb",
+                  core.State == MovementState.Climb && y1 - y0 > 1.7f && y1 - y0 < 2.3f,
+                  $"Δy={y1 - y0:F2}（期望 ≈ 2.00，state={core.State}）");
         }
 
         // ── 12. 按 A/D 沿墙横移 ──
@@ -450,7 +464,7 @@ public static class SlipHangTest
             Run(core, 40, In());
             int probes = core.WallHangProbeCount - before;
 
-            Check("扒墙探针每 tick 都跑（不按蹲时提前返回，无射线开销）",
+            Check("扒墙探针每 tick 都跑（ClimbProbeInterval=1，不额外抽样）",
                   probes == 40,
                   $"实测 {probes} 次（期望 40）");
         }

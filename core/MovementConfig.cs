@@ -233,8 +233,65 @@ public sealed class MovementConfig
 
     // ═════════════════════════════ 翻越 / 攀爬 ═════════════════════════════
 
-    /// <summary>[A] 可"走过"的台阶高度 (m) = 30 hu = 0.762。wiki Ground：overwalkable。</summary>
-    public float OverwalkableHeight = 0.76200f;
+    /// <summary>
+    /// [C] **台阶**高度上限 (m) = 0.25（v0.4 需求方口径）。
+    ///
+    /// 需求原话：「≤0.25 m 视为台阶 → 直接平滑经过、无速度衰减；上台阶时水平速度
+    /// 变为斜向上的速度再变回水平，**只有方向变化、大小不变**，不触发任何动作」。
+    ///
+    /// 三档障碍分级（v0.4 起，全部由需求方定义）：
+    ///   · <c>≤ StepMaxHeight (0.25)</c> → 台阶：自动平滑跨越，速度大小不变（只倾斜方向）
+    ///   · <c>(0.25, VaultMaxHeight (1.0)]</c> → 小障碍：按 W+Space 翻越，速度小幅削减后快速恢复
+    ///   · <c>&gt; VaultMaxHeight (1.0)</c> → 墙：撞上去停住；W+Space 起跳后由 Climb 接管
+    ///
+    /// v0.3 及之前这里是 0.762（Apex 的 30 hu overwalkable），一个 0.7 m 的台子
+    /// 会被"直接跨过去"，既不符合需求的三档分级，也让 ≤1 m 的小障碍失去意义。
+    /// </summary>
+    public float OverwalkableHeight = 0.25000f;
+
+    /// <summary>
+    /// [C] **小障碍**高度上限 (m) = 1.0（v0.4 需求方口径）。
+    ///
+    /// 高于这个值就是"墙"：贴墙按 W 只会撞停，必须 W+Space 起跳后走攀爬。
+    /// 低于等于这个值：W+Space 直接翻越（Vault），**不触发攀爬**。
+    /// </summary>
+    public float VaultMaxHeight = 1.0f;
+
+    /// <summary>
+    /// [C] 翻越小障碍时的水平速度保留系数（0.85 = 只损失 15%）。
+    ///
+    /// 需求：「水平速度削减较小，翻越结束快速恢复满速」。
+    /// 与"攀爬"形成对比：攀爬时水平速度直接掉到 0（需求原话）。
+    /// </summary>
+    public float VaultSpeedRetention = 0.85f;
+
+    /// <summary>
+    /// [C] 翻越后恢复到满速的时间 (s)。
+    ///
+    /// 实现方式：翻越结束时给一个 <see cref="VaultRecoverTime"/> 长的"加速宽限"，
+    /// 这期间地面加速度放大，玩家 0.25 s 内就重新回到满速（需求：「快速恢复满速」）。
+    /// </summary>
+    public float VaultRecoverTime = 0.25f;
+
+    /// <summary>[C] 翻越后加速宽限期的加速度倍率。</summary>
+    public float VaultRecoverAccelBoost = 3.0f;
+
+    /// <summary>
+    /// [C] 台阶过渡的倾斜时长 (s)。
+    ///
+    /// 上台阶时速度方向从水平抬到 <c>θ = atan(b/a)</c> 再落回水平，
+    /// 这个时长就是"抬起来 → 落回去"的总时间。0.12 s 约等于脚掌踩上台阶再蹬直的时间。
+    /// </summary>
+    public float StepTiltTime = 0.12f;
+
+    /// <summary>
+    /// [C] 台阶倾角的横向基准 a (m)：玩家脚底中心到脚底边缘的距离。
+    ///
+    /// 需求给的公式是 <c>tan(θ) = b / a</c>，其中 a = 玩家脚底中心到脚底边缘的横向距离。
+    /// 默认取胶囊半径（= 脚底半径），因为胶囊的底面就是一个半径 R 的半球。
+    /// 传 &lt;= 0 时运行时用 <see cref="CapsuleRadius"/>。
+    /// </summary>
+    public float StepTiltFootRadius = 0f;
 
     /// <summary>[A] Auto-mantle 高度上限 (m) = 80 hu = 2.032。wiki Auto mantle。</summary>
     public float AutoMantleMaxHeight = 2.03200f;
@@ -538,10 +595,35 @@ public sealed class MovementConfig
     /// <summary>
     /// [C] 扒墙是否**必须按住蹲键**。
     ///
-    /// 默认 true —— 这是"非强制"原则的延续：贴着墙跳一下不该被自动抓成悬垂，
-    /// 玩家必须显式按住 Ctrl 才挂。关掉后变成"空中贴墙自动挂"（不推荐）。
+    /// **v0.4 起默认 false** —— 需求原话：「扒墙我希望是默认扒墙，不需要按任何按键」。
+    /// 保留字段是为了让别的项目可以回到 v0.3 的"显式按 Ctrl 才挂"。
     /// </summary>
-    public bool WallHangRequiresCrouch = true;
+    public bool WallHangRequiresCrouch = false;
+
+    /// <summary>
+    /// [C] 扒墙待机时，**多久没有任何输入就掉下去** (s)。
+    ///
+    /// 需求：「如果持续一小段时间没有按键输入，就会掉落」。
+    /// 1.2 s 足够让"松手后想按 A/D 横移"的人来得及，又不会让人一直白挂着。
+    /// 注意这是**无输入**计时，不是握力计时：按着 A/D 或 W 都会重置它。
+    /// </summary>
+    public float WallHangIdleFallTime = 1.2f;
+
+    /// <summary>
+    /// [C] 只横移（A/D）不往上爬时，握力从满到空要多久 (s)。
+    ///
+    /// 需求只规定了"无输入会掉"，横移显然不该和无输入一样快掉 ——
+    /// 6 s 允许玩家沿着一面长墙横着挪一段，但不会无限期挂着。
+    /// </summary>
+    public float WallHangLateralFallTime = 6.0f;
+
+    /// <summary>
+    /// [C] 按 W 上爬时，握力从空回满要多久 (s)。
+    ///
+    /// 对应 <c>m_wallDangleClimbProgressFloor</c>：往上爬 = 把手再抓高一点，
+    /// 把已经下滑掉的进度收回来。2.5 s 回满 ≈ 一次"喘口气再往上"的节奏。
+    /// </summary>
+    public float WallHangGripRestoreTime = 2.5f;
 
     /// <summary>[A] 扒墙的最大视角偏角 (deg)。与攀爬同源 = arccos(0.7)。</summary>
     public float WallHangMaxViewAngle = 45.57f;
@@ -549,8 +631,15 @@ public sealed class MovementConfig
     /// <summary>[C] 扒墙的前向抓取距离 (m)（在胶囊半径之外还要够到多远）。</summary>
     public float WallHangReach = 0.9f;
 
-    /// <summary>[C] 沿墙上爬 / 下移的速度 (m/s)（`ACT_MP_WALLHANG_UP`）。</summary>
-    public float WallHangClimbSpeed = 1.0f;
+    /// <summary>
+    /// [C] 抓墙要求的最小**离地间隙** (m)：脚底到脚下地面的距离小于这个值就不抓。
+    ///
+    /// 为什么需要：扒墙默认化之后，"站在墙根下"与"挂在墙上"在几何上只差几厘米 ——
+    /// 玩家贴着墙走下一个小坡、或者落地那一 tick 还没被贴地探针吸附，都会满足
+    /// "空中 + 够得到墙 + 正在下落"，于是人被凭空吸到墙上去。
+    /// 加一条脚下探针把这两种情况彻底分开：脚底下就是地面 ⇒ 该落地，不该挂墙。
+    /// </summary>
+    public float WallGrabMinGroundClearance = 0.5f;
 
     /// <summary>[C] 沿墙左右横移的速度 (m/s)（`ACT_MP_WALLHANG_LEFT/RIGHT`）。</summary>
     public float WallHangShimmySpeed = 0.8f;
@@ -587,6 +676,13 @@ public sealed class MovementConfig
 
     /// <summary>[C] 从扒墙"完成"（翻上去）时给的前推速度 (m/s)（`sound_wallHangComplete`）。</summary>
     public float WallHangCompleteForwardSpeed = 1.2f;
+
+    /// <summary>
+    /// 步态模型参数（v0.4）。走路/奔跑的步幅、步频、腾空比与各方向抖动幅度
+    /// 全部由 <see cref="GaitModel"/> 按「身高 + 速度」推导，这里是它的常数表。
+    /// 推导过程与数值落点见 <see cref="GaitParams"/> 的类型注释。
+    /// </summary>
+    public GaitParams Gait = GaitParams.Default;
 
     /// <summary>固定 tick 时长 (s)。</summary>
     public float FixedDelta => 1.0f / TickRate;
@@ -691,12 +787,16 @@ public sealed class MovementConfig
         if (WallHangMaxViewAngle <= 0f || WallHangMaxViewAngle >= 90f)
             throw new ArgumentOutOfRangeException(nameof(WallHangMaxViewAngle));
         if (WallHangReach <= 0f) throw new ArgumentOutOfRangeException(nameof(WallHangReach));
-        if (WallHangClimbSpeed < 0f) throw new ArgumentOutOfRangeException(nameof(WallHangClimbSpeed));
+        if (WallGrabMinGroundClearance < 0f)
+            throw new ArgumentOutOfRangeException(nameof(WallGrabMinGroundClearance));
         if (WallHangShimmySpeed < 0f) throw new ArgumentOutOfRangeException(nameof(WallHangShimmySpeed));
         if (WallHangMaxTime <= 0f) throw new ArgumentOutOfRangeException(nameof(WallHangMaxTime));
         if (WallHangSlipSpeed < 0f) throw new ArgumentOutOfRangeException(nameof(WallHangSlipSpeed));
         if (WallHangMaxSlipDistance <= 0f) throw new ArgumentOutOfRangeException(nameof(WallHangMaxSlipDistance));
         if (WallHangReattachCooldown < 0f) throw new ArgumentOutOfRangeException(nameof(WallHangReattachCooldown));
+        if (WallHangIdleFallTime <= 0f) throw new ArgumentOutOfRangeException(nameof(WallHangIdleFallTime));
+        if (WallHangLateralFallTime <= 0f) throw new ArgumentOutOfRangeException(nameof(WallHangLateralFallTime));
+        if (WallHangGripRestoreTime <= 0f) throw new ArgumentOutOfRangeException(nameof(WallHangGripRestoreTime));
         if (CapsuleRadius <= 0f) throw new ArgumentOutOfRangeException(nameof(CapsuleRadius));
         if (ClimbAttachMaxViewAngle <= 0f || ClimbAttachMaxViewAngle >= 90f)
             throw new ArgumentOutOfRangeException(nameof(ClimbAttachMaxViewAngle));

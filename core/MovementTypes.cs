@@ -195,6 +195,18 @@ public struct MovementSnapshot
     // ── 帧率无关的步频相位（供走路摇晃） ──
     public float BobPhase;
     public int TickCount;
+
+    // ── 步态推导结果（v0.4：相机只读，不再自己拍数） ──
+    /// <summary>
+    /// 本 tick 的步态求值结果（步频 / 步幅 / 腾空比 / 各方向抖动半幅）。
+    /// 由 <see cref="GaitModel"/> 按「身高 + 水平速度 + 冲刺参考速度 + 蹲伏量」推导，
+    /// 相机只负责把它变成眼位偏移与角度，**不再自己拍频率/幅度**。
+    /// </summary>
+    public GaitSample Gait;
+
+    // ── 台阶过渡（v0.4：≤0.25m 台阶"只改方向不改大小"） ──
+    /// <summary>当前台阶倾斜角 (rad)：速度方向被抬起这么多，0 = 水平。</summary>
+    public float StepTiltAngle;
 }
 
 /// <summary>

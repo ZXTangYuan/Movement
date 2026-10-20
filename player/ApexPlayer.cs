@@ -60,6 +60,11 @@ public partial class ApexPlayer : Node3D
     [Export] public float FovBase = 90f;
     [Export] public bool CameraEffectsEnabled = true;
     [Export] public bool ShowDebugHud = true;
+    /// <summary>
+    /// 是否启用运行时调试菜单（v0.4 新增）。按 <c>\</c> 打开/关闭。
+    /// 关掉它 = 这个节点完全不创建菜单节点（打包发布时可关）。
+    /// </summary>
+    [Export] public bool ShowDebugMenu = true;
 
     [ExportGroup("Input")]
     [Export] public float MouseSensitivity = 0.0025f;
@@ -82,6 +87,13 @@ public partial class ApexPlayer : Node3D
     private GodotMovementWorld _world = null!;
     private Camera3D _camera = null!;
     private Label _hud = null!;
+    /// <summary>运行时调试菜单（`\` 键开关，v0.4 新增）。未启用时为 null。</summary>
+    private ApexDebugMenu? _debugMenu;
+
+    /// <summary>调试面板（截图 / 自检脚本用；未构建时为 null）。</summary>
+    public ApexDebugMenu? DebugMenu => _debugMenu;
+    /// <summary>调试菜单是否正在显示（显示时冻结移动输入、释放鼠标）。</summary>
+    private bool _debugMenuOpen;
 
     /// <summary>
     /// 固定 tick 累加器：把物理帧时间折算成 60Hz 的求解器 tick。
@@ -144,6 +156,9 @@ public partial class ApexPlayer : Node3D
     public float DebugRollDeg => _camOut.Roll * 180f / Mathf.Pi;
     public float DebugTraversalBlend => _camOut.TraversalBlend;
     public float DebugVerticalSpeed => _core.VerticalSpeed;
+
+    /// <summary>台阶倾斜角（度）。>0 表示这一 tick 正在把水平速度抬成斜向上。</summary>
+    public float DebugStepTiltDeg => _core.StepTiltAngle * (180f / Mathf.Pi);
     public bool DebugHolstered => _holstered;
 
     /// <summary>当前相机相对脚底的高度（米）。站立应为 1.85，蹲下应为 0.875。</summary>
@@ -276,9 +291,116 @@ public partial class ApexPlayer : Node3D
         if (!_camera.IsInGroup("player_cameras")) _camera.AddToGroup("player_cameras");
 
         if (ShowDebugHud) BuildHud();
+        if (ShowDebugMenu)
+        {
+            // 先保证 `\` 这个动作存在，再建面板 —— 否则面板建好了却按不出来。
+            EnsureAction("apex_debug_menu", Key.Backslash);
+            BuildDebugMenu();
+        }
 
         Input.MouseMode = Input.MouseModeEnum.Captured;
         _mouseCaptured = true;
+    }
+
+    /// <summary>
+    /// 构建运行时调试菜单（`\` 键开关）。
+    ///
+    /// 需求原话：「我没看到调试菜单，我希望按 "\" 键进入调试菜单，
+    /// 调试菜单可以更改 fov，再按 "\" 关闭」。
+    ///
+    /// 菜单节点自己不知道移动逻辑，只发 C# 事件；这里把事件接到求解器/相机上。
+    /// </summary>
+    private void BuildDebugMenu()
+    {
+        _debugMenu = new ApexDebugMenu { Name = "DebugMenu", Layer = 20 };
+        AddChild(_debugMenu);
+        _debugMenu.Build(FovBase, MouseSensitivity,
+                         _rig.Config.BobGaitScale, _rig.Config.KickScale,
+                         CameraEffectsEnabled, ShowDebugHud);
+
+        _debugMenu.FovChanged += v =>
+        {
+            _rig.SetBaseFov(v);
+            FovBase = v;
+        };
+        _debugMenu.SensitivityChanged += v => MouseSensitivity = v;
+        _debugMenu.BobScaleChanged += v => _rig.Config.BobGaitScale = v;
+        _debugMenu.KickScaleChanged += v => _rig.Config.KickScale = v;
+        _debugMenu.CameraEffectsToggled += on => CameraEffectsEnabled = on;
+        _debugMenu.HudToggled += SetHudVisible;
+        _debugMenu.CloseRequested += CloseDebugMenu;
+
+        // 初始不可见（_Ready 里已设，这里再确认一次语义）
+        _debugMenu.Visible = false;
+        _debugMenuOpen = false;
+    }
+
+    /// <summary>切换调试菜单显隐（`\` 键）。</summary>
+    public void ToggleDebugMenu()
+    {
+        if (_debugMenu == null) return;
+        if (_debugMenuOpen) CloseDebugMenu(); else OpenDebugMenu();
+    }
+
+    private void OpenDebugMenu()
+    {
+        if (_debugMenu == null || _debugMenuOpen) return;
+        _debugMenuOpen = true;
+        _debugMenu.Visible = true;
+
+        // 打开菜单必须放开鼠标，否则滑条拖不动。
+        _mouseCaptured = false;
+        Input.MouseMode = Input.MouseModeEnum.Visible;
+
+        // 把面板上的数值同步成"此刻真实在用的值"（玩家可能用 [ / ] 改过 FOV）。
+        _debugMenu.SyncFov(_rig.Config.FovBase);
+        _debugMenu.SyncSensitivity(MouseSensitivity);
+    }
+
+    private void CloseDebugMenu()
+    {
+        if (_debugMenu == null || !_debugMenuOpen) return;
+        _debugMenuOpen = false;
+        _debugMenu.Visible = false;
+
+        _mouseCaptured = true;
+        Input.MouseMode = Input.MouseModeEnum.Captured;
+    }
+
+    /// <summary>调试菜单是否正在显示（自检/截图脚本用）。</summary>
+    public bool DebugMenuOpen => _debugMenuOpen;
+
+    /// <summary>显示/隐藏左上角状态行。</summary>
+    public void SetHudVisible(bool on)
+    {
+        ShowDebugHud = on;
+        if (on)
+        {
+            if (_hud == null) BuildHud();
+            else _hud.Visible = true;
+        }
+        else if (_hud != null)
+        {
+            _hud.Visible = false;
+        }
+    }
+
+    /// <summary>
+    /// 保证某个输入动作存在（不存在就现场注册）。
+    ///
+    /// 为什么不在 C# 里依赖 `apex_input_map.gd`：
+    /// 那个脚本是 GDScript，而 <see cref="ApexPlayer"/> 是纯 C# 节点 ——
+    /// 插件被拖进宿主项目时如果没人调 `ApexInputMap.ensure_all()`，
+    /// 这里就会 <c>Input.IsActionPressed("apex_debug_menu")</c> 报错。
+    /// 调试菜单是"排障入口"，它必须无论如何都能打开，所以在这里自给自足。
+    ///
+    /// 已存在的同名动作**不覆盖**（尊重宿主项目的键位自定义）。
+    /// </summary>
+    private static void EnsureAction(string action, Key physicalKey)
+    {
+        if (InputMap.HasAction(action)) return;
+        InputMap.AddAction(action, 0.2f);
+        InputMap.ActionAddEvent(action, new InputEventKey { PhysicalKeycode = physicalKey });
     }
 
     private void BuildHud()
@@ -303,6 +425,28 @@ public partial class ApexPlayer : Node3D
 
     public override void _UnhandledInput(InputEvent @event)
     {
+        // ── 调试菜单开关（`\` 键，v0.4） ──────────────────────────
+        //
+        // 放在最前面：菜单打开时其它按键（包括 Esc）不应该穿透到游戏逻辑，
+        // 否则"想拖滑条"会变成"切鼠标捕获"。
+        if (@event.IsActionPressed("apex_debug_menu"))
+        {
+            ToggleDebugMenu();
+            GetViewport().SetInputAsHandled();
+            return;
+        }
+
+        if (_debugMenuOpen)
+        {
+            // 菜单打开时 Esc 也当"关闭菜单"，符合直觉。
+            if (@event.IsActionPressed("ui_cancel"))
+            {
+                CloseDebugMenu();
+                GetViewport().SetInputAsHandled();
+            }
+            return;
+        }
+
         if (@event is InputEventMouseMotion mm && _mouseCaptured)
         {
             _pendingMouseX += mm.Relative.X * MouseSensitivity;
@@ -318,10 +462,12 @@ public partial class ApexPlayer : Node3D
         else if (@event.IsActionPressed("apex_fov_up"))
         {
             _rig.AdjustBaseFov(_rig.Config.FovUserStep);
+            _debugMenu?.SyncFov(_rig.Config.FovBase);
         }
         else if (@event.IsActionPressed("apex_fov_down"))
         {
             _rig.AdjustBaseFov(-_rig.Config.FovUserStep);
+            _debugMenu?.SyncFov(_rig.Config.FovBase);
         }
         else if (@event.IsActionPressed("apex_holster"))
         {
@@ -344,6 +490,21 @@ public partial class ApexPlayer : Node3D
         bool jumpPressed = Input.IsActionJustPressed("apex_jump");
         bool jumpHeld = Input.IsActionPressed("apex_jump");
         if (jumpPressed) _jumpQueued = true;
+
+        // 1b) 调试菜单打开时**冻结移动输入**：
+        //     拖滑条时手不会离开鼠标，若不冻结，玩家会一边拖一边往前跑。
+        //     注意只冻结输入，物理照常跑（下落/惯性仍然正常），
+        //     这样"边调 FOV 边看跑动"也能工作。
+        if (_debugMenuOpen)
+        {
+            _moveX = 0f;
+            _moveZ = 0f;
+            _crouchHeld = false;
+            _sprintHeld = false;
+            _jumpQueued = false;
+            _pendingMouseX = 0f;
+            _pendingMouseY = 0f;
+        }
 
         // 2) 物理空间（每次查询前取一次；求解器的所有射线都在 tick 内部完成）
         PhysicsDirectSpaceState3D space = GetWorld3D().DirectSpaceState;
@@ -533,15 +694,27 @@ public partial class ApexPlayer : Node3D
             ? $"WALLHANG grip={_snapshot.WallHangGrip:F2} t={_snapshot.WallHangTime:F2}s"
             : "no";
 
+        // v0.4：步态摘要（频率来自步态模型，是"抖动频率"最直接的证据）
+        string gait = _snapshot.Gait.CadenceHz > 0.05f
+            ? $"{_snapshot.Gait.CadenceHz:F2}Hz stride={_snapshot.Gait.StrideLength:F2}m " +
+              $"fly={_snapshot.Gait.FlightFraction:F2} vAmp={_snapshot.Gait.VerticalAmplitude * 1000f:F1}mm"
+            : "idle";
+
+        // v0.4：台阶倾斜（<=0.25m 台阶「只改方向不改大小」的可读证据）
+        float tiltDeg = _core.StepTiltAngle * (180f / Mathf.Pi);
+        if (tiltDeg > 0.05f) gait += $" step={tiltDeg:F1}deg";
+
         _hud.Text =
+            $"ApexMovement v0.4  tick={_core.TickCount}\n" +
             $"state={_core.State}  speed={_core.HorizontalSpeed:F2} m/s  vy={_core.VerticalSpeed:F2}\n" +
             $"ground={_core.OnGround}  crouch={_core.CrouchAmount:F2}  h={_core.CurrentHeight:F2}  {holster}\n" +
             $"fov={_camOut.Fov:F1}°  roll={_camOut.Roll * 180f / Mathf.Pi:F1}°  bobPhase={_snapshot.BobPhase:F2}\n" +
+            $"gait={gait}\n" +
             $"mantle={_core.CurrentMantleClass}/{_core.CurrentMantlePhase}  xBlend={_camOut.TraversalBlend:F2}\n" +
             $"slip={slip}  hang={hang}\n" +
             $"slideBoost={boost}  slideHops={_core.SlideHopCount}  bhops={_core.BunnyHopCount}  mantles={_core.MantleCount}\n" +
-            $"jumpFatigue={fatigue}  fallstun={stun}  tick={_core.TickCount}\n" +
-            $"[WASD] move  [Space] jump/climb  [Ctrl] crouch  [Shift] sprint\n" +
-            $"[Shift+Ctrl] slide  [Shift+Ctrl+Space] slide-jump  [空中贴墙+Ctrl] 扒墙  [H] holster  [ [ / ] ] FOV  [R] reset";
+            $"jumpFatigue={fatigue}  fallstun={stun}\n" +
+            $"[WASD] move  [Space] jump/vault  [Ctrl] crouch  [Shift] sprint\n" +
+            $"[W贴墙+Space] 爬墙  [松W] 扒住  [S] 松手直落  [A/D] 横移  [H] 收枪  [ [ / ] ] FOV  [R] 复位  [\\] 调试菜单";
     }
 }

@@ -428,7 +428,7 @@ public static class FeatureTest
                   $"首跳 {afterFirst:F2} → bhop {afterBhop:F2} m/s，bhops={core.BunnyHopCount}");
         }
 
-        // ═════════ 22. 翻越 Below 档（0.8m 矮墙）═════════
+        // ═════════ 22. 小障碍档（≤1m）：W + Space 直接翻越，不触发攀爬 ═════════
         {
             var world = new AnalyticWorld(0f);
             world.AddBox(new F3(-5f, 0f, -3.5f), new F3(5f, 0.8f, -3.0f));
@@ -436,51 +436,55 @@ public static class FeatureTest
             core.Reset(new F3(0f, 1f, 0f));
             Settle(core, 10);
 
-            bool triggered = false;
-            MovementState asState = MovementState.Ground;
+            Run(core, 70, In(mz: 1f));      // 先走到障碍前（撞住，不会自动翻）
+            bool reachedWall = core.Position.Z < -2.4f;
+            bool neverClimbed = core.State is not (MovementState.Climb or MovementState.WallHang);
+
+            bool vaulted = false;
             MantleClass asClass = MantleClass.Below;
-            for (int i = 0; i < 120; i++)
+            for (int i = 0; i < 90; i++)
             {
-                core.Step(In(mz: 1f), core.Config.FixedDelta);
-                if (!triggered && core.State is MovementState.Vault or MovementState.Mantle or MovementState.Window)
-                {
-                    triggered = true; asState = core.State; asClass = core.CurrentMantleClass;
-                }
+                core.Step(In(mz: 1f, jump: i == 0), core.Config.FixedDelta);
+                if (core.State == MovementState.Vault) { vaulted = true; asClass = core.CurrentMantleClass; }
+                if (vaulted && core.State == MovementState.Ground && core.OnGround) break;
             }
-            Check("翻越 0.8m 矮墙（Below 档）",
-                  triggered && asState == MovementState.Vault && asClass == MantleClass.Below && core.Position.Z < -3.5f,
-                  $"state={asState}/{asClass}，最终 z={core.Position.Z:F2}（墙 z=-3.5..-3.0）");
+            Check("小障碍 0.8m：走近只撞停不自动翻 → W+Space 翻过去（Vault/Below）",
+                  reachedWall && neverClimbed && vaulted && asClass == MantleClass.Below
+                  && core.Position.Z < -3.5f,
+                  $"走到 z={core.Position.Z:F2} 翻越={vaulted}/{asClass}（障碍 z=-3.5..-3.0）");
         }
 
-        // ═════════ 23. 攀爬 Level 档（1.6m 台面）═════════
+        // ═════════ 23. 墙档（>1m）：W + Space 抓墙，按住 W 一路爬到台面上 ═════════
         {
             var world = new AnalyticWorld(0f);
-            world.AddBox(new F3(-5f, 0f, -3.5f), new F3(5f, 1.6f, -3.0f));
+            world.AddBox(new F3(-5f, 0f, -3.5f), new F3(5f, 2.5f, -3.0f));
             var core = MakeCore(world);
             core.Reset(new F3(0f, 1f, 0f));
             Settle(core, 10);
 
-            bool triggered = false;
-            MovementState asState = MovementState.Ground;
-            MantleClass asClass = MantleClass.Below;
-            float peakFeet = core.FeetPosition.Y;
-            for (int i = 0; i < 120; i++)
+            Run(core, 70, In(mz: 1f));      // 走到墙前：撞停，不自动攀爬
+            bool bumpedOnly = core.State == MovementState.Ground;
+
+            bool grabbed = false;
+            for (int i = 0; i < 60 && !grabbed; i++)
+            {
+                core.Step(In(mz: 1f, jump: i == 0), core.Config.FixedDelta);
+                if (core.State is MovementState.Climb or MovementState.WallHang) grabbed = true;
+            }
+            // 一直按 W：上爬 → 到顶补爬 → Hang → 翻上台面。
+            // 台面只有 0.5m 深，站上去之后必须松 W，否则会直接走下另一侧。
+            float topFeet = 0f;
+            for (int i = 0; i < 240; i++)
             {
                 core.Step(In(mz: 1f), core.Config.FixedDelta);
-                if (!triggered && core.State is MovementState.Vault or MovementState.Mantle or MovementState.Window)
-                {
-                    triggered = true; asState = core.State; asClass = core.CurrentMantleClass;
-                }
-                if (triggered) peakFeet = MathF.Max(peakFeet, core.FeetPosition.Y);
-                if (triggered && core.State == MovementState.Ground && core.OnGround) break;
+                if (core.OnGround && core.FeetPosition.Y > 2.0f) { topFeet = core.FeetPosition.Y; break; }
             }
-            Check("攀爬 1.6m 台面（Level 档）",
-                  triggered && asState == MovementState.Mantle && asClass == MantleClass.Level &&
-                  MathF.Abs(peakFeet - 1.6f) < 0.15f,
-                  $"state={asState}/{asClass}，脚底 {peakFeet:F2}（台面 1.6m）");
+            Check("墙 2.5m：地面按 W 只撞停 → W+Space 抓墙 → 按住 W 爬到台面上",
+                  bumpedOnly && grabbed && topFeet > 0f && MathF.Abs(topFeet - 2.5f) < 0.15f,
+                  $"撞停={bumpedOnly} 抓到={grabbed} 站上台面时脚底={topFeet:F2}（台面 2.5m）");
         }
 
-        // ═════════ 24. 攀爬 6m（High 档，Apex 可爬 273hu≈6.93m）═════════
+        // ═════════ 24. 高墙（6m）：能抓住并持续上爬，但不会瞬移到顶 ═════════
         {
             var world = new AnalyticWorld(0f);
             world.AddBox(new F3(-5f, 0f, -3.5f), new F3(5f, 6.0f, -3.0f));
@@ -488,25 +492,23 @@ public static class FeatureTest
             core.Reset(new F3(0f, 1f, 0f));
             Settle(core, 10);
 
-            bool triggered = false;
-            MantleClass asClass = MantleClass.Below;
-            float peakFeet = core.FeetPosition.Y;
-            for (int i = 0; i < 240; i++)
+            Run(core, 70, In(mz: 1f));
+            bool grabbed = false;
+            for (int i = 0; i < 60 && !grabbed; i++)
             {
-                core.Step(In(mz: 1f), core.Config.FixedDelta);
-                if (!triggered && core.State is MovementState.Vault or MovementState.Mantle or MovementState.Window)
-                {
-                    triggered = true; asClass = core.CurrentMantleClass;
-                }
-                if (triggered) peakFeet = MathF.Max(peakFeet, core.FeetPosition.Y);
-                if (triggered && core.State == MovementState.Ground && core.OnGround) break;
+                core.Step(In(mz: 1f, jump: i == 0), core.Config.FixedDelta);
+                if (core.State is MovementState.Climb or MovementState.WallHang) grabbed = true;
             }
-            Check("攀爬 6m 高墙（High 档）",
-                  triggered && asClass == MantleClass.High && MathF.Abs(peakFeet - 6.0f) < 0.20f,
-                  $"档位={asClass}，脚底 {peakFeet:F2}（台面 6.0m）");
+            float y0 = core.FeetPosition.Y;
+            Run(core, 60, In(mz: 1f));      // 1s 持续上爬
+            float climbed = core.FeetPosition.Y - y0;
+            // v0.4：攀爬/扒墙合并成一套贴墙状态机，上爬统一用 ClimbSpeed（2.0 m/s）
+            Check("高墙 6m：抓住后按住 W 每秒爬 ≈2m（ClimbSpeed 2.0，是状态不是瞬移）",
+                  grabbed && climbed > 1.7f && climbed < 2.3f,
+                  $"抓到={grabbed} Δy={climbed:F2} m/s，state={core.State}");
         }
 
-        // ═════════ 25. 超过攀爬上限（7.5m）应拒绝 ═════════
+        // ═════════ 25. 超过攀爬上限（7.5m > MantleMaxHeight 6.93m）：爬不到顶 ═════════
         {
             var world = new AnalyticWorld(0f);
             world.AddBox(new F3(-5f, 0f, -3.5f), new F3(5f, 7.5f, -3.0f));
@@ -514,17 +516,19 @@ public static class FeatureTest
             core.Reset(new F3(0f, 1f, 0f));
             Settle(core, 10);
 
-            bool triggered = false;
-            for (int i = 0; i < 150; i++)
+            Run(core, 70, In(mz: 1f));
+            bool topped = false;
+            for (int i = 0; i < 900; i++)
             {
-                core.Step(In(mz: 1f), core.Config.FixedDelta);
-                if (core.State is MovementState.Vault or MovementState.Mantle or MovementState.Window) { triggered = true; break; }
+                core.Step(In(mz: 1f, jump: i == 0), core.Config.FixedDelta);
+                if (core.OnGround && core.FeetPosition.Y > 7.0f) { topped = true; break; }
             }
-            Check("超限拒绝（7.5m > 273hu 上限）", !triggered,
-                  $"触发={triggered}（上限 {cfg0.MantleMaxHeight:F2}m）");
+            Check("超限拒绝（7.5m > 6.93m 上限）：爬不上去，会脱手掉下来",
+                  !topped,
+                  $"登顶={topped}，脚底={core.FeetPosition.Y:F2}（上限 {cfg0.MantleMaxHeight:F2}m）");
         }
 
-        // ═════════ 26. 窗口翻越（TRAVERSAL_WINDOW）═════════
+        // ═════════ 26. 窗口翻越（W + Space 穿开口）═════════
         {
             var world = new AnalyticWorld(0f);
             // 窗台：y 0..1.0，z 从 -4.5 到 -3.0（够厚，穿过后能落在窗台上）
@@ -536,21 +540,18 @@ public static class FeatureTest
             core.Reset(new F3(0f, 1f, 0f));
             Settle(core, 10);
 
+            Run(core, 70, In(mz: 1f));
             bool triggered = false;
-            MovementState asState = MovementState.Ground;
             float endZ = 0f;
             for (int i = 0; i < 120; i++)
             {
-                core.Step(In(mz: 1f), core.Config.FixedDelta);
-                if (!triggered && core.State == MovementState.Window)
-                {
-                    triggered = true; asState = core.State;
-                }
-                if (triggered && core.State == MovementState.Window) endZ = core.Position.Z;
+                core.Step(In(mz: 1f, jump: i == 0), core.Config.FixedDelta);
+                if (core.State == MovementState.Window) { triggered = true; endZ = core.Position.Z; }
                 if (triggered && core.State != MovementState.Window) break;
             }
-            Check("窗口翻越（穿过开口）", triggered && asState == MovementState.Window && endZ < -3.0f,
-                  $"state={asState}，穿过后 z={endZ:F2}（墙 z=-3.5..-3.0）");
+            Check("窗口翻越（W+Space 穿过开口）",
+                  triggered && endZ < -3.0f,
+                  $"触发={triggered}，穿过后 z={endZ:F2}（墙 z=-3.5..-3.0）");
         }
 
         // ═════════ 27. Fallstun（300hu→800hu 二次曲线）═════════

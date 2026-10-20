@@ -230,22 +230,19 @@ public sealed class ApexCameraRig
 
     private void UpdateRoll(in MovementSnapshot s, float dt)
     {
-        // 滑铲侧倾：角度与**玩家速度**相关（`slide_viewTiltPlayerSpeed`），
-        // 且增大/减小用两个不同速率（`slide_viewTiltIncreaseSpeed` / `DecreaseSpeed`）。
-        float slideTargetDeg = 0f;
-        if (s.Sliding)
-        {
-            float k = Math.Clamp(s.HorizontalSpeed / _cfg.SlideRollPlayerSpeedRef, 0f, 1f);
-            slideTargetDeg = _cfg.SlideMaxRollDeg * k * _cfg.SlideRollSide;
-        }
+        // ── 滑铲侧倾：v0.4 已整体移除 ──────────────────────────────
+        //
+        // 需求原话：「滑铲时镜头我希望不要倾斜，而是与下蹲状态一致。」
+        // 所以滑铲时**没有**任何额外的侧倾 —— 画面只有视点降低（那由
+        // CurrentHeight 决定，和蹲下走的是同一条路径），倾斜角恒为 0。
+        //
+        // 保留字段 `SlideMaxRollDeg` / `SlideRollIncreaseSpeed` / `SlideRollDecreaseSpeed`
+        // / `SlideRollPlayerSpeedRef` / `SlideRollSide` 是为了配置文件兼容，
+        // 但这里不再读取它们 —— 改配置也不会让滑铲歪头。
+        _slideRoll = 0f;
 
-        float slideTarget = slideTargetDeg * MathF.PI / 180f;
-        float slideRateDeg = MathF.Abs(slideTarget) > MathF.Abs(_slideRoll)
-            ? _cfg.SlideRollIncreaseSpeed
-            : _cfg.SlideRollDecreaseSpeed;
-        _slideRoll = MoveTowards(_slideRoll, slideTarget, slideRateDeg * MathF.PI / 180f * dt);
-
-        // 冲刺侧倾（`sprinttiltMaxRoll`）
+        // 冲刺侧倾（`sprinttiltMaxRoll`）：这是一个**缓慢的倾斜**，不是抖动，
+        // 与需求里的"视角抖动"不是一回事，所以保留；但幅度已经很小（1.5° 上限）。
         float sprintTarget = _cfg.SprintMaxRollDeg * _sprintBlend * MathF.PI / 180f;
         _sprintRoll = MoveTowards(_sprintRoll, sprintTarget, _cfg.SprintRollSpeed * MathF.PI / 180f * dt);
     }
@@ -254,9 +251,12 @@ public sealed class ApexCameraRig
 
     private void UpdateFov(float dt)
     {
+        // ── 滑铲 FOV 加宽：v0.4 已整体移除 ──────────────────────────
+        //
+        // 需求：「滑铲时镜头……与下蹲状态一致」。下蹲不改 FOV，滑铲也不改。
+        // （字段 `FovSlideAdd` 保留仅为配置兼容，这里不读取。）
         float target = _cfg.FovBase
                      + _cfg.FovSprintAdd * _sprintBlend
-                     + _cfg.FovSlideAdd * _slideBlend
                      + _cfg.FovTraversalAdd * _traversalBlend;
 
         target = Math.Clamp(target, _cfg.FovMin, _cfg.FovMax);
@@ -297,26 +297,52 @@ public sealed class ApexCameraRig
         // 蹲下前倾
         offset += fwd * (_cfg.CrouchEyeForwardOffset * s.CrouchAmount);
 
-        // 滑铲下沉（贴地感）
-        offset -= up * (_cfg.SlideEyeDrop * _slideBlend);
+        // ── 走路摇晃（bob）—— v0.4 改为**步态推导** ────────────────
+        //
+        // 需求原话：「通过步行和奔跑的速度，以及角色身高对应的步幅步频来获得
+        // 对应的镜头抖动频率和幅度，奔跑状态的步幅和步频需要考虑现实人物奔跑的
+        // 略微腾空。」
+        //
+        // 分工：
+        //   · **频率**（相位推进）在求解器的 UpdateBobPhase 里，按步态模型的
+        //     CadenceHz 累加相位 —— 帧率无关，且跑/走自动切换节奏。
+        //   · **幅度**（这里）直接读快照里的 GaitSample：
+        //       VerticalAmplitude / LateralAmplitude  半幅（米）
+        //       PitchDeg / RollDeg                    半幅（度）
+        //     这些值由身高 → 腿长 → Froude 速度 → 步频 → 步幅 → 腾空比
+        //     → 质心起伏逐级推出，不是手调常数。
+        //
+        // 为什么不再有 `bobAmp = speed/5` 那套斜坡：
+        // 它让"走"和"跑"用同一个波形、只改幅度，于是频率永远对不上步频，
+        // 玩家看到的就是"腿在走、画面在飘"的违和感 —— 这正是需求方说
+        // 「抖动还是太剧烈」的根因之一。
+        bool gaitStateOk = s.State is not (MovementState.Mantle or MovementState.Vault
+                                        or MovementState.Window or MovementState.Hang
+                                        or MovementState.Climb or MovementState.WallHang);
+        // 腾空时是否保留 bob：只在**奔跑的腾空相**保留（FlightFraction > 0）。
+        // 普通跳跃/走下坡不掉 bob 会显得画面在自娱自乐，所以非奔跑的空中一律关掉。
+        bool gaitAirOk = s.OnGround || s.Gait.FlightFraction > 0.05f;
+        bool gaitActive = gaitStateOk && gaitAirOk && !s.Sliding;
 
-        // ── 走路摇晃（bob） ───────────────────────────────────────
-        // 相位来自求解器的固定 tick（帧率无关）；这里只负责把它变成位移与角度。
-        float bobAmp = 0f;
-        if (s.OnGround && !s.Sliding && s.HorizontalSpeed > _cfg.BobMinSpeed)
+        float bobVert = 0f, bobLat = 0f, bobPitch = 0f, bobRoll = 0f;
+        if (gaitActive)
         {
-            bobAmp = Math.Clamp(s.HorizontalSpeed / 5f, 0f, 1.4f);
-            if (s.Sprinting) bobAmp *= _cfg.BobSprintMultiplier;
+            GaitSample g = s.Gait;
+            float k = _cfg.BobGaitScale;      // 调试菜单里的实时倍率（1 = 物理值）
+            float sinP = MathF.Sin(s.BobPhase);
+            float cosP = MathF.Cos(s.BobPhase);
+            // 横向摆动与同侧腿同频：一个完整步态周期（= 两步）左右各摆一次，
+            // 所以用相位的一半。
+            float cosHalfP = MathF.Cos(s.BobPhase * 0.5f);
+
+            bobVert = sinP * g.VerticalAmplitude * k;
+            bobLat = cosHalfP * g.LateralAmplitude * k;
+            bobPitch = cosP * g.PitchDeg * k * MathF.PI / 180f;
+            bobRoll = cosHalfP * g.RollDeg * k * MathF.PI / 180f;
+
+            offset += up * bobVert;
+            offset += right * bobLat;
         }
-
-        float sinP = MathF.Sin(s.BobPhase);
-        float cosHalfP = MathF.Cos(s.BobPhase * 0.5f);
-
-        offset += up * (sinP * _cfg.BobAmplitude * bobAmp);
-        offset += right * (cosHalfP * _cfg.BobLateralAmplitude * bobAmp);
-
-        float bobPitch = MathF.Cos(s.BobPhase) * _cfg.BobPitchDeg * bobAmp * MathF.PI / 180f;
-        float bobRoll = MathF.Cos(s.BobPhase * 0.5f) * _cfg.BobRollDeg * bobAmp * MathF.PI / 180f;
 
         // ── 翻越相机：位置滞后 + 高度上限 ──────────────────────────
         if (_traversalBlend > 1e-3f)
