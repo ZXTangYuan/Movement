@@ -1,4 +1,0 @@
-[gd_scene format=3 uid="uid://selftestgpu1"]
-[ext_resource type="Script" path="res://tests/headless_selftest_gpu.gd" id="1"]
-[node name="GpuSelfTest" type="Node"]
-script = ExtResource("1")

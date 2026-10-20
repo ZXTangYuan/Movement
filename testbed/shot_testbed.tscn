@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://addons/apex_movement/testbed/shot_testbed.gd" id="1_shot"]
+
+[node name="ShotTestbed" type="Node"]
+script = ExtResource("1_shot")

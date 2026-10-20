@@ -1,4 +1,0 @@
-[gd_scene format=3 uid="uid://reprocam001"]
-[ext_resource type="Script" path="res://tests/repro_camera.gd" id="1"]
-[node name="ReproCam" type="Node"]
-script = ExtResource("1")

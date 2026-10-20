@@ -1,0 +1,190 @@
+using System;
+
+namespace ApexMovement.Camera;
+
+/// <summary>FOV 插值所在的数值空间。</summary>
+public enum FovInterpSpace
+{
+    /// <summary>角度空间线性插值（直观）。</summary>
+    Linear = 0,
+    /// <summary>
+    /// **tan(半角) 空间插值**。Apex 二进制里 FOV 以 `.fTanHalfFOV` 字段存储
+    /// （见 docs/reverse-engineering-v0.2.md §3.1），说明投影运算在 tan 空间进行。
+    /// 在这种模式下，FOV 变化的"视觉速度"才是均匀的。
+    /// </summary>
+    Tangent = 1,
+}
+
+/// <summary>
+/// 相机效果的全部可调参数（单一事实来源）。
+///
+/// ## 证据等级
+/// 本文件**没有 A 级数值证据** —— 逆向只证明了这些系统的**存在与字段名**，
+/// 数值全部读不到（在 BSS 里）。因此这里每个字段都标 **C**（设计选择 / 手感校准），
+/// 但字段命名与分组**严格对应逆向观测到的字段**，方便将来拿到真值后逐个替换。
+///
+/// 对应的逆向字段见 docs/reverse-engineering-v0.2.md §3–§4：
+///   · `cl_fovScale` / `setting.cl_fovScale` / `.fTanHalfFOV` / `USE_FOV_SCALING`
+///   · `viewkick_spring` / `_cooldown_holdtime` / `_cooldown_fadetime` / `_velocityScalePerShot`
+///   · `viewkickFallDistMin` / `viewkickFallDistMax` / `viewkickFallDistMaxScale`
+///   · `slide_viewTiltSide` / `_IncreaseSpeed` / `_DecreaseSpeed` / `_PlayerSpeed`
+///   · `sprinttiltMaxRoll`
+///   · `traversal_viewLerpOutPos` / `traversal_viewLerpOutAngle` / `traversal_viewLerpInDuration`
+///   · `traversal_mantle_cap_camera_height`
+///   · `sprintViewOffset` / `viewheight`
+/// </summary>
+public sealed class CameraEffectsConfig
+{
+    // ═══════════════════════════ FOV ═══════════════════════════
+
+    /// <summary>[C] 基础水平 FOV (deg)。Apex 游戏内 FOV 设置范围是 70–110。</summary>
+    public float FovBase = 90f;
+
+    /// <summary>[C] FOV 允许范围（会被夹住）。</summary>
+    public float FovMin = 60f;
+    public float FovMax = 120f;
+
+    /// <summary>[C] 冲刺时叠加的 FOV (deg)。</summary>
+    public float FovSprintAdd = 3f;
+
+    /// <summary>[C] 滑铲时叠加的 FOV (deg)。</summary>
+    public float FovSlideAdd = 6f;
+
+    /// <summary>[C] 攀爬/翻越时的 FOV 收缩 (deg，负值 = 变窄)。</summary>
+    public float FovTraversalAdd = -4f;
+
+    /// <summary>[C] FOV 平滑速度（1/s，越大越快跟上目标）。</summary>
+    public float FovSmoothing = 8f;
+
+    /// <summary>[C] FOV 插值空间（默认 tan 空间，对应 `.fTanHalfFOV`）。</summary>
+    public FovInterpSpace FovSpace = FovInterpSpace.Tangent;
+
+    /// <summary>[C] 玩家可用按键调节的 FOV 步长 (deg/次)。</summary>
+    public float FovUserStep = 2f;
+
+    // ═══════════════════════════ 视角踢（弹簧） ═══════════════════════════
+
+    /// <summary>
+    /// [C] 弹簧刚度 k（`viewkick_spring`）。运动方程 <c>a = −k·x − c·v</c>。
+    /// ω = sqrt(k) = 13.4 rad/s ≈ 2.1 Hz，接近"落地一顿"的观感。
+    /// </summary>
+    public float SpringStiffness = 180f;
+
+    /// <summary>[C] 弹簧阻尼 c（`viewkick_spring_cooldown_fadetime` 的对应物）。</summary>
+    public float SpringDamping = 18f;
+
+    /// <summary>[C] 各落地档位的俯仰冲量 (rad/s)。索引 = <c>LandingTier</c>。</summary>
+    public float[] LandingPitchImpulse = { 0f, 0.9f, 2.2f, 4.0f, 6.5f };
+
+    /// <summary>[C] 各落地档位的偏航随机量 (rad/s)。落地不应有确定方向，这里用确定性的符号交替。</summary>
+    public float[] LandingYawImpulse = { 0f, 0.15f, 0.35f, 0.6f, 0.9f };
+
+    /// <summary>[C] 各落地档位的滚转冲量 (rad/s)。</summary>
+    public float[] LandingRollImpulse = { 0f, 0.10f, 0.25f, 0.45f, 0.7f };
+
+    /// <summary>[C] 跳跃时给一点向上的视角踢（起跳"抬镜头"）。</summary>
+    public float JumpPitchImpulse = 0.5f;
+
+    /// <summary>[C] 视角踢的总幅度上限 (rad)，防止极端情况把镜头甩飞。</summary>
+    public float MaxKickAngle = 0.18f;
+
+    // ═══════════════════════════ 侧倾（roll） ═══════════════════════════
+
+    /// <summary>[C] 滑铲最大侧倾角 (deg)（`slide_viewTiltSide` 的幅度）。</summary>
+    public float SlideMaxRollDeg = 5.0f;
+
+    /// <summary>[C] 滑铲侧倾增大速率 (deg/s)（`slide_viewTiltIncreaseSpeed`）。</summary>
+    public float SlideRollIncreaseSpeed = 60f;
+
+    /// <summary>[C] 滑铲侧倾减小速率 (deg/s)（`slide_viewTiltDecreaseSpeed`）。</summary>
+    public float SlideRollDecreaseSpeed = 35f;
+
+    /// <summary>[C] 侧倾角达到最大时的参考速度 (m/s)（`slide_viewTiltPlayerSpeed`）。</summary>
+    public float SlideRollPlayerSpeedRef = 8.0f;
+
+    /// <summary>[C] 侧倾方向（+1 右倾 / −1 左倾）。</summary>
+    public float SlideRollSide = 1f;
+
+    /// <summary>[C] 冲刺最大侧倾角 (deg)（`sprinttiltMaxRoll`）。</summary>
+    public float SprintMaxRollDeg = 1.5f;
+
+    /// <summary>[C] 冲刺侧倾的跟随速度 (deg/s)。</summary>
+    public float SprintRollSpeed = 12f;
+
+    // ═══════════════════════════ 攀爬相机插值 ═══════════════════════════
+
+    /// <summary>
+    /// [C] 翻越时相机"脱开"（lerp out）的时长 (s)（`traversal_viewLerpOutPos` / `OutAngle`）。
+    /// 0 = 相机完全跟随（生硬但无延迟）。
+    /// </summary>
+    public float TraversalLerpOutDuration = 0.12f;
+
+    /// <summary>[C] 翻越结束后相机"回贴"（lerp in）的时长 (s)（`traversal_viewLerpInDuration`）。</summary>
+    public float TraversalLerpInDuration = 0.20f;
+
+    /// <summary>
+    /// [C] 翻越期间相机允许的最大离地高度 (m)（`traversal_mantle_cap_camera_height`）。
+    /// 翻越高墙时相机不会跟着飞到很高，避免眩晕。
+    /// </summary>
+    public float TraversalCapCameraHeight = 2.20f;
+
+    /// <summary>[C] 翻越期间相机位置滞后的比例（0 = 不滞后，1 = 完全不动）。</summary>
+    public float TraversalPositionLag = 0.45f;
+
+    /// <summary>[C] 翻越期间相机俯仰滞后的比例。</summary>
+    public float TraversalAngleLag = 0.35f;
+
+    // ═══════════════════════════ 走路摇晃（bob） ═══════════════════════════
+
+    /// <summary>
+    /// [C] 走路摇晃的垂直幅度 (m)。
+    ///
+    /// ⚠️ **Apex 没有 `cl_bob` 类 cvar**（逆向负结论），走路摇晃来自第一人称动画，
+    /// 因此这里**没有任何证据可依**，纯手感参数。
+    /// </summary>
+    public float BobAmplitude = 0.035f;
+
+    /// <summary>[C] 走路摇晃的横向幅度 (m)。</summary>
+    public float BobLateralAmplitude = 0.022f;
+
+    /// <summary>[C] 冲刺时摇晃幅度倍率。</summary>
+    public float BobSprintMultiplier = 1.6f;
+
+    /// <summary>[C] 摇晃的俯仰幅度 (deg)。</summary>
+    public float BobPitchDeg = 0.35f;
+
+    /// <summary>[C] 摇晃的滚转幅度 (deg)。</summary>
+    public float BobRollDeg = 0.30f;
+
+    /// <summary>[C] 摇晃开始生效的最低速度 (m/s)。</summary>
+    public float BobMinSpeed = 0.6f;
+
+    // ═══════════════════════════ 眼位偏移 ═══════════════════════════
+
+    /// <summary>[C] 冲刺时的相机前移量 (m)（对应 `sprintViewOffset`）。</summary>
+    public float SprintEyeForwardOffset = 0.06f;
+
+    /// <summary>[C] 蹲下时的相机前移量 (m)（蹲下身体前倾）。</summary>
+    public float CrouchEyeForwardOffset = 0.03f;
+
+    /// <summary>[C] 滑铲时的相机下沉量 (m)（贴地感）。</summary>
+    public float SlideEyeDrop = 0.10f;
+
+    public void Validate()
+    {
+        if (FovMin <= 0f || FovMax <= FovMin)
+            throw new ArgumentException("FovMin / FovMax 配置非法");
+        if (FovBase < FovMin || FovBase > FovMax)
+            throw new ArgumentOutOfRangeException(nameof(FovBase), "FovBase 必须在 [FovMin, FovMax] 内");
+        if (SpringStiffness <= 0f) throw new ArgumentOutOfRangeException(nameof(SpringStiffness));
+        if (SpringDamping < 0f) throw new ArgumentOutOfRangeException(nameof(SpringDamping));
+        if (LandingPitchImpulse.Length < 5 || LandingYawImpulse.Length < 5 || LandingRollImpulse.Length < 5)
+            throw new ArgumentException("落地冲量数组必须至少 5 项（对应 LandingTier 0..4）");
+        if (SlideRollPlayerSpeedRef <= 0f)
+            throw new ArgumentOutOfRangeException(nameof(SlideRollPlayerSpeedRef));
+        if (TraversalCapCameraHeight <= 0f)
+            throw new ArgumentOutOfRangeException(nameof(TraversalCapCameraHeight));
+    }
+
+    public CameraEffectsConfig Clone() => (CameraEffectsConfig)MemberwiseClone();
+}
