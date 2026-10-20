@@ -80,7 +80,7 @@ GODOT="D:/Godot/Godot_4.7_stable_mono/Godot_v4.7-stable_mono_win64_console.exe"
 # 有窗口，可玩
 "$GODOT" --path . --rendering-driver vulkan res://addons/apex_movement/testbed/apex_testbed.tscn
 
-# 自检 A：跨帧率确定性 + 33 项功能断言 + 20 项相机断言（纯数学，无引擎）
+# 自检 A：跨帧率确定性 + 36 项功能断言 + 20 项相机断言（纯数学，无引擎）
 "$GODOT" --headless --path . res://addons/apex_movement/tests/determinism_test.tscn
 # 期望：=== APEX MOVEMENT SELFTEST PASS ===
 
@@ -133,7 +133,7 @@ testbed/
 tests/
   AnalyticWorld.cs            纯数学碰撞世界（测试替身，契约与 Godot 桥接层一致）
   DeterminismTest.cs          跨帧率确定性
-  FeatureTest.cs              33 项功能断言（纯数学）
+  FeatureTest.cs              36 项功能断言（纯数学）
   CameraTest.cs               20 项相机断言（纯数学）
   determinism_test.tscn       自检 A 入口
   integration_test.gd/.tscn   39 项真实物理集成断言（自检 B）
@@ -220,6 +220,30 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
 落点前推距离（0.90 m）小于墙厚 + 半径，胶囊头部卡进窗楣。
 **修法**：`WindowForwardOffset` 提到 1.20 m，并在落点做收缩 2 cm 的重叠检查。
 
+### ⑥ 收枪散步被误判成"冲刺" —— 用速度反推意图
+
+`Sprinting` 原本写成 `HorizontalSpeed > WalkSpeed * 1.05`（4.627 m/s）。
+但**收枪行走** = 173.5 × 1.15 = 199 hu/s = **5.055 m/s**，天然超过这条线 ⇒
+收枪散步时相机 FOV 多 3°、冲刺侧倾多 1.5° 全部误触发。
+这个 bug 只在截图复核时才暴露（自检断言没覆盖"收枪行走"这个组合）。
+
+**修法**：`Sprinting = 冲刺意图(input.SprintHeld) ∧ 地面 ∧ 真的跑起来了`。
+保留速度条件是为了覆盖"冲刺途中被 Fallstun 压下来"的情况。
+新增 2 项断言锁死：收枪行走 5.068 m/s 且 `Sprinting == false`。
+
+### ⑦ 侧倾几乎不动 —— 把"度/秒"当成指数时间常数
+
+二进制里 `slide_viewTiltIncreaseSpeed` / `_DecreaseSpeed` / `sprinttilt*` 是
+**度/秒的线性斜率**（正因为是线性斜率，才会分成"增大速率"和"减小速率"两个字段）。
+但代码用 `Approach()`（指数逼近）消费它，于是 60°/s 被当成时间常数
+1/1.047 ≈ 0.95 s —— 侧倾要 1 秒才到位。实测滑铲 0.2 s 时只到 **1.5°**（目标 5°）。
+
+**修法**：新增 `MoveTowards()`（每帧最多走 `速率 × dt` 的线性趋近），侧倾改用它。
+修后同样时机实测 **5.5°**，10 m/s 滑铲满值 5.00°，冲刺侧倾 2.17°。
+
+> 教训：**"速率"这个词有歧义**。指数逼近的速率是「1/秒」，线性趋近的速率是「单位/秒」。
+> 二进制字段名带 `Speed` 且成对出现（Increase/Decrease）时，几乎一定是线性斜率。
+
 ### 附带修掉的三个问题
 
 | 问题 | 现象 | 修法 |
@@ -228,11 +252,14 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
 | 窗口扫描的探针上限只到头顶上方 0.4m | 窗楣在 2.5m 时扫不到，被误判成"没有窗楣" | 提到头顶上方 0.9m |
 | `Sprint`/`Walk` 共用一个速度字段 | 无法表达"持枪 260 / 收枪 299" | 拆成 `SprintSpeed` + `HolsterMultiplier` |
 
+> ⑥⑦ 都是**截图视觉复核**才发现的：自检断言只看数值、不看画面，
+> 而这两个 bug 恰好是"数值在容差内、观感却错了"。这就是本轮坚持逐张 `read_image` 的原因。
+
 ---
 
 ## 8. 自检结果（实测）
 
-### A. 确定性 + 功能 + 相机（`determinism_test.tscn`，53 项断言）
+### A. 确定性 + 功能 + 相机（`determinism_test.tscn`，56 项断言）
 
 ```
 === 跨帧率确定性 ===
@@ -243,8 +270,8 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
   60fps vs 240fps: 一致（240 ticks，逐位相等）
   60fps vs 500fps: 一致（240 ticks，逐位相等）
 
-=== 功能验证（33 项，全 PASS）===
-  行走 4.407 / 冲刺 6.604 / 收枪冲刺 7.595 / 蹲行 2.032
+=== 功能验证（36 项，全 PASS）===
+  行走 4.407 / 冲刺 6.604 / 收枪冲刺 7.595 / 收枪行走 5.068（且不误判冲刺）/ 蹲行 2.032
   跳跃高度 1.487（期望 1.422 ± 0.10）、滞空 0.717s（wiki 0.74 ± 0.06）
   空中无摩擦（40 tick 速度差 0.00E+000）、Air strafe 加速 +0.83 m/s
   Slideboost 11.51 m/s（含收枪 ×1.15 上限 11.68）、2s 冷却、Deadslide、连续滑铲跳 3 次
@@ -256,7 +283,7 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
   FOV 90 基准 / 冲刺 93 / 滑铲 96 / 夹紧 120 / 玩家可调 ±2°
   tan 空间插值 vs 线性：中途差 1.599°，终值差 0.0001°
   落地踢：瞬间低头 −0.0888 rad，1.5s 后回正；按档位单调（0.029 < 0.072 < 0.131 < 0.180）
-  滑铲侧倾随速度增大（5m/s→2.04°，10m/s→3.26°）、冲刺侧倾 1.15°
+  滑铲侧倾随速度增大（5m/s→3.12°，10m/s→5.00° 满值）、冲刺侧倾 2.17°
   走路摇晃：静止 0 / 移动 0.0378m / 空中 0
   翻越相机脱开→回贴（0.997 → 0.000）、高度上限压低 0.65m
   FOV 收敛与帧率无关（60/144/240fps 差 < 0.0005°）
@@ -271,7 +298,7 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
   [PASS] 行走 4.407 / 平均位移 4.284 / 奔跑 6.604 / 收枪奔跑 7.595
   [PASS] 蹲下 0.975 / 脚底不下沉 / 相机高度 0.875 / 站起恢复
   [PASS] 跳跃高度 1.488 / 跳后重新落地
-  [PASS] 滑铲触发 9.28 m/s / Slideboost / 相机侧倾 1.21° / 抬 FOV 94.20°
+  [PASS] 滑铲触发 9.28 m/s / Slideboost / 相机侧倾 5.73° / 抬 FOV 94.20°
   [PASS] 连续滑铲跳 3 次
   [PASS] 翻越分档 Below(0.9m) / Level(1.7m) / Above(3.0m) / High(6.0m)
   [PASS] 6m 攀爬 6.000 / 爬上 15° 斜坡 / 翻越 0.8m 矮墙
@@ -319,7 +346,31 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
 
 ---
 
-## 11. 文档
+## 11. 截图（逐张视觉复核过）
+
+14 张 1920×1080，全部位于 [`../../docs/reference/apex_movement/`](../../docs/reference/apex_movement/)。
+每张第一人称图的 HUD 会打印当时的 `fov / roll / state / xBlend`，可对着数字核验。
+
+| 文件 | 内容 | 图上可核验的数字 |
+|---|---|---|
+| `shot_overview.png` | 场地全景 | 状态 `Ground`、`h=1.95` |
+| `shot_ramps.png` | 三条斜坡（15°/30°/45°） | — |
+| `shot_mantle_steps.png` | 攀爬台阶梯 8 档，颜色分 4 档 | — |
+| `shot_vault_walls.png` | 翻越低墙 0.4/0.8/1.0m | — |
+| `shot_window_frames.png` | 窗口框架（窗台 + 窗楣） | — |
+| `shot_climb_wall.png` | 贴墙爬墙（8m，带刻度线） | — |
+| `shot_slide_lane.png` | 滑铲长道（80m，10m 刻度） | — |
+| `shot_drop_plats.png` | 落差平台 3/6/10/22m | — |
+| `shot_player_fp.png` | 站立第一人称基准 | `fov=90.0°`、`roll=0.0°`、`bobPhase=0.00` |
+| `shot_player_fov110.png` | FOV 拉宽 | `fov=109.9°` |
+| `shot_player_fov70.png` | FOV 收窄 | `fov=70.5°` |
+| `shot_player_walking.png` | 走路摇晃 + 无侧倾 | `speed=5.07`、`roll=0.5°`、`bobPhase=5.26` |
+| `shot_player_slide.png` | 滑铲：侧倾 + 抬 FOV + 蹲高 | `state=Slide`、`speed=9.89`、`h=0.98`、`fov=94.9°`、`roll=5.5°` |
+| `shot_player_mantle.png` | 翻越途中：相机滞后 + 高度上限 | `state=Mantle`、`mantle=High/Grab`、`xBlend=0.97`、`fov=87.2°` |
+
+---
+
+## 12. 文档
 
 - [`docs/wiki-reference.md`](docs/wiki-reference.md) —— **社区 wiki 数值换算表**（1hu=2.54cm、速度表、机制说明，每条带来源 URL）
 - [`docs/reverse-engineering-v0.2.md`](docs/reverse-engineering-v0.2.md) —— **本轮逆向报告**（相机/FOV/晃动/翻越/滑铲/攀爬字段的 A 级证据 + 复现命令）

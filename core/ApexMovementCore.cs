@@ -89,6 +89,7 @@ public sealed class ApexMovementCore
     private float _jumpBufferTimer;
     private float _coyoteTimer;
     private bool _onGround;
+    private bool _sprintIntent;                 // 本 tick 的冲刺**意图**（不是速度）
     private F3 _groundNormal = F3.Up;
 
     // ── 跳跃疲劳 / bhop ──
@@ -183,7 +184,9 @@ public sealed class ApexMovementCore
         HorizontalSpeed = HorizontalSpeed,
         VerticalSpeed = VerticalSpeed,
         OnGround = _onGround,
-        Sprinting = _state == MovementState.Ground && _crouchAmount < 0.5f &&
+        // 「是否冲刺」= 冲刺意图 ∧ 真的跑起来了。用速度兜底是为了覆盖
+        // 冲刺途中被 Fallstun/斜坡减速压下来的情况（此时不该继续摆冲刺姿态）。
+        Sprinting = _sprintIntent && _state == MovementState.Ground && _crouchAmount < 0.5f &&
                     HorizontalSpeed > _cfg.WalkSpeed * 1.05f,
         Sliding = _state == MovementState.Slide,
         Crouching = _crouchAmount > 0.5f,
@@ -264,6 +267,11 @@ public sealed class ApexMovementCore
             throw new InvalidOperationException("ApexMovementCore: 必须先 BindWorld()");
 
         _tickCount++;
+
+        // 记录冲刺**意图**（不是速度）。相机侧倾/FOV 要按意图走：
+        // 收枪行走速度 = 4.407×1.15 = 5.068 m/s，已超过 `WalkSpeed×1.05`，
+        // 若用速度反推「是否冲刺」，收枪散步会被误判成冲刺（FOV +3°、侧倾 1.5°）。
+        _sprintIntent = input.SprintHeld;
 
         // 0) 清空本 tick 的落地事件（相机每 tick 只应看到一次落地）
         _landingTier = LandingTier.None;

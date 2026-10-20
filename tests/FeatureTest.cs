@@ -106,6 +106,22 @@ public static class FeatureTest
             Settle(core, 10);
             Run(core, 150, In(mz: 1f, sprint: true, holster: true));
             Near("收枪冲刺速度（299 hu/s）", core.HorizontalSpeed, 7.5946f, 0.15f);
+            Check("收枪冲刺标记 Sprinting", core.Snapshot.Sprinting);
+        }
+
+        // ═════════ 4b. 收枪**行走**不能算冲刺 ═════════
+        // 收枪行走 = 173.5×1.15 = 199 hu/s = 5.0546 m/s，已经超过 WalkSpeed×1.05
+        // （4.627）。早期版本用「速度 > WalkSpeed×1.05」反推 Sprinting，导致
+        // 收枪散步也被判成冲刺 ⇒ 相机 FOV +3°、冲刺侧倾 1.5° 全部误触发。
+        // 修法：Sprinting = 冲刺**意图** ∧ 真跑起来了。
+        {
+            var world = new AnalyticWorld(0f);
+            var core = MakeCore(world);
+            core.Reset(new F3(0f, 1f, 0f));
+            Settle(core, 10);
+            Run(core, 150, In(mz: 1f, holster: true));
+            Near("收枪行走速度（199 hu/s）", core.HorizontalSpeed, 5.0546f, 0.15f);
+            Check("收枪行走不标记 Sprinting", !core.Snapshot.Sprinting);
         }
 
         // ═════════ 5. 蹲行速度 = 80 hu/s = 2.032 ═════════

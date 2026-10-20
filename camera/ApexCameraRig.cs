@@ -235,11 +235,11 @@ public sealed class ApexCameraRig
         float slideRateDeg = MathF.Abs(slideTarget) > MathF.Abs(_slideRoll)
             ? _cfg.SlideRollIncreaseSpeed
             : _cfg.SlideRollDecreaseSpeed;
-        _slideRoll = Approach(_slideRoll, slideTarget, slideRateDeg * MathF.PI / 180f, dt);
+        _slideRoll = MoveTowards(_slideRoll, slideTarget, slideRateDeg * MathF.PI / 180f * dt);
 
         // 冲刺侧倾（`sprinttiltMaxRoll`）
         float sprintTarget = _cfg.SprintMaxRollDeg * _sprintBlend * MathF.PI / 180f;
-        _sprintRoll = Approach(_sprintRoll, sprintTarget, _cfg.SprintRollSpeed * MathF.PI / 180f, dt);
+        _sprintRoll = MoveTowards(_sprintRoll, sprintTarget, _cfg.SprintRollSpeed * MathF.PI / 180f * dt);
     }
 
     // ───────────────────────── 内部：FOV ─────────────────────────
@@ -354,6 +354,22 @@ public sealed class ApexCameraRig
         if (k >= 1f) return target;
         if (k <= 0f) return current;
         return current + (target - current) * k;
+    }
+
+    /// <summary>
+    /// 以**线性**速度趋近目标（每帧最多走 <paramref name="maxStep"/>）。
+    ///
+    /// 侧倾必须用它而不是 <see cref="Approach"/>：二进制里的
+    /// `slide_viewTiltIncreaseSpeed` / `_DecreaseSpeed` / `sprinttilt*` 都是
+    /// **度/秒的线性斜率**（所以才会分成增大/减小两个速率）。若把「度/秒」
+    /// 当指数时间常数用，60°/s 会变成 1/1.047 ≈ 0.95 s 的时间常数，
+    /// 侧倾要 1 秒才到位（实测只到目标的 65%），滑铲侧倾看起来像没生效。
+    /// </summary>
+    private static float MoveTowards(float current, float target, float maxStep)
+    {
+        float d = target - current;
+        if (MathF.Abs(d) <= maxStep) return target;
+        return current + MathF.Sign(d) * maxStep;
     }
 
     /// <summary>由 yaw 与任意 up 求水平前向（与求解器 <c>Forward()</c> 同一套基）。</summary>

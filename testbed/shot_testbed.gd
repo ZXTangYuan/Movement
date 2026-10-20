@@ -130,6 +130,10 @@ func _player_shots() -> void:
 	await _wait(0.4)
 
 	# ── ⑥ 攀爬途中：相机滞后 + 高度上限 ──
+	# 注意取景时机：Grab 阶段相机贴着 6m 墙面（实测距墙 1.30m、眼高 2.83m），
+	# 画面会被墙面填满（紫色 = High 档台阶本色），看不出任何相机行为。
+	# 因此等到 **Pull 阶段、视线已越过台沿** 再取图 —— 此时能看到台面与地平线，
+	# 而 HUD 里 xBlend 仍 > 0，正是"相机滞后"的可读证据。
 	_player.DebugTeleport(22.0, 2.0, 29.0)        # 6m 高台前
 	_player.DebugSetYaw(PI)
 	await _settle()
@@ -138,7 +142,13 @@ func _player_shots() -> void:
 		await get_tree().physics_frame
 		if _player.DebugState in ["Mantle", "Vault", "Window"]:
 			break
-	await _wait_frames(20)                        # 停在翻越中段
+	for i in 400:                                  # 等视线越过台沿（眼高 > 台面 6m）
+		await get_tree().physics_frame
+		var feet: float = _player.global_position.y - 0.975   # 节点原点在胶囊中心
+		if feet > 4.30:                            # 眼高 = 脚 + 1.85 > 6.15 → 已过台沿
+			break
+		if _player.DebugState not in ["Mantle", "Vault", "Window"]:
+			break
 	_save("shot_player_mantle")
 	_press_key(KEY_W, false)
 
