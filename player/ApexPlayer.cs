@@ -412,7 +412,7 @@ public partial class ApexPlayer : Node3D
         {
             Name = "DebugHud",
             Position = new Vector2(16, 16),
-            Text = "ApexMovement v0.3",
+            Text = "ApexMovement v0.4.1",
         };
         _hud.AddThemeColorOverride("font_color", new Color(0.9f, 1f, 0.9f));
         _hud.AddThemeColorOverride("font_outline_color", new Color(0, 0, 0, 1));
