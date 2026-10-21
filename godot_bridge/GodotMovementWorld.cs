@@ -14,7 +14,7 @@ namespace ApexMovement.GodotBridge;
 ///
 /// 只读查询，不修改物理世界。
 /// </summary>
-public sealed class GodotMovementWorld : IMovementWorld, ISlipWorld
+public sealed class GodotMovementWorld : IMovementWorld, ISlipWorld, IFrictionWorld
 {
     private readonly PhysicsDirectSpaceState3D _space;
     private readonly uint _collisionMask;
@@ -273,23 +273,65 @@ public sealed class GodotMovementWorld : IMovementWorld, ISlipWorld
     /// </summary>
     private F3 QueryNormalAt(F3 contactPos, float radius, float halfHeight, F3 fallback)
     {
-        ConfigureCapsule(radius, halfHeight);
         _shapeQuery.Motion = Vector3.Zero;
 
+        // ── ① 沿运动方向再推进 ProbeDepth，让形状"撞进"障碍里 ──────────
+        //    绝大多数情况（撞墙、落地、撞斜面）这一步就能拿到法线。
         Vector3 dir = (-fallback).ToGodot().Normalized();
         if (dir.LengthSquared() < 1e-12f) dir = Vector3.Down;
 
+        ConfigureCapsule(radius, halfHeight);
         _shapeQuery.Transform = new Transform3D(
             Basis.Identity, contactPos.ToGodot() + dir * ProbeDepth);
 
-        Godot.Collections.Dictionary rest = _space.GetRestInfo(_shapeQuery);
-        if (rest.Count > 0 && rest.TryGetValue("normal", out Variant n))
+        if (TryReadRestNormal(out F3 normal)) return normal;
+
+        // ── ② 贴着表面做切向滑动时，①永远推不进障碍 ──────────────────
+        //    典型场景：胶囊圆柱段贴着竖直墙面往上滑。此时"沿运动方向推"只是
+        //    沿着墙面平移，形状与墙面始终**相切**而不重叠，GetRestInfo 返回空。
+        //
+        //    以前这里直接 `return fallback.Normalized()`，而 fallback 是
+        //    `-delta.Normalized()`（运动方向的反向）—— 于是拿到一条"伪法线"。
+        //    MoveWithCollision 用它做 ProjectOnPlane 会把**竖直速度也一起吃掉**：
+        //    表现就是角色悬在半空、vy 一路加速到 -41 却纹丝不动（v0.4.1 修的
+        //    1.3m 平台翻越卡死就是这么来的）。
+        //
+        //    修法：原地把胶囊整体放大 ProbeDepth（半径与两端半球同时外扩），
+        //    保证与"刚刚接触的那个面"产生 ProbeDepth 的重叠，从而拿到真法线。
+        //    不位移，所以取到的法线仍然是接触点的法线。
+        ConfigureCapsule(radius + ProbeDepth, halfHeight);
+        _shapeQuery.Transform = new Transform3D(Basis.Identity, contactPos.ToGodot());
+
+        if (TryReadRestNormal(out normal))
         {
-            F3 normal = F3.From(n.AsVector3());
-            if (normal.LengthSq() > 1e-12f) return normal.Normalized();
+            ConfigureCapsule(radius, halfHeight);
+            return normal;
         }
 
+        ConfigureCapsule(radius, halfHeight);
+
+        // ── ③ 都取不到：退回"竖直墙"启发式，只挡水平分量 ──────────────
+        //    宁可当成墙也不要用 `-delta` 当法线：后者会把竖直速度一起抹掉，
+        //    让角色永久卡死；当成墙最差只是"少走一点"，不会卡住。
+        F3 horiz = F3.ProjectOnPlane(-fallback, new F3(0f, 1f, 0f));
+        if (horiz.LengthSq() > 1e-10f) return horiz.Normalized();
         return fallback.Normalized();
+    }
+
+    /// <summary>
+    /// 读取 <see cref="_shapeQuery"/> 当前位姿下的接触法线。
+    /// GetRestInfo 返回 [point, normal, rid, collider_id, shape, linear_velocity]。
+    /// </summary>
+    private bool TryReadRestNormal(out F3 normal)
+    {
+        normal = F3.Zero;
+        Godot.Collections.Dictionary rest = _space.GetRestInfo(_shapeQuery);
+        if (rest.Count == 0 || !rest.TryGetValue("normal", out Variant n)) return false;
+
+        F3 v = F3.From(n.AsVector3());
+        if (v.LengthSq() < 1e-12f) return false;
+        normal = v.Normalized();
+        return true;
     }
 
     public bool Overlaps(F3 pos, float radius, float halfHeight)
@@ -298,6 +340,47 @@ public sealed class GodotMovementWorld : IMovementWorld, ISlipWorld
         _shapeQuery.Motion = Vector3.Zero;
         _shapeQuery.Transform = new Transform3D(Basis.Identity, pos.ToGodot());
         return _space.IntersectShape(_shapeQuery, 1).Count > 0;
+    }
+
+    /// <summary>
+    /// 地面材质摩擦系数（对应 <see cref="IFrictionWorld"/>）。
+    ///
+    /// 约定：在**碰撞体所在的节点**上挂元数据 <c>friction</c>（float），
+    /// 例如 <c>staticBody.SetMeta("friction", 0.05)</c> 就是冰面。没挂就用默认值。
+    /// 这里用"脚底往下打一条 0.5 m 的射线"找地面，命中节点的自身/父节点都可挂。
+    /// </summary>
+    public bool SampleFriction(F3 position, out float friction)
+    {
+        friction = -1f;
+
+        _rayQuery.From = position.ToGodot();
+        _rayQuery.To = (position - F3.Up * 0.5f).ToGodot();
+        _rayQuery.CollisionMask = _collisionMask;
+        _rayQuery.CollideWithBodies = true;
+        _rayQuery.CollideWithAreas = false;
+
+        Godot.Collections.Dictionary hit = _space.IntersectRay(_rayQuery);
+        if (hit.Count == 0) return false;
+        if (!hit.TryGetValue("collider", out Variant cv) || cv.AsGodotObject() is not GodotObject obj)
+            return false;
+        if (obj is not Node node) return false;
+
+        // v0.4.1：逐级回退查找 meta "friction"。
+        // 场地里通常把材质 meta 挂在 StaticBody3D（或包一层的分组节点）上，
+        // 而 IntersectRay 的 collider 可能是子级的 CollisionShape3D 宿主 —— 只查
+        // 命中节点自己会漏掉。往上走最多 4 层（够覆盖 "分组节点 → 刚体 → 碰撞体"），
+        // 但不一路爬到场景根，避免误捡到全局 meta。
+        const int MaxAncestorDepth = 4;
+        Node? cur = node;
+        for (int depth = 0; cur != null && depth <= MaxAncestorDepth; depth++, cur = cur.GetParent())
+        {
+            if (cur.HasMeta("friction"))
+            {
+                friction = (float)cur.GetMeta("friction").AsDouble();
+                return true;
+            }
+        }
+        return false;
     }
 
     public bool Raycast(F3 origin, F3 dir, float maxDist, out F3 hitPoint, out F3 hitNormal)

@@ -203,7 +203,18 @@ public sealed class MovementConfig
     public float SlideBoostCooldown = 2.0f;
 
     /// <summary>[C] 滑铲摩擦（远低于地面摩擦 —— 这是能滑远的原因）。</summary>
-    public float SlideFriction = 0.9f;
+    /// <summary>
+    /// 滑铲时地面材质的**库仑摩擦系数 μ**（默认 0.45）。
+    ///
+    /// v0.4.1 起滑铲按真实物理走：沿坡合加速度 <c>a = g·sinθ − μ·g·cosθ</c>。
+    ///  - 平地 θ=0：匀减速 <c>μg ≈ 9.35 m/s²</c>（重力 20.78 × 0.45）
+    ///  - 临界角 <c>tanθ = μ</c>：θ &lt; 24.2° 会停下来，θ &gt; 24.2° 越滑越快
+    ///  - μ=0.05 是"冰面"，μ=0.9 是"粗糙水泥"
+    ///
+    /// 这个值是**默认值**：世界里实现 <see cref="IFrictionWorld"/> 时，
+    /// 脚下那块地面可以覆盖它（不同材质不同 μ）。
+    /// </summary>
+    public float SlideFrictionCoefficient = 0.45f;
 
     /// <summary>[C] 滑铲自动站起的最低速度 (m/s)。低于它自动结束滑铲。</summary>
     public float SlideMinSpeed = 2.5f;
@@ -784,6 +795,8 @@ public sealed class MovementConfig
             throw new ArgumentOutOfRangeException(nameof(SlipAirRestrictConeDeg));
         if (SlipSteerFactor < 0f || SlipSteerFactor > 1f)
             throw new ArgumentOutOfRangeException(nameof(SlipSteerFactor));
+        if (SlideFrictionCoefficient < 0f)
+            throw new ArgumentOutOfRangeException(nameof(SlideFrictionCoefficient));
         if (WallHangMaxViewAngle <= 0f || WallHangMaxViewAngle >= 90f)
             throw new ArgumentOutOfRangeException(nameof(WallHangMaxViewAngle));
         if (WallHangReach <= 0f) throw new ArgumentOutOfRangeException(nameof(WallHangReach));

@@ -237,6 +237,27 @@ public interface IMovementWorld
 }
 
 /// <summary>
+/// 可选的世界能力：**地面材质摩擦系数**采样。
+///
+/// 为什么不塞进 <see cref="IMovementWorld"/>：和 <see cref="ISlipWorld"/> 一样，
+/// 这是可选的扩展能力，不该强迫每个世界实现都提供它（测试替身、极简桥接层）。
+/// 求解器用 <c>world is IFrictionWorld</c> 探测，没实现就退回
+/// <see cref="MovementConfig.SlideFrictionCoefficient"/>。
+///
+/// 用途：滑铲按真实物理走 —— 沿坡加速度 <c>a = g·sinθ − μ·g·cosθ</c>。
+/// μ 由**脚下那块地面**决定，于是"冰面滑得远、草地一滑就停"这类材质差异
+/// 只要给碰撞体挂一个摩擦系数即可，不用改求解器。
+/// </summary>
+public interface IFrictionWorld
+{
+    /// <summary>
+    /// 查询 <paramref name="position"/> 正下方那块地面的库仑摩擦系数 μ。
+    /// 返回 false（或返回负数）表示"这里没有材质信息"，用配置默认值。
+    /// </summary>
+    bool SampleFriction(F3 position, out float friction);
+}
+
+/// <summary>
 /// 一次打滑采样：由体积（Apex 的 <c>C_TriggerSlipSphere</c>）提供。
 ///
 /// **来源**：逆向在 `.rdata` 观测到

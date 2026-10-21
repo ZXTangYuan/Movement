@@ -17,6 +17,8 @@ extends Node3D
 ##   · 打滑体积（Slip，v0.3 新增）        —— C_TriggerSlipSphere：走进球里被往外推
 ##   · 台阶区（v0.4 新增）               —— 0.10/0.15/0.20/0.25m 孤立单阶 + 6 级 ×0.20m 连续台阶
 ##                                        三档障碍第一档：≤0.25m 直接迈过、无速度衰减
+##   · 地面材质摩擦带（v0.4.1 新增）    —— 冰面 μ=0.05 / 默认 μ=0.45 / 粗糙 μ=0.90
+##                                        滑铲减速度 = μg·cosθ − g·sinθ，材质不同距离不同
 ##   · 落差平台（3 / 6 / 10 / 22m）       —— 落地分档 Low/Medium/High/Hard + Fallstun
 ##
 ## 全部几何为 StaticBody3D（静态），保证物理查询在固定 tick 下确定性。
@@ -46,6 +48,7 @@ func _ready() -> void:
 	_build_low_ceiling()
 	_build_slide_lane()
 	_build_slip_zone()
+	_build_friction_lanes()
 	_build_drop_platforms()
 	_spawn_player()
 
@@ -384,6 +387,34 @@ func _build_slip_zone() -> void:
 		Vector3(6, 0.06, 1.0), Color(0.95, 0.95, 0.4))
 	_deco_box("SlipMarkOut", Vector3(X, 0.03, Z + RADIUS + 2.0),
 		Vector3(6, 0.06, 1.0), Color(0.95, 0.4, 0.4))
+
+
+## 地面材质摩擦带（v0.4.1）：三条并排的平地，只有 meta "friction" 不同。
+##
+## 滑铲按真实物理走 —— 沿坡合加速度 a = g·sinθ − μ·g·cosθ；平地上 θ=0 就是
+## a = −μg。于是同一次滑铲在三条带子上滑出的距离差别很大：
+##     μ=0.05（冰面）→ 几乎不减速
+##     μ=0.45（默认）→ 约 9.35 m/s² 减速度
+##     μ=0.90（粗糙）→ 约 18.7 m/s²，一滑就停
+##
+## 材质是通过**碰撞体节点的 meta** 交给求解器的：GodotMovementWorld.SampleFriction
+## 沿 -Y 打一条射线，命中的节点（或它的父节点）上若有 "friction" meta 就用它。
+## 这样"不同材质不同摩擦"只要给 StaticBody3D 挂一个 meta，不用改求解器。
+func _build_friction_lanes() -> void:
+	var lanes := [
+		{ "name": "FrictionIce",   "mu": 0.05, "color": Color(0.55, 0.80, 0.95) },
+		{ "name": "FrictionNorm",  "mu": 0.45, "color": Color(0.60, 0.60, 0.62) },
+		{ "name": "FrictionRough", "mu": 0.90, "color": Color(0.45, 0.35, 0.30) },
+	]
+	var z := 0.0
+	for lane in lanes:
+		var body := _box(lane["name"], Vector3(92.0, 0.02, z), Vector3(8.0, 0.04, 30.0),
+			lane["color"])
+		body.set_meta("friction", lane["mu"])
+		# 起点标记（装饰）：滑铲从这一侧进入
+		_deco_box("%sMark" % lane["name"], Vector3(92.0, 0.06, z - 13.0),
+			Vector3(8.0, 0.05, 0.5), Color(1.0, 0.9, 0.3))
+		z += 34.0        # 带宽 30，间距 34 ⇒ 互不重叠，中间留 4m 间隔
 
 
 func _build_drop_platforms() -> void:

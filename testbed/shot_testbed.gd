@@ -46,6 +46,7 @@ var _shots := [
 	{ "name": "climb_wall",   "pos": Vector3(40, 12, 22),  "look": Vector3(50, 4, 0),    "fov": 62.0 },
 	{ "name": "slide_lane",   "pos": Vector3(-70, 22, 55), "look": Vector3(-70, 0, 0),   "fov": 65.0 },
 	{ "name": "slip_zone",    "pos": Vector3(96, 20, -26), "look": Vector3(80, 2, 4),    "fov": 62.0 },
+	{ "name": "friction_lanes", "pos": Vector3(114, 26, -30), "look": Vector3(92, 0.5, 34),  "fov": 62.0 },
 	{ "name": "drop_plats",   "pos": Vector3(32, 26, 82),  "look": Vector3(32, 8, 55),   "fov": 60.0 },
 ]
 
@@ -295,6 +296,102 @@ func _player_shots() -> void:
 	print("STEPS HUD: " + _player.DebugHudLine.replace("\n", " | "))
 	_press_key(KEY_W, false)
 	await _wait(0.4)
+
+	# ── ⑭ 下坡滑铲（v0.4.1 新增：滑铲按真实物理 a = g·sinθ − μ·g·cosθ）────
+	#   30° 坡（Ramp30, x=-25, z 从 -55 到 -35, 顶高 11.55m）：
+	#     tan30° = 0.577 > μ = 0.45 ⇒ 重力压不住摩擦，下坡越滑越快。
+	#   抓两张对比（同一趟滑铲的起头与 1 秒后）：HUD 的 speed= 应该变大，
+	#   roll= 恒为 0.0°（滑铲无侧倾），crou.00 / h=0.98（与下蹲一致）。
+	#   机位：坡的**正侧面**（+X 方向平视）—— 只有侧视才能看出 30° 倾角，
+	#   第一人称下坡时画面全是坡面、俯视又会被坡面遮住。
+	var slope_len := 20.0
+	var h30: float = slope_len * tan(deg_to_rad(30.0))
+	_player.DebugTeleport(-25.0, h30 + 1.4, -33.0)
+	_player.DebugSetYaw(0.0)                      # yaw=0 ⇒ 前向 -Z，正对下坡
+	await _settle()
+	_press_key(KEY_SHIFT, true)
+	_press_key(KEY_W, true)
+	await _wait(0.35)
+	_press_key(KEY_CTRL, true)
+
+	var slide_v0 := 0.0
+	var slide_v1 := 0.0
+	var shot_a := false
+	for i in 260:
+		await get_tree().physics_frame
+		# ① 已经滑到坡面中段（脚底比坡顶低 1.5m 以上）再拍，避免拍到坡顶平台
+		if not shot_a and _player.DebugState == "Slide" and _player.DebugFeetY < h30 - 1.5:
+			shot_a = true
+			slide_v0 = _player.DebugSpeed
+			_proxy.global_position = _player.global_position
+			_proxy.rotation = Vector3(0, PI, 0)   # 胶囊"鼻子"朝 -Z（下坡方向）
+			_proxy.visible = true
+			_cam.global_position = _player.global_position + Vector3(13.0, 1.8, 0.0)
+			_cam.look_at(_player.global_position + Vector3(0, 0.4, 0), Vector3.UP)
+			_cam.fov = 55.0
+			_cam.current = true
+			await _wait_frames(3)
+			await _save("shot_player_slide_slope")
+			print("SLOPE30 HUD: " + _player.DebugHudLine.replace("\n", " | "))
+			continue
+		# ② 再滑 1 秒后重拍：HUD 上 speed= 必须明显变大
+		var fast_ready: bool = (shot_a and slide_v0 > 0.0 and slide_v1 == 0.0
+				and _player.DebugState == "Slide" and _player.DebugSpeed > slide_v0 + 1.0)
+		if fast_ready:
+			slide_v1 = _player.DebugSpeed
+			_proxy.global_position = _player.global_position
+			_cam.global_position = _player.global_position + Vector3(13.0, 1.8, 0.0)
+			_cam.look_at(_player.global_position + Vector3(0, 0.4, 0), Vector3.UP)
+			await _wait_frames(3)
+			await _save("shot_player_slide_slope_fast")
+			print("SLOPE30 FAST HUD: " + _player.DebugHudLine.replace("\n", " | "))
+			break
+	print("SLOPE30 v0=%.2f v1=%.2f state=%s feet=%.2f" %
+		[slide_v0, slide_v1, _player.DebugState, _player.DebugFeetY])
+	_proxy.visible = false
+	_cam.current = false
+	pcam.current = true
+	_press_key(KEY_CTRL, false)
+	_press_key(KEY_W, false)
+	_press_key(KEY_SHIFT, false)
+	await _wait(0.4)
+
+	# ── ⑮ 地面材质摩擦（v0.4.1 新增：μ 可调，不同材质滑出不同距离）────
+	#   三条带子 x=92：z=0 冰面 μ=0.05 / z=34 默认 μ=0.45 / z=68 粗糙 μ=0.90。
+	#   起点取带子**远端**（z = 中心 +12），朝 -Z 滑 0.5s（≈5.5m）全程不出带子。
+	#   同一起滑条件下各滑 0.5 秒，HUD 上的 speed= 就是三种材质的减速度差。
+	#   物理依据：平地 θ=0 ⇒ a = −μg ⇒ 减速度与 μ 成正比。
+	for spec in [{"z": 12.0, "tag": "ice"}, {"z": 46.0, "tag": "norm"}, {"z": 80.0, "tag": "rough"}]:
+		var lz: float = spec["z"]
+		var tag: String = spec["tag"]
+		_cam.current = false
+		pcam.current = true
+		_player.DebugTeleport(92.0, 1.2, lz)
+		_player.DebugSetYaw(0.0)                  # 前向 -Z，沿带子滑
+		await _settle()
+		_press_key(KEY_SHIFT, true)
+		_press_key(KEY_W, true)
+		await _wait(0.30)
+		_press_key(KEY_CTRL, true)
+		var v0 := 0.0
+		var v1 := 0.0
+		var got0 := false
+		for i in 120:
+			await get_tree().physics_frame
+			if not got0 and _player.DebugState == "Slide" and i > 6:
+				got0 = true
+				v0 = _player.DebugSpeed
+			if got0 and i >= 36:
+				v1 = _player.DebugSpeed
+				break
+		print("FRICTION %s v0=%.2f v1=%.2f state=%s" %
+			[tag, v0, v1, _player.DebugState])
+		await _save("shot_player_friction_%s" % tag)
+		print("FRICTION %s HUD: " % tag + _player.DebugHudLine.replace("\n", " | "))
+		_press_key(KEY_CTRL, false)
+		_press_key(KEY_W, false)
+		_press_key(KEY_SHIFT, false)
+		await _wait(0.4)
 
 	# ── ⑫ 调试菜单（v0.4 新增：按 \ 打开 / 再按 \ 关闭）──
 	#   这一张证明三件事：① 面板确实存在且能被 \ 叫出来；

@@ -12,7 +12,7 @@ namespace ApexMovement.Tests;
 /// 它按"轴分离 + 最早命中"处理，胶囊近似为竖直圆柱 + 球端。
 /// 它与求解器的契约和 GodotMovementWorld 一致（Sweep/Overlaps/Raycast）。
 /// </summary>
-public sealed class AnalyticWorld : IMovementWorld, ISlipWorld
+public sealed class AnalyticWorld : IMovementWorld, ISlipWorld, IFrictionWorld
 {
     public float GroundY;
 
@@ -42,7 +42,25 @@ public sealed class AnalyticWorld : IMovementWorld, ISlipWorld
         }
     }
 
+    /// <summary>
+    /// 地面材质摩擦系数 μ。null = 没有材质信息（求解器用配置默认值）。
+    /// 测试用它模拟"冰面 / 粗糙水泥"。
+    /// </summary>
+    public float? SurfaceFriction;
+
     public AnalyticWorld(float groundY = 0f) { GroundY = groundY; }
+
+    // ═══════════════════════ IFrictionWorld ═══════════════════════
+
+    public bool SampleFriction(F3 position, out float friction)
+    {
+        friction = -1f;
+        if (SurfaceFriction is not float mu) return false;
+        // 只在贴近地面时算"踩在这块材质上"
+        if (position.Y - GroundY > 0.6f) return false;
+        friction = mu;
+        return true;
+    }
 
     public void AddBox(F3 min, F3 max) => Boxes.Add((min, max));
 

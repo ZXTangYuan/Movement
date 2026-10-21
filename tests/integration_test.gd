@@ -1,5 +1,5 @@
 extends Node
-## ApexMovement **真实物理**集成测试（v0.4）。
+## ApexMovement **真实物理**集成测试（v0.4.1）。
 ##
 ## 为什么需要它：`determinism_test.tscn` 里的 FeatureTest 跑在 AnalyticWorld
 ## （纯数学测试替身）上，覆盖不到 Godot 桥接层与相机应用层。历史事故：
@@ -35,7 +35,7 @@ var _report: PackedStringArray = PackedStringArray()
 
 
 func _ready() -> void:
-	print("=== APEX MOVEMENT 集成测试 v0.4（真实物理） ===")
+	print("=== APEX MOVEMENT 集成测试 v0.4.1（真实物理） ===")
 	var packed: PackedScene = load(TESTBED)
 	if packed == null:
 		push_error("测试场地加载失败")
@@ -82,6 +82,8 @@ func _run_all() -> void:
 	await _case_mantle_6m()
 	await _case_climb_gate()
 	await _case_ramp()
+	await _case_slide_slope()
+	await _case_mantle_13()
 	await _case_vault_wall()
 	await _case_window()
 	await _case_low_ceiling()
@@ -207,7 +209,7 @@ func _case_slide() -> void:
 	_expect("滑铲触发", sliding, "state=%s speed=%.2f" % [_player.DebugState, speed])
 	_expect("Slideboost 生效（>400hu/s 上限内）", speed > EXPECT_SPRINT + 1.0,
 		"speed=%.2f（冲刺 %.2f）" % [speed, EXPECT_SPRINT])
-	# v0.4 需求：滑铲画面与下蹲一致 —— 不再有滑铲专属侧倾（曾 5°）与 FOV 加宽（曾 +6°）。
+	# v0.4.1 需求：滑铲画面与下蹲一致 —— 不再有滑铲专属侧倾（曾 5°）与 FOV 加宽（曾 +6°）。
 	# 残下的 0.74° / 92.37° 是"冲刺余量"（SprintMaxRollDeg 1.5°、FovSprintAdd 3° 的 blend 尾），
 	# 所以断言改成上限：绝不能超过冲刺档本身。
 	_expect("滑铲不再有专属侧倾（只剩冲刺余量 ≤1.5°）", absf(roll) <= 1.55,
@@ -261,7 +263,7 @@ func _case_mantle_classes() -> void:
 		_player.DebugSetYaw(PI)               # 朝 +Z
 		await _frames(40)
 
-		# v0.4：翻越/攀爬必须 "W + Space" 才触发（走着撞墙只会撞停）。
+		# v0.4.1：翻越/攀爬必须 "W + Space" 才触发（走着撞墙只会撞停）。
 		# 只在**地面上**点跳：已经挂上墙之后再按 Space 会变成蹬墙跳/到顶翻越，会毁掉攀爬。
 		var h: float = float(s["h"])
 		_press(KEY_W, true)
@@ -296,6 +298,53 @@ func _case_mantle_classes() -> void:
 		await _frames(30)
 
 
+func _case_mantle_13() -> void:
+	# 回归：v0.4.1 修掉的"1.3m 平台翻越时悬空卡死"。
+	# 平台 MantleStep_1.3 位于 x=-18, 中心 z=35, 尺寸 4×1.3×4（前表面 z=33）。
+	# 曾经的 bug：起跳后 GodotMovementWorld.QueryNormalAt 在接触边缘拿不到真实法线，
+	# 返回"运动方向反向"的伪法线，MoveWithCollision 用它做 ProjectOnPlane 把
+	# 水平与竖直速度一起吃掉 ⇒ 人悬在半空、vy 一路掉到 -41 而位置不动。
+	# 判据：① 能站上 1.3m 台面 ② 全程不出现"Air 且速度很大却位移不动"的死锁。
+	_release_all()
+	_player.DebugTeleport(-18.0, 1.2, 30.0)
+	_player.DebugSetYaw(PI)                   # 朝 +Z（正对平台前表面 z=33）
+	await _frames(30)
+
+	_press(KEY_W, true)
+	await _frames(24)                         # 先撞上去
+	_press(KEY_SPACE, true)
+	await _frames(2)
+	_press(KEY_SPACE, false)
+
+	var max_feet: float = 0.0
+	var stuck_frames := 0
+	var worst_stuck := 0
+	var prev_feet: float = _player.DebugFeetY
+	for i in range(300):
+		await get_tree().physics_frame
+		max_feet = max(max_feet, _player.DebugFeetY)
+		# "卡死"判据：空中 + 位置几乎没动 + 竖直速度绝对值很大
+		var moved: float = absf(_player.DebugFeetY - prev_feet)
+		if _player.DebugState == "Air" and moved < 0.002 and absf(_player.DebugVerticalSpeed) > 5.0:
+			stuck_frames += 1
+			worst_stuck = max(worst_stuck, stuck_frames)
+		else:
+			stuck_frames = 0
+		prev_feet = _player.DebugFeetY
+		if _player.DebugState == "Ground" and _player.DebugFeetY > 1.25:
+			break
+	_press(KEY_W, false)
+	await _frames(30)
+
+	_expect("1.3m 平台：W+Space 能站上台面（回归：不再悬空卡死）",
+		_player.DebugState == "Ground" and _player.DebugFeetY > 1.25,
+		"state=%s feet=%.2f（台面 1.30）max_feet=%.2f" % [
+			_player.DebugState, _player.DebugFeetY, max_feet])
+	_expect("1.3m 平台：全程没有『空中速度很大却不动』的死锁",
+		worst_stuck < 10,
+		"最长连续卡死帧数 = %d（判据 <10）" % worst_stuck)
+
+
 func _case_mantle_6m() -> void:
 	# 攀爬台阶梯最高一级：6.0m（High 档）
 	_release_all()
@@ -303,7 +352,7 @@ func _case_mantle_6m() -> void:
 	_player.DebugSetYaw(PI)                   # 朝 +Z
 	await _frames(40)
 
-	# v0.4：先在地面点一次 Space 起跳抓墙，之后一路按住 W 往上爬。
+	# v0.4.1：先在地面点一次 Space 起跳抓墙，之后一路按住 W 往上爬。
 	_press(KEY_W, true)
 	var max_feet: float = 0.0
 	var jumped := false
@@ -377,7 +426,7 @@ func _case_climb_gate() -> void:
 		_expect("按住 W 持续上爬（0.75s 至少 +0.8m）", feet1 - feet0 > 0.8,
 			"Δfeet=%.3f（ClimbSpeed 2.0 m/s）" % (feet1 - feet0))
 
-		# ③ 松开 W ⇒ 进入扒墙（WallHang），并开始缓慢下滑（v0.4 需求第 3 条）
+		# ③ 松开 W ⇒ 进入扒墙（WallHang），并开始缓慢下滑（v0.4.1 需求第 3 条）
 		_press(KEY_W, false)
 		var slide_from: float = _player.DebugFeetY
 		await _frames(40)
@@ -407,6 +456,75 @@ func _case_ramp() -> void:
 	await _frames(40)
 
 
+func _case_slide_slope() -> void:
+	# 滑铲物理化：a = g·sinθ − μ·g·cosθ
+	#   30° 坡（Ramp30 x=-25, z=-55..-35）：tan30°=0.577 > μ=0.45 ⇒ 下坡持续加速
+	#   15° 坡（Ramp15 x=-45）：tan15°=0.268 < μ        ⇒ 下坡仍被摩擦刹停
+	# 判据：取"滑铲已经稳定在坡面上"的窗口（跳过刚离开平台的落地瞬间），
+	#       用速度差 / 时间算实测加速度，与理论值比对。
+	var results := {}
+	for spec in [{"x": -25.0, "deg": 30.0}, {"x": -45.0, "deg": 15.0}]:
+		var sx: float = spec["x"]
+		var deg: float = spec["deg"]
+		var slope_len: float = 20.0
+		var h: float = slope_len * tan(deg_to_rad(deg))
+		# 站到坡顶平台（平台顶面 = h + 0.4，中心 z=-33）
+		_release_all()
+		_player.DebugTeleport(sx, h + 1.4, -33.0)
+		_player.DebugSetYaw(0.0)              # 朝 -Z（下坡方向）
+		await _frames(30)
+		_press(KEY_SHIFT, true)
+		_press(KEY_W, true)
+		await _frames(20)
+		_press(KEY_CTRL, true)
+
+		# 采样：只要还在滑铲就记 (tick, speed)。前 24 帧留给"离开平台 → 落到坡面"。
+		var samples: Array = []
+		var tick := 0
+		for i in range(90):
+			await get_tree().physics_frame
+			tick += 1
+			if _player.DebugState == "Slide":
+				samples.append([tick, _player.DebugSpeed])
+		_press(KEY_CTRL, false)
+		_press(KEY_W, false)
+		_press(KEY_SHIFT, false)
+
+		var v0 := 0.0
+		var v1 := 0.0
+		var t0 := 0
+		var t1 := 0
+		for smp in samples:
+			if int(smp[0]) >= 24 and t0 == 0:
+				t0 = int(smp[0]); v0 = float(smp[1])
+			if int(smp[0]) >= 24:
+				t1 = int(smp[0]); v1 = float(smp[1])
+		var acc := 0.0
+		if t1 > t0:
+			acc = (v1 - v0) / (float(t1 - t0) / 60.0)
+		results[deg] = {"v0": v0, "v1": v1, "t0": t0, "t1": t1, "acc": acc}
+		await _frames(40)
+
+	var g: float = 20.7802
+	var mu := 0.45
+	var r30: Dictionary = results[30.0]
+	var r15: Dictionary = results[15.0]
+	var a30_theory: float = g * sin(deg_to_rad(30.0)) - mu * g * cos(deg_to_rad(30.0))
+	var a15_theory: float = g * sin(deg_to_rad(15.0)) - mu * g * cos(deg_to_rad(15.0))
+
+	_expect("滑铲在 30° 坡（tanθ>μ）实测加速度 ≈ g·sinθ−μg·cosθ",
+		float(r30["acc"]) > 1.0 and absf(float(r30["acc"]) - a30_theory) < 1.2,
+		"实测 %+.2f m/s²（理论 %+.2f）v %.2f→%.2f" % [r30["acc"], a30_theory, r30["v0"], r30["v1"]])
+	_expect("滑铲在 15° 坡（tanθ<μ）实测减速 ≈ −(μg·cosθ−g·sinθ)",
+		float(r15["acc"]) < -2.0 and absf(float(r15["acc"]) - a15_theory) < 1.5,
+		"实测 %+.2f m/s²（理论 %+.2f）v %.2f→%.2f" % [r15["acc"], a15_theory, r15["v0"], r15["v1"]])
+	_expect("同样起滑速度下，陡坡越滑越快、缓坡被刹停",
+		float(r30["v1"]) > float(r30["v0"]) and float(r15["v1"]) < float(r15["v0"]),
+		"30° %s，15° %s" % [
+			("加速 %.2f→%.2f" % [r30["v0"], r30["v1"]]) if float(r30["v1"]) > float(r30["v0"]) else ("减速 %.2f→%.2f" % [r30["v0"], r30["v1"]]),
+			("加速 %.2f→%.2f" % [r15["v0"], r15["v1"]]) if float(r15["v1"]) > float(r15["v0"]) else ("减速 %.2f→%.2f" % [r15["v0"], r15["v1"]])])
+
+
 func _case_vault_wall() -> void:
 	# 翻越低墙 0.8m：VaultWall_0.8 位于 x=-14, z=50，尺寸 3×0.8×6
 	_release_all()
@@ -414,7 +532,7 @@ func _case_vault_wall() -> void:
 	_player.DebugSetYaw(PI)                   # 朝 +Z
 	await _frames(40)
 
-	# v0.4：小障碍档（≤1m）是 W + Space 直接翻越，不是走着自动翻。
+	# v0.4.1：小障碍档（≤1m）是 W + Space 直接翻越，不是走着自动翻。
 	_press(KEY_W, true)
 	var max_z: float = -1e9
 	for i in range(300):
@@ -440,7 +558,7 @@ func _case_window() -> void:
 	_player.DebugSetYaw(PI)                   # 朝 +Z
 	await _frames(40)
 
-	# v0.4：窗口翻越同样挂在 W + Space 上（自动翻越探测已移除）。
+	# v0.4.1：窗口翻越同样挂在 W + Space 上（自动翻越探测已移除）。
 	_press(KEY_W, true)
 	var saw_window := false
 	var max_z: float = -1e9

@@ -3,7 +3,7 @@ using System;
 namespace ApexMovement.Core;
 
 /// <summary>
-/// Apex 风格移动求解器 v0.3 —— **固定 tick 确定性**实现。
+/// 自研移动求解器 v0.4.1 —— **固定 tick 确定性**实现。
 ///
 /// ## 与 Apex 原版的关系
 /// Apex（Source 2 / Titanfall 谱系）按**渲染帧**积分：两次画面帧之间的输入动量会叠加，
@@ -42,6 +42,27 @@ namespace ApexMovement.Core;
 /// | 扒墙态 | 无（`Hang` 只是攀爬到顶的过渡） | **`WallHang`**：贴墙 + 按蹲才挂（非强制），有握力 / 爬升 / 横移 / 下滑 / 蹬墙跳 |
 /// | tick 基准 | 跟随引擎物理频率 | **固定 60/s**（`PinnedTickRate`），由 `ApexTickClock` 折算 |
 /// | 昂贵探针 | 每 tick | `TraversalProbeInterval` / `SlipProbeInterval` 可降到 30 Hz |
+///
+/// ## v0.4 相比 v0.3 的机制变化（自研手感，不再对标 Apex）
+///
+/// | 机制 | v0.3 | v0.4 |
+/// |---|---|---|
+/// | 镜头抖动 | 手拍常数（步频 `1.2 + 速度×0.55`，冲刺 4.83 Hz） | **步态模型推导**（身高→腿长→偏好步速→步频/步幅→腾空比→起伏与点头），见 <see cref="GaitModel"/> |
+/// | 滑铲镜头 | 侧倾 5° + FOV +6° + 下沉 10cm | **完全等同下蹲**（三项全删） |
+/// | 攀爬触发 | 空中 + 面向墙 + 朝墙速度 | **W 贴墙 + Space 跳起**；地面按 W 只撞停 |
+/// | 扒墙 | 贴墙 + 按蹲才挂（非强制） | **默认化**：空中下落贴墙自动挂；上升不打断；松 W 转扒墙；`S` 直接垂直下落 |
+/// | 障碍分级 | 单一 `OverwalkableHeight=0.762` | **三档**：≤0.25m 台阶迈过 / ≤1.0m 小障碍 W+Space 翻越 / >1.0m 墙撞停 |
+/// | 自动翻越探测 | 地面每 2 tick 探一次 | **已移除**（翻越/窗口改由 W+Space 显式触发） |
+/// | 调试菜单 | 无 | **`\` 键**：FOV / 灵敏度 / 摇晃倍率 / 冲击倍率 / 开关 |
+///
+/// ## v0.4.1 相比 v0.4 的机制变化
+///
+/// | 机制 | v0.4 | v0.4.1 |
+/// |---|---|---|
+/// | 滑铲减速 | 与坡度无关的指数衰减（`SlideFriction=0.9`）⇒ 下坡反而更慢 | **真实物理** `a = g·sinθ − μ·g·cosθ`（<see cref="StepSlide"/>）：平地匀减速、下坡越陡越快、`tanθ=μ` 是临界角 |
+/// | 摩擦系数 | 单一常数 | **按地面材质取**（<see cref="IFrictionWorld"/>，默认 `SlideFrictionCoefficient=0.45`），Godot 侧读碰撞体 meta `friction` |
+/// | 碰撞法线兜底 | `GetRestInfo` 打空时退回 `-delta` 伪法线 ⇒ 把竖直速度一起投掉、角色悬空卡死 | **原地放大胶囊再查**，仍失败才退回"竖直墙"启发式（只挡水平分量） |
+/// | 贴墙爬升 | 一次性冲到 `ClimbAttachOffset` | **分段爬升**：到上限就脱手，需要重新抓墙继续爬 |
 ///
 /// ## 参考的引擎公式（Source 谱系，本实现沿用）
 /// - 加速：<c>accelSpeed = accel × dt × wishSpeed</c>，并夹到 <c>addSpeed</c>
@@ -940,17 +961,51 @@ public sealed class ApexMovementCore
     {
         _slideTime += dt;
 
-        // ── 摩擦 ──────────────────────────────────────────────────
-        // 反向输入会"非常剧烈"地减速（wiki），用额外摩擦倍率表达。
-        float friction = _cfg.SlideFriction;
-        F3 horizVel = F3.ProjectOnPlane(_vel, _up);
+        // ── 摩擦 + 坡度重力（v0.4.1：滑铲改成真实物理）──────────────
+        //
+        // 沿坡面方向的合加速度：
+        //     a = g·sinθ − μ·g·cosθ
+        // 其中 θ = 坡面倾角（由 _groundNormal 与 up 的夹角给出）、μ = 地面摩擦系数。
+        //
+        //   · 平地 θ=0  ⇒ a = −μg（匀减速）
+        //   · 越陡 sinθ 越大 ⇒ 下坡越滑越快（用户需求"坡道越陡越快"）
+        //   · 临界角 tanθ = μ：超过它重力就再也压不住，一路加速到底
+        //
+        // μ 由脚下地面材质决定（IFrictionWorld），没实现就用配置默认 0.45。
+        // 先加重力分量、再减库仑摩擦，于是"坡不够陡时摩擦能把重力分量吃掉"
+        // 自动成立 —— 等价于静摩擦把人按在坡上，不需要额外分支。
         F3 wishDir = WishDirection(input);
+        F3 horizVel = F3.ProjectOnPlane(_vel, _up);
+
+        float mu = SlideFrictionAt();
         if (horizVel.LengthSq() > 1e-6f && wishDir.LengthSq() > 1e-6f &&
             F3.Dot(horizVel.Normalized(), wishDir) < -0.2f)
         {
-            friction *= _cfg.SlideReverseInputPenalty;
+            // 反向输入会"非常剧烈"地减速（wiki），用额外摩擦倍率表达。
+            mu *= _cfg.SlideReverseInputPenalty;
         }
-        ApplyFriction(dt, friction);
+
+        float cosT = Clamp(F3.Dot(_groundNormal, _up), 0f, 1f);
+        float sinT = MathF.Sqrt(MathF.Max(0f, 1f - cosT * cosT));
+
+        // ① 重力沿坡分量（方向 = 下坡）
+        if (sinT > 1e-4f)
+        {
+            F3 downhill = F3.ProjectOnPlane(-_up, _groundNormal);
+            if (downhill.LengthSq() > 1e-8f)
+                _vel += downhill.Normalized() * (_cfg.Gravity * sinT * dt);
+        }
+
+        // ② 库仑摩擦：沿"坡面内的速度方向"反向，大小 μ·g·cosθ·dt
+        //    按**坡面内**的速度算，不是三维速度 —— 否则上坡/下坡会把竖直分量算重。
+        F3 slopeVel = F3.ProjectOnPlane(_vel, _groundNormal);
+        float slopeSpeed = slopeVel.Length();
+        if (slopeSpeed > 1e-5f)
+        {
+            float drop = mu * _cfg.Gravity * cosT * dt;
+            float newSpeed = MathF.Max(0f, slopeSpeed - drop);
+            _vel += slopeVel / slopeSpeed * (newSpeed - slopeSpeed);
+        }
 
         // ── 转向 ──────────────────────────────────────────────────
         // wiki：短暂方向输入几乎被忽略，持续按住可以极轻微转向。
@@ -997,6 +1052,33 @@ public sealed class ApexMovementCore
             DoJump(fromSlide: slideJumpAllowed, crouchHeld: input.CrouchHeld);
             return;
         }
+    }
+
+    /// <summary>
+    /// 取当前脚下地面的库仑摩擦系数 μ。
+    /// 世界实现了 <see cref="IFrictionWorld"/> 就用材质值，否则用配置默认值。
+    /// </summary>
+    private float SlideFrictionAt()
+    {
+        if (_world is IFrictionWorld fw &&
+            fw.SampleFriction(FeetPosition + _up * 0.05f, out float materialMu) &&
+            materialMu >= 0f)
+        {
+            return materialMu;
+        }
+        return _cfg.SlideFrictionCoefficient;
+    }
+
+    /// <summary>
+    /// 沿坡滑动的合加速度 (m/s²)：<c>a = g·sinθ − μ·g·cosθ</c>。
+    /// 正值 = 沿坡加速（坡太陡，摩擦压不住），负值 = 减速。
+    /// 纯函数，自检直接验它（不需要真的造一个斜坡世界）。
+    /// </summary>
+    public static float SlideSlopeAcceleration(float gravity, float slopeAngleRad, float mu)
+    {
+        float c = MathF.Cos(slopeAngleRad);
+        float s = MathF.Sin(slopeAngleRad);
+        return gravity * s - mu * gravity * c;
     }
 
     private void EndSlide()
@@ -1676,7 +1758,13 @@ public sealed class ApexMovementCore
     /// <summary>爬到顶但上方没有可挂的台面：给 End boost（+28hu）上抛脱离。</summary>
     private void DetachWallGrabAtTop()
     {
-        RememberClimbSurface();
+        // 注意：这里**故意不调 RememberClimbSurface()**。
+        //
+        // 到顶脱手不是"玩家放弃了这面墙"，而是"爬升距离到了 ClimbAttachOffset 的
+        // 上限"——玩家还按着 W，应该能落回去继续爬（高墙分两段爬上去）。
+        // 一旦记下 surface，重附着规则（"必须先掉回上次 attach 点以下"）就会把
+        // 后续每一次重抓全部拒掉：实测 6 m 墙卡在 2.54 m 处上不去（v0.4.1）。
+        // 反作弊规则只针对玩家主动脱手（S / 跳 / 甩视角），那些走 DetachWallGrab。
         _state = MovementState.Air;
         _vel = _up * MathF.Sqrt(2f * _cfg.Gravity * _cfg.ClimbEndBoost);
         _climbTime = 0f;

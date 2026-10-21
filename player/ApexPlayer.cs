@@ -705,7 +705,7 @@ public partial class ApexPlayer : Node3D
         if (tiltDeg > 0.05f) gait += $" step={tiltDeg:F1}deg";
 
         _hud.Text =
-            $"ApexMovement v0.4  tick={_core.TickCount}\n" +
+            $"ApexMovement v0.4.1  tick={_core.TickCount}\n" +
             $"state={_core.State}  speed={_core.HorizontalSpeed:F2} m/s  vy={_core.VerticalSpeed:F2}\n" +
             $"ground={_core.OnGround}  crouch={_core.CrouchAmount:F2}  h={_core.CurrentHeight:F2}  {holster}\n" +
             $"fov={_camOut.Fov:F1}°  roll={_camOut.Roll * 180f / Mathf.Pi:F1}°  bobPhase={_snapshot.BobPhase:F2}\n" +

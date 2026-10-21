@@ -1,4 +1,4 @@
-# ApexMovement 插件 v0.4
+# ApexMovement 插件 v0.4.1
 
 **自研移动系统**（固定 tick 确定性）+ 相机子系统 + 可玩测试场地。
 起点是逆向 Apex Legends **v3.0.3.65**（只读分析，未修改游戏安装目录）并按
@@ -13,6 +13,14 @@
 四档翻越 / 窗口翻越 / 贴墙爬 / 空中转向 / 跳跃疲劳 / Fallstun / FOV / 镜头晃动 / 走路摇晃），
 但把**画面帧判定改成游戏 tick 判定** —— 同样的输入序列在 30 / 60 / 144 / 240 fps 下
 产生**逐位相同**的轨迹。
+
+v0.4.1 的两个主打变化（在 v0.4 之上）：
+
+1. **滑铲按真实物理走**：沿坡合加速度 `a = g·sinθ − μ·g·cosθ`。平地匀减速、坡越陡越滑越快、
+   临界角 `tanθ = μ` 一过就再也停不下来。摩擦系数 μ **按地面材质取**（`IFrictionWorld`），
+   默认 0.45，冰面 0.05 / 粗糙 0.90 只是给碰撞体挂一个 meta，不用改求解器。
+2. **修掉「翻越 1.3 m 平台时悬空卡死」**：扫掠在接触边缘拿不到真实法线时会退回
+   「运动方向反向」的伪法线，把水平与竖直速度一起吃掉 —— 人悬在半空、vy 掉到 −41 而纹丝不动。
 
 v0.4 的五个主打变化：
 
@@ -35,8 +43,10 @@ v0.4 的五个主打变化：
 | `Space` | 跳跃；地面朝小障碍按 = 翻越（见下） |
 | `Ctrl` | 蹲下 |
 | `Shift` | 冲刺 |
-| `Shift + Ctrl` | 滑铲（需 ≥5.08 m/s）。**镜头与下蹲完全一致**：无侧倾、无 FOV 加宽、无额外下沉 |
+| `Shift + Ctrl` | 滑铲（需 ≥5.08 m/s）。**镜头与下蹲完全一致**：无侧倾、无 FOV 加宽、无额外下沉。**v0.4.1 起按真实物理减速**：`a = g·sinθ − μ·g·cosθ`，平地被 μ 刹住、下坡越陡越滑越快、μ 由地面材质决定 |
 | `Shift + Ctrl + Space` | 滑铲跳 |
+| **在坡上滑铲** | 30° 坡（`tanθ=0.577 > μ=0.45`）**越滑越快**；15° 坡（`tanθ=0.268 < μ`）仍会被刹停。临界角 `tanθ = μ` = 24.23° |
+| **在冰面 / 粗糙地面滑铲** | μ 由碰撞体 meta `friction` 决定（冰 0.05 / 默认 0.45 / 粗糙 0.90）；同样起滑条件下 0.5 s 后速度 11.06 / 6.07 / 2.34 m/s |
 | 反复「滑铲 → 跳 → 落地 → 滑铲」 | 连续滑铲跳 |
 | **走向 ≤0.25 m 台阶** | 直接迈过去：**无速度衰减**，水平速度临时变成斜向上再变回水平，只改方向不改大小 |
 | **走向 0.25–1 m 小障碍 + `W` + `Space`** | **直接翻越**（`Vault`，不触发攀爬）；翻完 0.25 s 内加速倍率 ×3，快速回到满速 |
@@ -92,6 +102,8 @@ v0.4 的五个主打变化：
 | 打滑速度 / 方向限制锥 | 8 m/s / 35° | **C 级手感参数**（逆向只证明 `slipSpeed`、`m_slipAirRestrictDirection` 字段存在） |
 | 扒墙爬升 / 横移 / 下滑 | 2.0（`ClimbSpeed`）/ 0.8 / 0.22 m/s | **需求方口径（v0.4）**：上爬与攀爬同速，一个旋钮一个方向 |
 | 扒墙无输入掉落 / 横移流失 / 上爬回补 | 1.2 s / 6 s / 2.5 s | **需求方口径（v0.4）**：握力 0–1，三种流失/回补各有时间常数 |
+| 滑铲摩擦系数 μ | **0.45**（`SlideFrictionCoefficient`） | **需求方口径（v0.4.1）**：默认值；地面挂了 meta `friction` 时按材质取（冰 0.05 / 常规 0.45 / 粗糙 0.90） |
+| 滑铲坡度加速度 | `a = g·sinθ − μ·g·cosθ` | **需求方口径（v0.4.1）**：μ=0.45 ⇒ 临界角 24.23° |
 
 **`Legacy` 预设**：v0.1 的口径（行走 5.4 / 冲刺 ×1.37 = 7.4 / 攀爬 6.5 / 跳跃 1.15）。
 在 `ApexPlayer.ConfigPreset` 里一行切换。
@@ -109,28 +121,34 @@ GODOT="D:/Godot/Godot_4.7_stable_mono/Godot_v4.7-stable_mono_win64_console.exe"
 # 有窗口，可玩
 "$GODOT" --path . --rendering-driver vulkan res://addons/apex_movement/testbed/apex_testbed.tscn
 
-# 自检 A：跨帧率确定性 + 36 项功能 + 24 项相机 + 47 项攀爬/tick/三档
-#         + 23 项步态推导 + 35 项打滑/扒墙（纯数学，无引擎）= 165 项断言
+# 自检 A：跨帧率确定性 + 43 项功能（含滑铲物理 / 地面材质）+ 24 项相机
+#         + 47 项攀爬/tick/三档 + 23 项步态推导 + 35 项打滑/扒墙（纯数学，无引擎）= 172 项断言
 "$GODOT" --headless --path . res://addons/apex_movement/tests/determinism_test.tscn
 # 期望：=== APEX MOVEMENT SELFTEST PASS ===
 
-# 自检 B：44 项真实物理集成断言（跑真实 Godot 物理 + 真实场地）
+# 自检 B：49 项真实物理集成断言（跑真实 Godot 物理 + 真实场地）
 "$GODOT" --headless --path . res://addons/apex_movement/tests/integration_test.tscn
-# 期望：=== INTEGRATION PASS（44 项断言） ===
+# 期望：=== INTEGRATION PASS（49 项断言） ===
 
 # 截图（需要窗口/真实渲染）
 "$GODOT" --path . --rendering-driver vulkan --resolution 1920x1080 \
          res://addons/apex_movement/testbed/shot_testbed.tscn
-# 出 24 张图到 user://shot_*.png：
-#  10 张自由机位（overview / ramps / mantle_steps / vault_walls / step_stairs /
-#                  window_frames / climb_wall / slide_lane / drop_plats / slip_zone）
-#  12 张玩家视角（fp / fov110 / fov70 / walking / slide / mantle /
-#                  climb / hang / climb_top / slip / wallhang / steps）
+# 出 30 张图到 user://shot_*.png：
+#  11 张自由机位（overview / ramps / mantle_steps / vault_walls / step_stairs /
+#                  window_frames / climb_wall / slide_lane / drop_plats / slip_zone /
+#                  friction_lanes）
+#  17 张玩家视角（fp / fov110 / fov70 / walking / slide / mantle /
+#                  climb / hang / climb_top / slip / wallhang / steps /
+#                  slide_slope / slide_slope_fast /
+#                  friction_ice / friction_norm / friction_rough）
 #   2 张调试菜单（debug_menu / debug_menu_fov110）
 #   ← climb / hang / climb_top 是攀爬三阶段；slip / wallhang 是打滑与扒墙
 #   ← step_stairs / steps 是 v0.4 三档障碍第一档（≤0.25m 台阶）
-#   wallhang 是唯一的第三人称图（第一人称贴墙只有一片墙，看不出挂点）
-#   HUD 会打印当时的 fov / roll / state / gait / step —— 这是相机与步态效果的视觉证据
+#   ← slide_slope* 是 v0.4.1 的"下坡越滑越快"；friction_* 是三种地面材质
+#   wallhang / slide_slope* 是第三人称图（第一人称贴墙只有一片墙；
+#   第一人称下坡时画面全是坡面，看不出倾角）
+#   HUD 会打印当时的 fov / roll / state / gait / step / speed —— 这是相机、步态
+#   与滑铲物理效果的视觉证据
 ```
 
 **为什么需要两套自检**：`determinism_test` 跑在 `AnalyticWorld`（纯数学碰撞替身）上，
@@ -146,8 +164,8 @@ core/                        ← 纯 C#，不引用 Godot（可脱离引擎单�
   F3.cs                       确定性三维向量（标量 float，不走 SIMD）
   GaitModel.cs                步态模型：身高 → 腿长 → 步频/步幅/腾空比 → 起伏与点头（v0.4 新增）
   MovementConfig.cs           全部参数 + 证据等级 + Apex/Legacy 双预设
-  MovementTypes.cs            状态/翻越档位/落地档位/输入/快照/世界接口（含 ISlipWorld 打滑探针）
-  ApexMovementCore.cs         求解器（状态机 + 加速/摩擦/跳跃/滑铲/三档障碍/攀爬+扒墙统一状态机/打滑/疲劳/Fallstun）
+  MovementTypes.cs            状态/翻越档位/落地档位/输入/快照/世界接口（ISlipWorld 打滑 / IFrictionWorld 地面材质）
+  ApexMovementCore.cs         求解器（状态机 + 加速/摩擦/跳跃/滑铲物理/三档障碍/攀爬+扒墙统一状态机/打滑/疲劳/Fallstun）
   ApexTickClock.cs            固定 tick 累加器（含死亡螺旋防护）
 
 camera/                      ← 纯 C#，相机效果（可脱离引擎单元测试）
@@ -155,7 +173,8 @@ camera/                      ← 纯 C#，相机效果（可脱离引擎单元�
   ApexCameraRig.cs            每帧算出 FOV / roll / pitch-yaw 偏移 / 眼位偏移
 
 godot_bridge/
-  GodotMovementWorld.cs       IMovementWorld + ISlipWorld 的 Godot 实现（CastMotion / GetRestInfo / Raycast / SampleSlip）
+  GodotMovementWorld.cs       IMovementWorld + ISlipWorld + IFrictionWorld 的 Godot 实现
+                              （CastMotion / GetRestInfo / QueryNormalAt / Raycast / SampleSlip / SampleFriction）
 
 player/
   ApexPlayer.cs               玩家节点：输入累积 + 固定 tick 驱动 + 相机应用 + HUD
@@ -170,13 +189,13 @@ testbed/
 tests/
   AnalyticWorld.cs            纯数学碰撞世界（测试替身，契约与 Godot 桥接层一致）
   DeterminismTest.cs          跨帧率确定性
-  FeatureTest.cs              36 项功能断言（纯数学）
+  FeatureTest.cs              43 项功能断言（纯数学，含 v0.4.1 滑铲物理与地面材质）
   CameraTest.cs               24 项相机断言（纯数学）
   ClimbTest.cs                47 项攀爬/三档障碍/tick/探针断言（纯数学）
   GaitTest.cs                 23 项步态模型推导断言（纯数学，v0.4 新增）
   SlipHangTest.cs             35 项打滑/扒墙断言（纯数学）
   determinism_test.tscn       自检 A 入口
-  integration_test.gd/.tscn   44 项真实物理集成断言（自检 B）
+  integration_test.gd/.tscn   49 项真实物理集成断言（自检 B，含下坡滑铲与 1.3m 卡死回归）
 ```
 
 ### 关键设计：帧率无关
@@ -188,6 +207,7 @@ tests/
 | 浮点 | 只用标量 `float` 加减乘除 + `MathF.Sqrt`，不用 SIMD 归约 |
 | 走路摇晃 | 步频相位在 **tick 内**推进（不在渲染帧），所以摇晃也帧率无关 |
 | 步态推导 | 每次 tick 由 `GaitModel.Evaluate(速度, 身高, 冲刺速度, 蹲伏量)` 求值写进快照，相机只读不拍 |
+| 滑铲物理 | `a = g·sinθ − μ·g·cosθ` 在 tick 内按 `dt` 积分；θ 由 `_groundNormal` 与 up 的夹角给出，μ 由 `IFrictionWorld` 按地面材质取 |
 | 卡顿 | 单帧最多追赶 4 tick，超出丢弃并计数（防死亡螺旋） |
 
 ### 与 ProjectA 的边界
@@ -199,7 +219,78 @@ tests/
 
 ## 6. 版本变化史
 
-### 6.1 v0.4 相比 v0.3（**自研手感，不再对标 Apex**）
+### 6.1 v0.4.1 相比 v0.4（滑铲物理化 + 悬空卡死修复）
+
+需求原话：「滑铲要按物理走（坡道越陡越快）」，以及一张「1.3 m 平台翻越时角色悬在半空、
+W 按着也上不去」的截图。
+
+**① 滑铲改成真实物理（`a = g·sinθ − μ·g·cosθ`）**
+
+v0.4 及之前：滑铲用一条与坡度无关的 `SlideFriction = 0.9` 做指数衰减，
+所以**下坡反而比平地减速更快**，与直觉完全相反。
+
+v0.4.1 的解法（`ApexMovementCore.StepSlide`）：
+
+```
+a = g·sinθ − μ·g·cosθ          θ = 地面法线与 up 的夹角
+v -= a·dt  （沿坡面切线方向）
+```
+
+- **平地**（θ=0）：`a = −μ·g`，匀减速 —— 与旧行为量级一致，手感不突变。
+- **下坡**（θ>0）：`g·sinθ` 把速度往回加。θ 越大加速越猛 —— 这就是「坡越陡越快」。
+- **临界角**：`tanθ = μ`，μ=0.45 ⇒ **24.23°**。比这更陡的坡上，滑铲**永远停不下来**
+  （只受 `SlideMaxSpeed = 10.16 m/s` 封顶）。
+- **上坡**（θ<0）：两项同向减速，滑铲很快被 `SlideMinSpeed = 2.5 m/s` 终止。
+
+**② μ 按地面材质取（`IFrictionWorld`）**
+
+需求原话：「保留这套公式，默认 0.45，摩擦系数改成可调的，便于游戏未来添加不同材质不同摩擦系数的地面」。
+
+```csharp
+public interface IFrictionWorld
+{
+    bool SampleFriction(F3 position, out float coefficient);   // 取不到就返回 false
+}
+```
+
+- 求解器每次滑铲 tick 先问世界「脚下这块地 μ 是多少」，问不到才用 `SlideFrictionCoefficient = 0.45`。
+- Godot 侧实现（`GodotMovementWorld.SampleFriction`）：沿 up 打一条 2 m 射线，
+  从命中节点起沿父链逐级找 meta `friction`（float，最多 4 层）。
+  **场地里加材质只是给 `StaticBody3D` 挂一个 meta，不用改求解器、不用重编译**。
+- 测试场地新增三条材质带（`friction_lanes`）：冰 `0.05` / 常规 `0.45`（不挂 meta） / 粗糙 `0.90`。
+
+**③ 不自动滑**（需求答复：「不自动，必须先蹲下滑铲」）
+滑铲入口仍是 `Shift` 冲刺 + `Ctrl`，`BeginSlide` 前置条件没动。物理化只改了"进入之后怎么减速"。
+
+**④ 修掉「1.3 m 平台翻越时悬空卡死」**
+
+根因不在翻越逻辑，在碰撞桥接层的法线兜底：
+
+```
+GodotMovementWorld.QueryNormalAt(contactPos, r, hh, fallback)
+  → GetRestInfo 在"扫掠停在接触面边缘"时打空（ProbeDepth 只有 2 cm，胶囊其实还没接触）
+  → return fallback.Normalized()          ← fallback = -delta.Normalized()
+```
+
+于是法线变成「运动方向的反向」这种伪法线。`MoveWithCollision` 拿它做
+`_vel = F3.ProjectOnPlane(_vel, normal)`，把**水平与竖直分量一起吃掉** ⇒
+人悬在半空、`vy` 一路掉到 −41 而位置纹丝不动（实测轨迹：
+`t=67 post vy=-0.000 vz=-0.000` 之后每 tick `post y` 恒定 1.8466）。
+
+修法（`GodotMovementWorld.QueryNormalAt`）：`GetRestInfo` 打空时不再直接返回伪法线，而是两级兜底：
+
+1. **原地把胶囊整体放大 `ProbeDepth`**（半径与两端半球同时外扩 2 cm，不位移）再查一次。
+   保证与"刚刚接触的那个面"产生 2 cm 的重叠，从而拿到真法线；不位移所以法线仍是接触点的法线。
+   典型场景（胶囊圆柱段贴着竖直墙面往上滑）走的就是这一级。
+2. 仍取不到则退回**"竖直墙"启发式**：把 `-fallback` 投影到水平面再归一化，只挡水平分量。
+   宁可当成墙（最差只是少走一点）也不要用 `-delta` 当法线（会把竖直速度一起抹掉、永久卡死）。
+
+**⑤ 顺带修掉的分段攀爬**：到顶脱手不再被"反作弊黑名单"永久拉黑，高墙可以分多段爬上去
+（根因与修法见 §7 的 ㉑）。
+
+---
+
+### 6.2 v0.4 相比 v0.3（**自研手感，不再对标 Apex**）
 
 需求原话：「从现在开始，不参照 apex 的移动系统，而是打造我们自己的移动系统」。
 所以这一节不是"把 Apex 抄得更准"，而是**按需求方口径重写手感规则**，Apex 数值只当参考。
@@ -354,7 +445,7 @@ v0.3 有两套独立状态机（`Climb` 靠 `TryAttachClimb/StepClimb/DetachClim
 | `_wallHangNeedRelease` | 更名 `_wallGrabNeedW`，语义从"必须离开墙一次"改成"必须按 W 才能再抓" |
 | 探针计数 | 删 `_wallHangProbeCount` / `_climbNonUpwardTimer`（合并后失去使用者），`WallHangProbeCount => _climbProbeCount` |
 
-### 6.2 v0.3 相比 v0.2
+### 6.3 v0.3 相比 v0.2
 
 **① 攀爬：从"被动吸入"改成"有条件的攀爬状态"（本轮主线）**
 
@@ -426,7 +517,7 @@ v0.3 早先的 `Hang` 只是"攀爬到顶后的过渡态"。本轮新增真正�
 攀爬常量与 wiki 对齐：attach offset **100 hu**、climb 空间 cutoff **147 hu**、end boost **28 hu**、
 attach 视角容差 **45.57°** = arccos(0.7)、可攀墙面角度 > **45.572°**。
 
-### 6.3 v0.2 相比 v0.1 的机制变化
+### 6.4 v0.2 相比 v0.1 的机制变化
 
 | 机制 | v0.1 | v0.2 |
 |---|---|---|
@@ -451,6 +542,87 @@ attach 视角容差 **45.57°** = arccos(0.7)、可攀墙面角度 > **45.572°*
 ---
 
 ## 7. 本轮修掉的真实 bug（根因均已实测确认）
+
+### v0.4.1 新增：⑱ ⑲ ⑳ ㉑
+
+#### ⑱ 翻越 1.3 m 平台时角色悬在半空、vy 掉到 −41 却纹丝不动
+
+**症状**（需求方截图 + 探针复现）：贴墙 → `Space` → 按住 `W`，人停在脚底 0.87 m 处，
+`state=Air`、`onGround=false`，`vy` 每 tick 更负（一路到 −41），但 `pos` 完全不变。
+
+**排除项**：向下射线命中地面在 y=0（距离 1.847）、前后上三向射线全 `none`、
+胶囊 `intersect_shape` 的 overlap count = **0** ⇒ 不是被几何体卡住，是**速度被吃光**。
+
+**根因**：`GodotMovementWorld.QueryNormalAt` 在"扫掠刚好停在接触面边缘"时
+`GetRestInfo` 打空（`ProbeDepth` 只有 2 cm，胶囊其实还没真正重叠），于是走了
+`return fallback.Normalized()` 兜底 —— 而 `fallback = -delta.Normalized()`，
+即"运动方向的反向"这种**伪法线**。`MoveWithCollision` 拿它做
+`_vel = F3.ProjectOnPlane(_vel, normal)`，把水平与竖直分量**一起**投影掉。
+
+逐帧插桩（`TRACE pre/post`）证据：
+
+```
+TRACE pre  t=67 y=1.8397 z=32.5936 vy=4.918 vz=0.254
+TRACE post t=67 y=1.8467 z=32.5940 vy=-0.000 vz=-0.000     ← vy 被吃掉
+TRACE pre  t=68 y=1.8467 z=32.5940 vy=-0.346 vz=0.254
+TRACE post t=68 y=1.8466 z=32.5940 vy=-0.345 vz=0.000      ← 位置不再变化
+```
+
+**修法**：两级兜底（见 §6.1 ④）—— ① 原地把胶囊半径与半球外扩 `ProbeDepth` 再查一次；
+② 仍失败则把 `-fallback` 投影到水平面当"竖直墙"法线，只挡水平分量。
+**宁可当成墙（最差少走一点），也不要把竖直速度抹掉（永久卡死）。**
+
+回归：`ClimbTest` 新增 1.3 m 平台用例；`integration_test` 新增「1.3 m 平台 W+Space 能站上去」。
+
+#### ⑲ 滑铲在坡上是"越陡越慢"，与直觉相反
+
+v0.4 及之前滑铲用一条与坡度无关的 `SlideFriction = 0.9` 做指数衰减，
+重力分量被 `_vel = F3.ProjectOnPlane(_vel, _groundNormal)` 直接投掉 ⇒
+**下坡反而比平地减速更快**。
+
+修法：改成真实物理 `a = g·sinθ − μ·g·cosθ`（先加下坡重力分量、再减库仑摩擦），
+θ 由 `_groundNormal` 与 up 的夹角给出。副产品：`tanθ = μ` 的临界角自动成立，
+μ=0.45 ⇒ 24.23°，比这更陡的坡上滑铲永远停不下来 —— 这是物理的必然，不是特判。
+
+回归：`FeatureTest` 新增「平地下坡上坡三种坡度下的滑铲加速度符号与量级」；
+`integration_test` 新增「15° 下坡滑铲 1 s 后比平地更快」。
+
+#### ⑳ `SampleFriction` 的 meta 回退链缺失，只有碰撞体挂 meta 时才生效
+
+需求要"不同材质不同摩擦系数"，第一版只在命中节点自己身上读 meta `friction`，
+但场地里通常把材质 meta 挂在 `StaticBody3D`（或再包一层的分组节点）上，
+而 `IntersectRay` 返回的 collider 可能是子级的 `CollisionShape3D` 宿主 ⇒ 读不到、静默用默认值。
+
+修法：`GodotMovementWorld.SampleFriction` 沿父链**逐级回退最多 4 层**
+（够覆盖"分组节点 → 刚体 → 碰撞体"，但不一路爬到场景根，避免误捡全局 meta），
+任一级取到就用。这样"给 `StaticBody3D` 挂一个 meta `friction`"就够了，
+不用给每个 `CollisionShape3D` 单独配。
+
+```gdscript
+# 场地里加一种材质只要这三行（testbed_builder.gd 的 _build_friction_lanes）
+var body := StaticBody3D.new()
+body.set_meta("friction", 0.05)      # 冰面
+add_child(body)                       # 挂个带 CollisionShape3D 的 MeshInstance3D 即可
+```
+
+#### ㉑ 高墙爬不上去：到顶脱手被"反作弊规则"永久拉黑
+
+**症状**：6 m 以上的墙，爬到 `ClimbAttachOffset`(2.54 m) 处脱手后**再也抓不回去**，
+人贴墙往下掉，按 W 也没反应 —— 高墙永远上不去。
+
+**根因**：`DetachWallGrabAtTop()` 里调了 `RememberClimbSurface()`。
+而重附着规则是"必须先掉回上次 attach 点以下才能再抓"（wiki L172-175，防刷攀爬），
+于是"到顶脱手"这个**不是玩家放弃**的动作，被当成"玩家主动脱手"记进了黑名单 ⇒
+后续每一次重抓都在 `here > _lastClimbAttachY` 处被拒。实测卡在 2.54 m。
+
+**修法**：`DetachWallGrabAtTop()` **故意不调** `RememberClimbSurface()`。
+理由写进代码注释：到顶脱手是"爬升距离到上限"，玩家还按着 W，应该能落回去继续爬；
+反作弊规则只针对玩家主动脱手（`S` / 跳 / 甩视角），那些走 `DetachWallGrab`。
+
+**回归**：`FeatureTest` 两条 —— 「单段爬升不超过 `ClimbAttachOffset`（不是瞬移到顶）」
+实测单段最大 2.91 m；「到顶脱手后能重新抓墙，分段爬到台面」实测 7.5 m 墙能登顶。
+
+---
 
 ### v0.4 新增：⑬ ⑭ ⑮ ⑯ ⑰
 
@@ -666,7 +838,7 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
 
 ## 8. 自检结果（实测）
 
-### A. 确定性 + 功能 + 相机 + 贴墙/三档/tick + 步态 + 打滑（`determinism_test.tscn`，165 项断言）
+### A. 确定性 + 功能 + 相机 + 贴墙/三档/tick + 步态 + 打滑（`determinism_test.tscn`，172 项断言）
 
 ```
 === 跨帧率确定性 ===
@@ -677,14 +849,18 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
   60fps vs 240fps: 一致（240 ticks，逐位相等）
   60fps vs 500fps: 一致（240 ticks，逐位相等）
 
-=== 功能验证（36 项，全 PASS）===
+=== 功能验证（43 项，全 PASS）===
   行走 4.407 / 冲刺 6.604 / 收枪冲刺 7.595 / 收枪行走 5.068（且不误判冲刺）/ 蹲行 2.032
   跳跃高度 1.487（期望 1.422 ± 0.10）、滞空 0.717s
-  空中无摩擦（40 tick 速度差 0.00E+000）、Air strafe 加速 +0.83 m/s
-  Slideboost 11.51 m/s、2s 冷却、Deadslide、连续滑铲跳 3 次、跳跃疲劳 0.462m
+  空中无摩擦（40 tick 速度差 0.00E+000）、Air strafe 加速 +0.82 m/s
+  Slideboost 11.53 m/s、2s 冷却、Deadslide、连续滑铲跳 3 次、跳跃疲劳 0.462m
   v0.4 三档：小障碍 0.8m 只撞停 / W+Space 翻越（Below）；墙 2.5m W+Space 抓墙 → 爬到台面；
-            6m 高墙按住 W 每秒爬 ~2m（是状态不是瞬移）；7.5m 超限爬不上去；
+            6m 高墙按住 W 每秒爬 ≈2m（是状态不是瞬移）；7.5m 超限爬不上去但能分段爬到顶；
             窗口翻越（W+Space 穿开口）
+  v0.4.1 滑铲物理（5 项）：15° 下坡 −3.65 m/s² / 30° 下坡 +2.29 m/s² / 临界角 24.23°（a=0.0000）；
+            合加速度随坡角单调上升（15° −3.65 < 20° −1.68 < 30° +2.29）；
+            默认 μ=0.45 减速 9.351 ≈ μg；冰面 μ=0.05 减速 1.039；粗糙 μ=0.90 减速 18.35（≈2×默认）；
+            三种材质 0.4s 后速度：冰面 9.71 > 默认 6.11 > 粗糙 2.20 m/s
   重力与 wiki 双数据自洽（g=20.7801 vs 20.7802）
 
 === 相机子系统（24 项，全 PASS）===
@@ -745,17 +921,20 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
 === APEX MOVEMENT SELFTEST PASS ===
 ```
 
-### B. 真实物理集成（`integration_test.tscn`，44 项断言）
+### B. 真实物理集成（`integration_test.tscn`，49 项断言）
 
 ```
   [PASS] 落地 / 脚底贴地 0.001 / 站立身高 1.950 / 相机高度 1.850 / 基础 FOV 90.000
   [PASS] 行走 4.407 / 平均位移 4.284 / 奔跑 6.604 / 收枪奔跑 7.595
   [PASS] 蹲下 0.975 / 脚底不下沉 / 相机高度 0.875 / 站起恢复
   [PASS] 跳跃高度 1.488 / 跳后重新落地
-  [PASS] 滑铲触发 9.28 m/s / Slideboost
-  [PASS] **滑铲不再有专属侧倾**（roll=0.70° ≤ SprintMaxRollDeg 1.5）
-  [PASS] **滑铲不再抬 FOV**（fov=92.32° ≤ 90+3 冲刺余量）
+  [PASS] 滑铲触发 9.22 m/s / Slideboost
+  [PASS] **滑铲不再有专属侧倾**（roll=0.72° ≤ SprintMaxRollDeg 1.5）
+  [PASS] **滑铲不再抬 FOV**（fov=92.35° ≤ 90+3 冲刺余量）
   [PASS] 连续滑铲跳 3 次
+  [PASS] **v0.4.1 滑铲物理**：30° 坡（tanθ>μ）实测 +1.98 m/s²（理论 +2.29）v 4.32→6.50
+  [PASS] **v0.4.1 滑铲物理**：15° 坡（tanθ<μ）实测 −3.53 m/s²（理论 −3.65）v 3.75→2.51
+  [PASS] 同样起滑速度下，陡坡越滑越快、缓坡被刹停
   [PASS] 小障碍 0.9m：W+Space 直接翻越（档位 Below，脚底最高 1.49）
   [PASS] 墙 1.7 / 3.0 / 6.0m：W+Space 抓墙 → 按住 W 爬到台面上（脚底最高 = 台面高）
   [PASS] 6m 攀爬（High 档）6.000
@@ -765,10 +944,12 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
   [PASS] 按住 W 持续上爬 0.75s → Δfeet 1.500（ClimbSpeed 2.0）
   [PASS] **松开 W 后转入扒墙（WallHang）并缓慢下滑**（feet 2.221 → 2.112）
   [PASS] 爬上 15° 斜坡 / 翻越 0.8m 矮墙（W+Space）/ 窗口翻越 + 穿过开口
+  [PASS] **v0.4.1 回归**：1.3m 平台 W+Space 能站上台面（feet=1.30，max_feet=1.49）
+  [PASS] **v0.4.1 回归**：1.3m 平台全程没有「空中速度很大却不动」的死锁（最长连续卡死帧数 = 0）
   [PASS] 低天花板下无法站起 / 离开后站起
   [PASS] FOV 可调 100°/90° / 视角踢可触发 / 掉出世界自动复活
 
-=== INTEGRATION PASS（44 项断言） ===
+=== INTEGRATION PASS（49 项断言） ===
 ```
 
 ---
@@ -791,6 +972,7 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
 | 滑铲长道 | x=-70, 80m 带 10m 刻度 | 滑铲距离 / 连续滑铲跳 |
 | 打滑体积 | x=80, z∈[-7,7]，半径 7m（`slip_volume` 组） | Slip 状态 / 方向限制 / 滑出回 Ground |
 | 落差平台 | x∈[20,44], z=55，高 3/6/10/22m | 落地四档 + Fallstun |
+| 地面材质带 | x=-20, z∈[62,74]，三条并排 4×12m（`friction_lanes`） | **v0.4.1 滑铲物理**：meta `friction` = 冰 0.05 / 常规 0.45 / 粗糙 0.90 |
 
 ---
 
@@ -800,10 +982,13 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
 |---|---|
 | `airAcceleration = 500` 的单位语义 | **未解**。若直接套 Source 公式会得到 12.7 m/s/tick（荒谬），说明 Apex 内部另做了缩放，该系数没读到。本插件把它归一化为可调的 `AirAccel`（B 级），并以 `AirWishSpeed = 60hu/s`（A 级）作为硬约束 |
 | 相机数值（FOV 增量 / 弹簧刚度 / bob 幅度 / 侧倾角） | **全部 C 级**。逆向只证明字段存在，数值在 BSS 里读不到；wiki 也没有这些数据 |
-| 走路摇晃 | Apex **没有** `cl_bob` 类 cvar（逆向负结论），摇晃来自第一人称动画。**v0.4 起改为自研步态模型**（`core/GaitModel.cs`）：腿长/Froude/走跑阈值来自人体测量学与步态文献，`WalkAbsorb`(0.16)、`RunCompression`(0.05)、`VerticalScale`(0.80)、`PitchPerCm`(0.28) 仍是拟合出来的手感系数（C 级），但**频率与身高、速度的耦合关系是有依据的**，且 23 项自检把每个常数夹在文献区间内 |
+| 走路摇晃 | Apex **没有** `cl_bob` 类 cvar（逆向负结论），摇晃来自第一人称动画。**v0.4 起改为自研步态模型**（`core/GaitModel.cs`）：腿长/Froude/走跑阈值来自人体测量学与步态文献，`WalkAbsorb`(0.16)、`RunCompression`(0.05)、`VerticalScale`(0.40)、`PitchPerCm`(0.40) 仍是拟合出来的手感系数（C 级；0.40/0.40 是照 m02752「垂直峰到峰 ~2 cm、点头 ≤0.8°」的舒适档定的），但**频率与身高、速度的耦合关系是有依据的**，且 23 项自检把每个常数夹在文献区间内 |
 | 台阶倾斜角 `tan(θ)=b/a` | **需求方口径（v0.4）**。`a` 默认取胶囊半径 0.4064 m（`StepTiltFootRadius` 可覆盖为真实脚宽），`θ` 在 `StepTiltTime`(0.12 s) 内线性衰减。速度**只旋转不改大小**，自检 ⑲ 用 `|v|` 守恒验证 |
 | `WallGrabMinGroundClearance = 0.5 m` | **自研手感参数**（C 级）。作用是区分"走下台沿"与"掉下墙"，0.5 m ≈ 半个身位；见 7 ⑬ |
 | 调试菜单各滑条范围（FOV 60–120 / 灵敏度 0.0005–0.0100 / 摇晃 0–2× / 冲击 0–2×） | **自研**（无逆向依据，纯 UX 选择）。摇晃与冲击倍率直接乘在步态模型输出与 `KickScale` 上，不改变模型本身 |
+| 滑铲摩擦系数 μ（默认 0.45） | **需求方口径（v0.4.1）**：用户指定默认 0.45，并要求按地面材质可调。实现为 `IFrictionWorld.SampleFriction` + 节点 meta `friction`（逐级回退最多 4 层），取不到才用默认值。μ=0.45 ⇒ 临界角 24.23°（`tanθ=μ`），是物理推论不是特判 |
+| 滑铲坡度项 `g·sinθ` | **物理公式**（非逆向、非手感拍数）。θ 由 `_groundNormal` 与 up 的夹角给出；自检用 15°/30° 两个坡度实测加速度与解析解比对（−3.53 vs −3.65、+1.98 vs +2.29 m/s²） |
+| `WallHangIdleFallTime = 1.2s` / `WallHangLateralFallTime = 6.0s` / `WallHangGripRestoreTime = 2.5s` | **自研手感参数**（C 级）。需求只说"一小段时间没有输入就掉落"，没给具体时长；三个时间常数分别对应"完全不动"/"只横移"/"按 W 回补" |
 | `cl_fovScale` → 显示 FOV 度数的换算公式 | **未读到**。本插件直接用水平 FOV 度数，`FovBase` 可调 |
 | Fallstun 精确公式 | wiki 自己标注"不确定"，本实现用二次曲线 |
 | 7 种 MANTLE 分类 | 二进制里有 **10 个** `ACT_VM_MANTLE_*`（4 主档 × 蹲姿变体 + IDLE + JUMPOFF）。本插件实现 4 档 + grab/pull 两段 + 可选挂边，**蹲姿变体未实现** |
@@ -818,8 +1003,8 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
 
 ## 11. 截图（逐张视觉复核过）
 
-**24 张 1920×1080**，全部位于 [`../../docs/reference/apex_movement/`](../../docs/reference/apex_movement/)。
-每张第一人称图的 HUD 会打印当时的 `fov / roll / state / vy / gait / step`，可对着数字核验。
+**30 张 1920×1080**，全部位于 [`../../docs/reference/apex_movement/`](../../docs/reference/apex_movement/)。
+每张第一人称图的 HUD 会打印当时的 `fov / roll / state / vy / gait / step / speed`，可对着数字核验。
 
 | 文件 | 内容 | 图上可核验的数字 |
 |---|---|---|
@@ -832,6 +1017,7 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
 | `shot_climb_wall.png` | 装墙（8m，带刻度线） | — |
 | `shot_slide_lane.png` | 滑铲长道（80m，10m 刻度） | — |
 | `shot_slip_zone.png` | 打滑场地（地面绿色圆盘 + 进出参考色条） | HUD `slip=no hang=no` |
+| `shot_friction_lanes.png` | **v0.4.1 地面材质带**（三条并排：冰 / 常规 / 粗糙） | — |
 | `shot_drop_plats.png` | 落差平台 3/6/10/22m | — |
 | `shot_player_fp.png` | 站立第一人称基准 | `fov=90.0°`、`roll=0.0°`、`bobPhase=0.00` |
 | `shot_player_fov110.png` | FOV 拉宽 | `fov=109.9°` |
@@ -845,6 +1031,11 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
 | `shot_player_climb_top.png` | 挂边上墙（站到台面） | `state=Ground`，控制台同时打印 `CLIMB TOP feet=3.00` |
 | `shot_player_slip.png` | 打滑态（站在圆盘里被推着走） | `state=Slip`、`speed=8.00`、`ground=True`、`slip=SLIP dir=0.00,1.00` |
 | `shot_player_wallhang.png` | **v0.4 扒墙**（第三人称看挂点与高度） | `state=WallHang`、`speed=0.00`、`vy=0.00`、`hang=WALLHANG grip=0.68 t=0.38s` |
+| `shot_player_slide_slope.png` | **v0.4.1 30° 下坡滑铲**（第三人称侧视看倾角） | `state=Slide`、`speed=5.26`、`vy=-3.04`、`fov=90.0°`、`roll=0.0°` |
+| `shot_player_slide_slope_fast.png` | 同一趟滑铲 1 秒后（**下坡越滑越快**） | `state=Slide`、`speed=6.29`（控制台 `v0=5.13 → v1=6.16`）、`roll=0.0°` |
+| `shot_player_friction_ice.png` | **冰面 μ=0.05** 滑铲（几乎不减速） | `state=Slide`、`speed=11.06`（0.5 s 内 11.58 → 11.08） |
+| `shot_player_friction_norm.png` | **默认 μ=0.45** 滑铲（明显减速） | `state=Slide`、`speed=6.07`（0.5 s 内 10.75 → 6.23） |
+| `shot_player_friction_rough.png` | **粗糙 μ=0.90** 滑铲（很快被刹停） | `state=Ground`、`speed=2.34`（0.5 s 内 9.81 → 2.34，已退出滑铲） |
 | `shot_debug_menu.png` | **v0.4 调试菜单**（按 `\` 打开） | 面板：FOV 90°/灵敏度/摇晃倍率/冲击倍率/两个开关；HUD `fov=90.0°` |
 | `shot_debug_menu_fov110.png` | 调试菜单里把 FOV 拖到 110° | 面板数值 `110°`、HUD `fov=110.0°`、画面视野明显变宽 |
 
@@ -860,6 +1051,15 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
 > （`ApexDebugMenu.SetFovSliderValue`），不是旁路改状态；两张图整画面差异 **47.68%**，
 > 证明改的确实是视野而不只是 HUD 文字。
 >
+> `shot_player_slide_slope*.png` 与 `shot_player_friction_*.png` 都是**第三人称**：
+> 第一人称下坡时画面全是坡面，看不出 30° 倾角；三条材质带都是平地，第一人称也分辨不出。
+> 这两组图共用同一个纯视觉胶囊替身（`_build_proxy()`）。
+>
+> 三条材质带的 HUD `speed=` 是「同一起滑条件下滑 0.5 秒后」的读数，可以直接横向对比：
+> **冰 11.06 > 默认 6.07 > 粗糙 2.34（已退出滑铲）**，正好是 μ 的单调反向。
+> 理论依据：平地 θ=0 ⇒ `a = −μg`，减速度与 μ 成正比（自检 A 里三条断言分别实测
+> 1.039 / 9.351 / 18.35 m/s²，比值 ≈ μ 比值）。
+>
 > 全部由 `testbed/shot_testbed.gd` 自动驱动按键与相机，不是摆拍。
 
 ---
@@ -869,8 +1069,10 @@ wiki 明写 Apex 可以"直接走过"约 30hu（0.762 m）的台阶，但**胶�
 - [`docs/wiki-reference.md`](docs/wiki-reference.md) —— **社区 wiki 数值换算表**（1hu=2.54cm、速度表、机制说明，每条带来源 URL）
 - [`docs/reverse-engineering-v0.2.md`](docs/reverse-engineering-v0.2.md) —— **本轮逆向报告**（相机/FOV/晃动/翻越/滑铲/攀爬字段的 A 级证据 + 复现命令）
 - [`docs/reverse-engineering.md`](docs/reverse-engineering.md) —— v0.1 逆向报告（PE 布局 / cvar 注册点 / 7 种 MANTLE 枚举）
-- [`docs/selftest/v0.4-determinism.txt`](docs/selftest/v0.4-determinism.txt) —— **v0.4 自检 A 实测原始输出**（165 项，逐条 PASS）
-- [`docs/selftest/v0.4-integration.txt`](docs/selftest/v0.4-integration.txt) —— **v0.4 自检 B 实测原始输出**（44 项，逐条 PASS）
+- [`docs/selftest/v0.4.1-determinism.txt`](docs/selftest/v0.4.1-determinism.txt) —— **v0.4.1 自检 A 实测原始输出**（172 项，逐条 PASS）
+- [`docs/selftest/v0.4.1-integration.txt`](docs/selftest/v0.4.1-integration.txt) —— **v0.4.1 自检 B 实测原始输出**（49 项，逐条 PASS）
+- [`docs/selftest/v0.4-determinism.txt`](docs/selftest/v0.4-determinism.txt) —— v0.4 自检 A 原始输出（165 项）
+- [`docs/selftest/v0.4-integration.txt`](docs/selftest/v0.4-integration.txt) —— v0.4 自检 B 原始输出（44 项）
 - [`docs/selftest/v0.3-determinism.txt`](docs/selftest/v0.3-determinism.txt) —— v0.3 自检 A 原始输出（122 项）
 - [`docs/selftest/v0.3-integration.txt`](docs/selftest/v0.3-integration.txt) —— v0.3 自检 B 原始输出（44 项）
 - `../../docs/design/PLUGIN-CONVENTION.md` —— 插件化开发约定

@@ -49,6 +49,27 @@ public static class FeatureTest
 
     private static void Settle(ApexMovementCore core, int ticks = 30) => Run(core, ticks, In());
 
+    /// <summary>
+    /// 量一次滑铲减速度（m/s²，正值 = 变慢）。
+    /// <paramref name="materialMu"/> 为 null 时世界不提供材质（用配置默认 μ）。
+    /// </summary>
+    private static float MeasureSlideDecel(float? materialMu, out float speed0, out float speed1)
+    {
+        var world = new AnalyticWorld(0f) { SurfaceFriction = materialMu };
+        var core = MakeCore(world);
+        core.Reset(new F3(0f, 1f, 0f));
+        Settle(core, 10);
+        Run(core, 90, In(mz: 1f, sprint: true));       // 冲刺到 6.60
+
+        // 起滑（蹲下 + 有速度），前 3 tick 让 slideboost 结算完再取基准
+        var slideIn = In(mz: 1f, sprint: true, crouch: true);
+        Run(core, 3, slideIn);
+        speed0 = core.HorizontalSpeed;
+        Run(core, 24, slideIn);                        // 0.4 s
+        speed1 = core.HorizontalSpeed;
+        return (speed0 - speed1) / 0.4f;
+    }
+
     public static (bool Pass, string Report) Run()
     {
         var sb = new StringBuilder();
@@ -508,7 +529,12 @@ public static class FeatureTest
                   $"抓到={grabbed} Δy={climbed:F2} m/s，state={core.State}");
         }
 
-        // ═════════ 25. 超过攀爬上限（7.5m > MantleMaxHeight 6.93m）：爬不到顶 ═════════
+        // ═════════ 25. 超高墙（7.5m）：分段攀爬能上去，但单段不许超限 ═════════
+        //
+        // v0.4.1 起语义变了：到顶脱手（爬升距离到 ClimbAttachOffset 上限）后**允许
+        // 重新抓墙继续爬**，于是任意高度的墙都能分段爬上去。这里同时验两件事：
+        //   ① 单段爬升不超过 ClimbAttachOffset（不是瞬移到顶）
+        //   ② 分段累积最终能站上台面
         {
             var world = new AnalyticWorld(0f);
             world.AddBox(new F3(-5f, 0f, -3.5f), new F3(5f, 7.5f, -3.0f));
@@ -518,14 +544,24 @@ public static class FeatureTest
 
             Run(core, 70, In(mz: 1f));
             bool topped = false;
+            float segBase = 0f;
+            float maxSegGain = 0f;
+            bool wasClimbing = false;
             for (int i = 0; i < 900; i++)
             {
                 core.Step(In(mz: 1f, jump: i == 0), core.Config.FixedDelta);
+                bool climbing = core.State is MovementState.Climb or MovementState.WallHang;
+                if (climbing && !wasClimbing) segBase = core.FeetPosition.Y;
+                if (climbing) maxSegGain = MathF.Max(maxSegGain, core.FeetPosition.Y - segBase);
+                wasClimbing = climbing;
                 if (core.OnGround && core.FeetPosition.Y > 7.0f) { topped = true; break; }
             }
-            Check("超限拒绝（7.5m > 6.93m 上限）：爬不上去，会脱手掉下来",
-                  !topped,
-                  $"登顶={topped}，脚底={core.FeetPosition.Y:F2}（上限 {cfg0.MantleMaxHeight:F2}m）");
+            Check("超高墙 7.5m：单段爬升不超过 ClimbAttachOffset（不是瞬移到顶）",
+                  maxSegGain <= cfg0.ClimbAttachOffset + 0.5f,
+                  $"单段最大爬升={maxSegGain:F2}m（ClimbAttachOffset={cfg0.ClimbAttachOffset:F2}m）");
+            Check("超高墙 7.5m：到顶脱手后能重新抓墙，分段爬到台面",
+                  topped,
+                  $"登顶={topped}，脚底={core.FeetPosition.Y:F2}（墙高 7.5m）");
         }
 
         // ═════════ 26. 窗口翻越（W + Space 穿开口）═════════
@@ -631,6 +667,55 @@ public static class FeatureTest
             float gDerived = 8f * (56f * MovementConfig.HuToMeter) / (0.74f * 0.74f);
             Check("重力与 wiki 双数据自洽", MathF.Abs(gDerived - cfg0.Gravity) < 0.02f,
                   $"由 56hu/0.74s 反解 g={gDerived:F4}，配置 {cfg0.Gravity:F4}");
+        }
+
+        // ═════════ 33. 滑铲物理化：a = g·sinθ − μ·g·cosθ ═════════
+        //
+        // v0.4.1：滑铲不再用"指数式摩擦"，改成真实的库仑摩擦 + 坡度重力。
+        //   · 平地 θ=0  ⇒ a = −μg（匀减速）
+        //   · 坡越陡 sinθ 越大 ⇒ 下坡越滑越快
+        //   · 临界角 tanθ = μ：超过它重力压不住，一路加速
+        {
+            float g = cfg0.Gravity;
+            float mu0 = cfg0.SlideFrictionCoefficient;
+            float a15 = ApexMovementCore.SlideSlopeAcceleration(g, 15f * MathF.PI / 180f, mu0);
+            float a30 = ApexMovementCore.SlideSlopeAcceleration(g, 30f * MathF.PI / 180f, mu0);
+            float critRad = MathF.Atan(mu0);
+            float aCrit = ApexMovementCore.SlideSlopeAcceleration(g, critRad, mu0);
+            float critDeg = critRad * 180f / MathF.PI;
+
+            Check("滑铲坡度公式：15° 减速 / 30° 加速 / 临界角 tanθ=μ",
+                  a15 < -0.5f && a30 > 0.5f && MathF.Abs(aCrit) < 0.01f &&
+                  MathF.Abs(critDeg - 24.23f) < 0.3f,
+                  $"15°→{a15:F2} m/s²，30°→{a30:F2} m/s²，临界角 {critDeg:F2}°（a={aCrit:F4}）");
+
+            float a20 = ApexMovementCore.SlideSlopeAcceleration(g, 20f * MathF.PI / 180f, mu0);
+            Check("滑铲合加速度随坡角单调上升（越陡越不容易停）",
+                  a15 < a20 && a20 < a30,
+                  $"15°→{a15:F2} < 20°→{a20:F2} < 30°→{a30:F2} m/s²");
+        }
+
+        // ═════════ 34. 地面材质摩擦系数可调（IFrictionWorld）═════════
+        {
+            float g = cfg0.Gravity;
+            float mu0 = cfg0.SlideFrictionCoefficient;
+
+            float decelDefault = MeasureSlideDecel(null, out float d0, out float d1);
+            Near("滑铲默认 μ=0.45：减速度 ≈ μg（匀减速）",
+                 decelDefault, mu0 * g, mu0 * g * 0.25f);
+
+            float decelIce = MeasureSlideDecel(0.05f, out float i0, out float i1);
+            Near("冰面 μ=0.05：几乎不减速（减速度 ≈ 0.05g）",
+                 decelIce, 0.05f * g, 0.05f * g * 0.5f + 0.4f);
+
+            float decelRough = MeasureSlideDecel(0.90f, out float r0, out float r1);
+            Check("粗糙地面 μ=0.90：减速明显更快（≈ 2 倍默认）",
+                  decelRough > decelDefault * 1.5f,
+                  $"μ=0.90 实测 {decelRough:F2} m/s² vs 默认 {decelDefault:F2} m/s²");
+
+            Check("三种材质下滑行距离排序：冰面 > 默认 > 粗糙",
+                  i1 > d1 && d1 > r1,
+                  $"0.4s 后速度：冰面 {i1:F2} > 默认 {d1:F2} > 粗糙 {r1:F2} m/s");
         }
 
         sb.AppendLine();
