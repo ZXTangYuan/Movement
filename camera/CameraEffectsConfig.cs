@@ -9,7 +9,7 @@ public enum FovInterpSpace
     Linear = 0,
     /// <summary>
     /// **tan(半角) 空间插值**。Apex 二进制里 FOV 以 `.fTanHalfFOV` 字段存储
-    /// （见 docs/reverse-engineering-v0.2.md §3.1），说明投影运算在 tan 空间进行。
+    /// （见 docs/REVERSE-ENGINEERING.md §2.3.1），说明投影运算在 tan 空间进行。
     /// 在这种模式下，FOV 变化的"视觉速度"才是均匀的。
     /// </summary>
     Tangent = 1,
@@ -23,7 +23,7 @@ public enum FovInterpSpace
 /// 数值全部读不到（在 BSS 里）。因此这里每个字段都标 **C**（设计选择 / 手感校准），
 /// 但字段命名与分组**严格对应逆向观测到的字段**，方便将来拿到真值后逐个替换。
 ///
-/// 对应的逆向字段见 docs/reverse-engineering-v0.2.md §3–§4：
+/// 对应的逆向字段见 docs/REVERSE-ENGINEERING.md §2.3–§2.4：
 ///   · `cl_fovScale` / `setting.cl_fovScale` / `.fTanHalfFOV` / `USE_FOV_SCALING`
 ///   · `viewkick_spring` / `_cooldown_holdtime` / `_cooldown_fadetime` / `_velocityScalePerShot`
 ///   · `viewkickFallDistMin` / `viewkickFallDistMax` / `viewkickFallDistMaxScale`
@@ -139,8 +139,45 @@ public sealed class CameraEffectsConfig
     /// <summary>[C] 侧倾方向（+1 右倾 / −1 左倾）。</summary>
     public float SlideRollSide = 1f;
 
-    /// <summary>[C] 冲刺最大侧倾角 (deg)（`sprinttiltMaxRoll`）。</summary>
+    // ── v0.4.4：滚转（绕视线轴）总开关 ──────────────────────────
+    //
+    // 需求方（m00818）原话：「奔跑状态下镜头会以当前面向的射线为轴，逆时针转
+    // 一点点角度（可能只有 1.5° 左右），我希望**不要转角度**」。
+    //
+    // 那个 1.5° 正是 SprintMaxRollDeg（冲刺侧倾）。滚转是"画面绕视线轴转，
+    // 地平线跟着歪"；而"视点在垂直于视线的截面上画 ∞"是**另一种运动**：
+    // 视线指向（或视点位置）在动，地平线保持水平。需求要的是后者，
+    // 所以把滚转做成开关、默认关，调试菜单里可 A/B。
+    /// <summary>
+    /// 跑步侧倾（绕前向轴的滚转）开关。默认 **false**（v0.4.4 起按需求关掉）。
+    /// 打开即恢复 v0.4.3 的 <see cref="SprintMaxRollDeg"/> 行为。
+    /// </summary>
+    public bool SprintRollEnabled = false;
+
+    /// <summary>[C] 冲刺最大侧倾角 (deg)（`sprinttiltMaxRoll`）。受 <see cref="SprintRollEnabled"/> 控制。</summary>
     public float SprintMaxRollDeg = 1.5f;
+
+    /// <summary>
+    /// 走路摇晃的**滚转**通道（bobRoll）开关。默认 **false**（同上，按需求关掉）。
+    /// </summary>
+    public bool BobRollEnabled = false;
+
+    /// <summary>
+    /// ∞ 的载体：**只有角度模式**（v0.5 定稿，需求 m01070）。
+    ///
+    /// 眼位不动，**视线方向**在垂直于前向的截面上画 ∞。
+    /// 需求方 m01070：「镜头方面就用新的 ∞ 载体开关的这个方式，我很满意，
+    /// 把这个调成默认的镜头晃动效果吧，原先的那种可以删了」——
+    /// 所以 v0.4.3 的"移动眼位"平移模式**已整体删除**，没有开关、没有分支。
+    /// 屏幕中心点始终对应当前视线方向，∞ 是"看的方向在画"。
+    /// </summary>
+    public float BobAngularRefDistance = 1.0f;   // 位移(米) → 角度(弧度) 的参考距离
+
+    /// <summary>
+    /// <see cref="BobAngularRefDistance"/> 的语义：把多少米的横向位移看作
+    /// "在 ref 米处的视线偏移"，即 b 米 ⇔ atan(b/ref) 弧度。
+    /// 默认 1.0：横向半幅 8 mm ⇒ atan(0.008/1) ≈ 0.459° 的 yaw 摆幅。
+    /// </summary>
 
     /// <summary>[C] 冲刺侧倾的跟随速度 (deg/s)。</summary>
     public float SprintRollSpeed = 12f;
@@ -186,9 +223,16 @@ public sealed class CameraEffectsConfig
     /// <summary>
     /// [C] **步态摇晃倍率**（v0.4 新增，这是唯一仍然生效的摇晃幅度旋钮）。
     ///
-    /// 1.0 = 步态模型推导出的物理值（舒适档：垂直 ~2 cm 半幅、点头 ≤0.8°）；
-    /// 0.0 = 完全关掉走路摇晃；2.0 = 翻倍（用于对比/调试）。
-    /// 运行时可通过调试菜单（`\` 键）实时拖动。
+    /// 1.0 = 步态模型推导出的物理值；0.0 = 完全关掉走路摇晃；2.0 = 翻倍（对比/调试）。
+    /// 运行时可通过调试菜单（`\` 键）实时拖动，滑条范围 0–2、步进 0.05。
+    ///
+    /// 它线性乘在 <c>BuildOutput</c> 的 bob 幅度上（垂直 / 侧向 / 点头 / 侧倾四个通道同乘），
+    /// 由 <c>tests/GaitTest.cs</c> 的 ㉕ 端到端实测确认（k=0.5 恰好得到 k=1 的一半）。
+    ///
+    /// v0.4.2 的物理值（1.0×，站立身高 1.95 m，H = 1.95 m）实测：
+    ///   冲刺 6.604 m/s   垂直峰到峰 12.4 mm、点头 0.25°、侧向 16.0 mm、相位 3.00 Hz；
+    ///   收枪 7.595 m/s   垂直峰到峰 12.1 mm、点头 0.24°、侧向 17.7 mm、相位 3.00 Hz。
+    /// 舒适档判据（v0.4.2 收紧后）：**垂直峰到峰 ≤ 1.5 cm、点头峰到峰 ≤ 0.30°**。
     /// </summary>
     public float BobGaitScale = 1.0f;
 
@@ -211,11 +255,39 @@ public sealed class CameraEffectsConfig
     /// <summary>[C] 摇晃的俯仰幅度 (deg)。**v0.4 起不再生效**。v0.3：0.35 → 0.24。</summary>
     public float BobPitchDeg = 0.24f;
 
-    /// <summary>[C] 摇晃的滚转幅度 (deg)。v0.3：0.30 → 0.20。</summary>
+    /// <summary>[C] 摇晃的滚转幅度 (deg)。**v0.4 起不再生效**。v0.3：0.30 → 0.20。</summary>
     public float BobRollDeg = 0.20f;
 
     /// <summary>[C] 摇晃开始生效的最低速度 (m/s)。</summary>
     public float BobMinSpeed = 0.6f;
+
+    /// <summary>
+    /// [C] **竖直起伏的相位偏移 (deg)**（v0.4.3 新增，0 = ∞ 默认）。
+    ///
+    /// 波形是 <c>sin(2φ + offset)</c>，φ 为步幅相位。
+    ///   · **0°（默认）** = 屏幕平面轨迹是横放的 **∞**（需求方要的形状，
+    ///     物理图像是头部相对质心有约 1/4 周期滞后）；
+    ///   · **90°** = 退化成**抛物线**（y 是 x 的单值函数，两侧高、中间低，
+    ///     = 纯质心口径），没有中心交叉。留作对比用。
+    /// </summary>
+    public float BobVerticalPhaseDeg = 0f;
+
+    /// <summary>
+    /// [C] **点头相对竖直起伏的相位偏移 (deg)**（v0.4.3 新增，0 = 同相）。
+    ///
+    /// 波形是 <c>sin(2φ + offset)</c>，φ 为步幅相位。0° = 身体最低点时低头最多；
+    /// 90° = 在升降速度最大时点头最多（"滞后感"）。默认 0 偏"扎实"，
+    /// 想要头部跟不上的柔软感可以往 30~60 调。
+    /// </summary>
+    public float BobPitchPhaseDeg = 0f;
+
+    /// <summary>
+    /// [C] **侧倾相对左右摆动的相位偏移 (deg)**（v0.4.3 新增，0 = 同相）。
+    ///
+    /// 波形是 <c>sin(φ + offset)</c>。0° = 身体摆到最外侧时倾斜最多（重心侧压），
+    /// 90° = 摆到正中时倾斜最多（会明显"晕"）。默认 0。
+    /// </summary>
+    public float BobRollPhaseDeg = 0f;
 
     // ═══════════════════════════ 眼位偏移 ═══════════════════════════
 
@@ -237,6 +309,20 @@ public sealed class CameraEffectsConfig
         if (SpringStiffness <= 0f) throw new ArgumentOutOfRangeException(nameof(SpringStiffness));
         if (SpringDamping < 0f) throw new ArgumentOutOfRangeException(nameof(SpringDamping));
         if (KickScale < 0f) throw new ArgumentOutOfRangeException(nameof(KickScale));
+        // 步态摇晃倍率：负值会让摇晃反相（相位语义错乱），必须是 0 或正数。
+        // 上限不在这里夹 —— 调试菜单的滑条给到 2×，但配置层允许更大值做对比实验。
+        if (!float.IsFinite(BobGaitScale) || BobGaitScale < 0f)
+            throw new ArgumentOutOfRangeException(nameof(BobGaitScale), "BobGaitScale 必须是有限非负数");
+        // 波形相位偏移：任何有限角度都合法（360° = 无偏移），只要不是 NaN/∞。
+        // 故意**不夹到 ±180** —— 调参时用 720 这种值更方便表达"转两整圈"。
+        if (!float.IsFinite(BobVerticalPhaseDeg))
+            throw new ArgumentOutOfRangeException(nameof(BobVerticalPhaseDeg), "BobVerticalPhaseDeg 必须是有限数");
+        if (!float.IsFinite(BobPitchPhaseDeg))
+            throw new ArgumentOutOfRangeException(nameof(BobPitchPhaseDeg), "BobPitchPhaseDeg 必须是有限数");
+        if (!float.IsFinite(BobRollPhaseDeg))
+            throw new ArgumentOutOfRangeException(nameof(BobRollPhaseDeg), "BobRollPhaseDeg 必须是有限数");
+        if (!(BobAngularRefDistance > 1e-3f) || !float.IsFinite(BobAngularRefDistance))
+            throw new ArgumentOutOfRangeException(nameof(BobAngularRefDistance), "BobAngularRefDistance 必须 > 0");
         if (LandingPitchImpulse.Length < 5 || LandingYawImpulse.Length < 5 || LandingRollImpulse.Length < 5)
             throw new ArgumentException("落地冲量数组必须至少 5 项（对应 LandingTier 0..4）");
         if (SlideRollPlayerSpeedRef <= 0f)

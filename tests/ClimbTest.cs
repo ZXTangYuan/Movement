@@ -153,9 +153,14 @@ public static class ClimbTest
                   grabbed,
                   $"state={core.State} feet={core.FeetPosition.Y:F2}（起跳前 {startFeet:F2}）");
 
-            Check("② 抓住后脚底已经离地上升",
+            // ★ v0.5 口径修正（用户 m01300 BUG 2「只要跳了就攀爬」）：
+            //   起跳那一下现在**立刻就能抓住**（脚底 0.06 m 也行），
+            //   所以"抓住那一刻已经升高 0.2 m"不再成立。
+            //   这条断言的本意是"抓住之后确实在往上爬"，改成抓稳后按住 W 再看爬升。
+            if (grabbed) Run(core, 30, In(mz: 1f));
+            Check("② 抓住后按住 W 确实在往上爬（脚底 +0.2 m 以上）",
                   grabbed && core.FeetPosition.Y > startFeet + 0.2f,
-                  $"feet={core.FeetPosition.Y:F2}（起跳前 {startFeet:F2}）");
+                  $"feet={core.FeetPosition.Y:F2}（起跳前 {startFeet:F2}，抓稳后爬 30 tick）");
         }
 
         // 3. 空中面向墙、正在**上升**、不按 W —— 不许抓（避免"向上跳经过墙面被吸住"）
@@ -344,9 +349,14 @@ public static class ClimbTest
             Check("⑬ 按 S → 立刻取消扒墙，回 Air",
                   detached,
                   $"state={core.State}");
-            Check("⑬ 松手后垂直下落（12 tick 掉 >0.3m，且有向下速度）",
-                  fell > 0.3f && core.VerticalSpeed < -2f,
-                  $"Δy=-{fell:F2}m vy={core.VerticalSpeed:F2}");
+            // v0.5：重力换地球值 9.8 后，12 tick（0.2 s）自由落体只有 ½·g·t² = 0.196 m，
+            // 原来的 >0.3 m 是 Apex 重力（20.78）下的数。改成断言**物理闭式解**，
+            // 这样以后改重力/改 tick 数测试都不会误报：
+            float tFall = 12f * core.Config.FixedDelta;
+            float expectFall = 0.5f * core.Config.Gravity * tFall * tFall;
+            Check("⑬ 松手后垂直下落（位移 = ½·g·t²，且有向下速度）",
+                  MathF.Abs(fell - expectFall) < 0.06f && core.VerticalSpeed < -1.5f,
+                  $"Δy=-{fell:F2}m（½·g·t²={expectFall:F2}）vy={core.VerticalSpeed:F2}");
         }
 
         // 14. 下落过程中按 W → 重新扒住墙
@@ -486,6 +496,7 @@ public static class ClimbTest
             float minTotal = float.MaxValue;
             float maxTotal = 0f;
             float peakFeet = core.FeetPosition.Y;
+            float minHspd = float.MaxValue;
 
             for (int i = 0; i < 90; i++)
             {
@@ -496,6 +507,7 @@ public static class ClimbTest
                 float total = core.Velocity.Length();
                 minTotal = MathF.Min(minTotal, total);
                 maxTotal = MathF.Max(maxTotal, total);
+                minHspd = MathF.Min(minHspd, core.HorizontalSpeed);
                 peakFeet = MathF.Max(peakFeet, core.FeetPosition.Y);
             }
 
@@ -508,10 +520,22 @@ public static class ClimbTest
             Check("⑲ 0.20m 台阶：上台阶瞬间速度出现斜向上分量（只改方向）",
                   maxUpVel > 0.3f,
                   $"最大向上速度 {maxUpVel:F2} m/s（tan θ = b/a = 0.20/{cfg0.CapsuleRadius:F2} → θ≈26°）");
-            Check("⑲ 0.20m 台阶：速度**大小**基本不变（无衰减）",
-                  MathF.Abs(maxTotal - speedBefore) < 0.6f &&
-                  minTotal > speedBefore * 0.75f,
-                  $"上台阶前 {speedBefore:F2} m/s，途中 |v|∈[{minTotal:F2}, {maxTotal:F2}]");
+            Check("⑲ 0.20m 台阶：速度**大小**不衰减（|v| 只涨不跌）",
+                  minTotal > speedBefore * 0.995f &&
+                  maxTotal < speedBefore * 1.20f,
+                  $"上台阶前 {speedBefore:F2} m/s，途中 |v|∈[{minTotal:F2}, {maxTotal:F2}]" +
+                  $"（上界 = |v_h|·√(1+sin²θ) = {speedBefore * 1.111f:F2}）");
+
+            // ★ v0.5.3 新增（需求 m02395 第 3 点）：水平速度**一点都不能丢**。
+            //
+            //   旧实现 `_vel = dir*(h*cos θ) + up*(h*sin θ)` 在竖直分量被贴地吸附
+            //   吃掉之后，净效果就是水平速度乘 cos θ 且永不恢复 ——
+            //   走 4.407→3.866（87.7%）、跑 6.604→4.543（68.8%）。
+            //   这条断言就是钉住那个回归。
+            Check("⑲ 0.20m 台阶：水平速度**零损失**（不再被 cos θ 吃掉）",
+                  minHspd > speedBefore * 0.99f,
+                  $"上台阶前 {speedBefore:F2} m/s，途中最低 {minHspd:F2} m/s" +
+                  $"（{minHspd / speedBefore * 100f:F1}%）");
         }
 
         // 20. ≤1m 小障碍：W 撞上去被挡住（不自动翻），W+Space 才翻越
@@ -713,6 +737,78 @@ public static class ClimbTest
                   $"实测 {probes} 次（v0.3 是 30 次；v0.4 改为只在 W+Space 时显式触发）");
         }
 
+        // 28. v0.5（用户 m01300 BUG 2）：疲劳跳 / 低重力跳也能抓墙 ──────────
+        //
+        //   需求：「疲劳跳期间无法攀爬……我希望改成只要跳了就攀爬」
+        //   旧实现：WallGrabMinGroundClearance = 0.30，即"脚底离地不足 30cm 不抓"。
+        //   跳跃疲劳把高度压到 30%（0.75×0.30 ≈ 0.225 m）⇒ 永远够不到 0.30，
+        //   于是连续跳期间完全抓不到墙。超重力星球（跳得更低）会整块失效。
+        //   现在判据改成"是不是就站在地上"（2 cm），跳跃高度不再参与。
+        {
+            // 28a 疲劳跳（约 0.23 m）贴墙必须能抓
+            {
+                var world = WallWorld(wallTop: 6f);
+                var core = MakeCore(world);
+                // 站在离墙 1.35 m（略超 reach 1.306）：第一次原地跳不会抓到墙
+                core.Reset(new F3(0f, 1.0f, -0.65f));
+                Settle(core, 30);
+
+                core.Step(In(jump: true), core.Config.FixedDelta);
+                Run(core, 120, In());                      // 第一次跳 → 落地
+
+                // 落地后立刻再跳（0.15 s 内 ⇒ 疲劳跳）并按 W 靠近墙
+                core.Step(In(mz: 1f, jump: true), core.Config.FixedDelta);
+                float maxFeet = core.FeetPosition.Y;
+                bool grabbed = false;
+                for (int i = 0; i < 120; i++)
+                {
+                    core.Step(In(mz: 1f), core.Config.FixedDelta);
+                    maxFeet = MathF.Max(maxFeet, core.FeetPosition.Y);
+                    if (core.State is MovementState.Climb or MovementState.WallHang) { grabbed = true; break; }
+                    if (core.OnGround && i > 5) break;
+                }
+                Check("㉘a 疲劳跳（约 0.23m，够不到旧 0.30m 门限）也能抓墙",
+                      grabbed,
+                      $"state={core.State} 脚底最高 {maxFeet:F3} m（旧门限 0.30 m，新门限 " +
+                      $"{core.Config.WallGrabMinGroundClearance:F2} m）");
+            }
+
+            // 28b 超重力星球：跳高只有 0.10 m 也要能抓（未来星球不失效）
+            {
+                var cfg = MovementConfig.Apex();
+                cfg.JumpHeight = 0.10f;
+                cfg.Validate();
+                var world = WallWorld(wallTop: 6f);
+                var core = MakeCore(world, cfg);
+                core.Reset(new F3(0f, 1.0f, -0.65f));
+                Settle(core, 30);
+                core.Step(In(mz: 1f, jump: true), core.Config.FixedDelta);
+                float maxFeet = core.FeetPosition.Y;
+                bool grabbed = false;
+                for (int i = 0; i < 120; i++)
+                {
+                    core.Step(In(mz: 1f), core.Config.FixedDelta);
+                    maxFeet = MathF.Max(maxFeet, core.FeetPosition.Y);
+                    if (core.State is MovementState.Climb or MovementState.WallHang) { grabbed = true; break; }
+                    if (core.OnGround && i > 5) break;
+                }
+                Check("㉘b 超重力星球（JumpHeight 0.10m）跳起来也能抓墙",
+                      grabbed,
+                      $"state={core.State} 脚底最高 {maxFeet:F3} m");
+            }
+
+            // 28c 站在墙根（脚底贴地）仍然不抓 —— 这是 2 cm 门限要守住的东西
+            {
+                var world = WallWorld(wallTop: 6f);
+                var core = MakeCore(world);
+                core.Reset(new F3(0f, 1.0f, -1.0f));
+                Settle(core, 30);
+                Run(core, 60, In(mz: 1f));                 // 贴墙按 W 走，不起跳
+                Check("㉘c 站在墙根按 W（脚底贴地）仍然不会挂墙",
+                      core.State != MovementState.WallHang && core.State != MovementState.Climb,
+                      $"state={core.State}（脚底 {core.FeetPosition.Y:F3} m）");
+            }
+        }
         sb.AppendLine();
         sb.AppendLine($"  合计 {checks} 项断言，失败 {failures} 项");
         return (failures == 0, sb.ToString());

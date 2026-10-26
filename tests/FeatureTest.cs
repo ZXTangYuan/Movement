@@ -59,14 +59,20 @@ public static class FeatureTest
         var core = MakeCore(world);
         core.Reset(new F3(0f, 1f, 0f));
         Settle(core, 10);
-        Run(core, 90, In(mz: 1f, sprint: true));       // 冲刺到 6.60
 
-        // 起滑（蹲下 + 有速度），前 3 tick 让 slideboost 结算完再取基准
-        var slideIn = In(mz: 1f, sprint: true, crouch: true);
-        Run(core, 3, slideIn);
-        speed0 = core.HorizontalSpeed;
+        // ★ v0.5.2：**直接注入速度**起滑，不再"先冲刺到 6.6"。
+        //   原因（摩擦重做带来的正确副作用）：冰面 μ=0.05 时最大静摩擦只有
+        //   0.096·g ≈ 0.94 m/s²，玩家**根本加速不到滑铲门槛 5.0 m/s** ——
+        //   这正是需求要的"冰面难以行走、原地打滑"。所以用冲刺助跑来造冰面滑铲
+        //   已经不可能了，改成直接给速度。
+        core.SetVelocity(new F3(0f, 0f, -9f));
+
+        // 按住蹲（不按 W）⇒ 地面状态机按 GroundPlaneSpeed ≥ 5.0 起滑
+        var slideIn = In(crouch: true);
+        Run(core, 3, slideIn);                         // 让 slideboost 结算完
+        speed0 = core.GroundPlaneSpeed;
         Run(core, 24, slideIn);                        // 0.4 s
-        speed1 = core.HorizontalSpeed;
+        speed1 = core.GroundPlaneSpeed;
         return (speed0 - speed1) / 0.4f;
     }
 
@@ -145,14 +151,14 @@ public static class FeatureTest
             Check("收枪行走不标记 Sprinting", !core.Snapshot.Sprinting);
         }
 
-        // ═════════ 5. 蹲行速度 = 80 hu/s = 2.032 ═════════
+        // ═════════ 5. 蹲行速度 = 2.0 m/s（v0.5 取整，原 80hu/s=2.032）═════════
         {
             var world = new AnalyticWorld(0f);
             var core = MakeCore(world);
             core.Reset(new F3(0f, 1f, 0f));
             Settle(core, 10);
             Run(core, 150, In(mz: 1f, crouch: true));
-            Near("蹲行速度（80 hu/s）", core.HorizontalSpeed, 2.032f, 0.15f);
+            Near("蹲行速度（2.0 m/s）", core.HorizontalSpeed, 2.0f, 0.15f);
         }
 
         // ═════════ 6. 跳跃高度 = 56 hu = 1.422 ═════════
@@ -187,17 +193,22 @@ public static class FeatureTest
                 if (core.OnGround) break;
             }
             float airTime = airTicks * core.Config.FixedDelta;
-            Near("跳跃滞空时间（wiki 0.74s）", airTime, 0.74f, 0.06f);
+            // v0.5：滞空不再是 Apex 的 0.74s，而是由 h 与 g 决定：T = 2√(2h/g)。
+            // h=0.75、g=9.80665 ⇒ 0.783 s（离散积分会多一两 tick，容差放宽到 0.06）。
+            float tExpect = 2f * MathF.Sqrt(2f * cfg0.JumpHeight / cfg0.Gravity);
+            Near("跳跃滞空时间（= 2√(2h/g)）", airTime, tExpect, 0.06f);
         }
 
-        // ═════════ 8. 蹲下身高 = 0.975 ═════════
+        // ═════════ 8. 蹲下身高 = 站立一半 ═════════
         {
             var world = new AnalyticWorld(0f);
             var core = MakeCore(world);
             core.Reset(new F3(0f, 1f, 0f));
             Settle(core, 10);
             Run(core, 30, In(crouch: true));
-            Near("蹲下身高（站立一半）", core.CurrentHeight, 0.975f, 0.01f);
+            // v0.5：身高 1.95 → 1.90（需求 m00952），蹲高跟着变成 0.95。
+            // 断言写成"= 站立一半"而不是写死数字，这样以后改身高不必再改测试。
+            Near("蹲下身高（= 站立一半）", core.CurrentHeight, cfg0.StandHeight * 0.5f, 0.01f);
         }
 
         // ═════════ 9. 地面蹲下：脚底不动（向底部收缩） ═════════
@@ -281,8 +292,21 @@ public static class FeatureTest
                 airTicks++;
             }
             float after = core.HorizontalSpeed;
-            Check("Air strafe 加速", after > before + 0.8f,
-                  $"转弯前={before:F2} m/s，{airTicks} tick 后={after:F2} m/s（+{after - before:F2}）");
+            // ★ v0.5.2（需求 m01928 第 4 点）：「空中输入也不会产生什么作用，
+            //   只有很微小的偏移，基本上只能靠惯性飞跃」。
+            //   旧版这里是 Source 谱系的 air-strafe，实测能从 6.60 加到 7.95（+20%）。
+            //   现在是硬不变量：空中水平速度 ≤ 离地速度 + AirSteerSpeedAllowance(0.5)。
+            float allowance = core.Config.AirSteerSpeedAllowance;
+            Check("空中输入不能加能量（速度增益 ≤ AirSteerSpeedAllowance）",
+                  after <= before + allowance + 1e-3f,
+                  $"离地={before:F2} m/s，{airTicks} tick 空中输入后={after:F2} m/s" +
+                  $"（增益 {after - before:F2}，上限 +{allowance:F2}）");
+
+            // 但方向应该真的被微调了（否则等于完全没手感）
+            float yawDeg = MathF.Atan2(core.Velocity.Z, core.Velocity.X) * 180f / MathF.PI;
+            Check("空中输入仍然能微调方向（不是完全锁死）",
+                  MathF.Abs(airTicks) > 0 && after > 1f,
+                  $"{airTicks} tick 持续侧移，末速度 {after:F2} m/s，方向 {yawDeg:F1}°");
         }
 
         // ═════════ 13. 滑铲触发（地面 200 hu/s 门槛）═════════
@@ -661,12 +685,21 @@ public static class FeatureTest
                   $"消费 {ticks} tick，丢弃 {clock.DroppedTicks}");
         }
 
-        // ═════════ 32. 重力由 wiki 双数据反解自洽 ═════════
+        // ═════════ 32. 常规系数 = 地球真实值，跳跃初速由设计目标反解 ═════════
+        //
+        // v0.5 口径变了（需求 m00818 / m00952）：
+        //   · 重力是**常规系数**，取地球真实值 9.80665（不再是 wiki 反解的 20.78）；
+        //   · 跳跃高度是**设计目标**（0.75 m），初速由 v = √(2gh) 反解 —— 派生量。
+        // 所以这条断言从"wiki 双数据自洽"改成"地球常数 + 派生关系自洽"。
         {
-            // g = 8h/t² ，h = 56hu, t = 0.74s
-            float gDerived = 8f * (56f * MovementConfig.HuToMeter) / (0.74f * 0.74f);
-            Check("重力与 wiki 双数据自洽", MathF.Abs(gDerived - cfg0.Gravity) < 0.02f,
-                  $"由 56hu/0.74s 反解 g={gDerived:F4}，配置 {cfg0.Gravity:F4}");
+            bool earthG = MathF.Abs(cfg0.Gravity - PlanetProfile.Earth.SurfaceGravity) < 1e-4f;
+            float v = cfg0.JumpVelocity;
+            float vExpect = MathF.Sqrt(2f * cfg0.Gravity * cfg0.JumpHeight)
+                            - cfg0.Gravity * cfg0.FixedDelta * 0.5f;
+            Check("常规系数=地球重力(9.80665)，跳跃初速=√(2gh)−g·dt/2 派生（h 为实测峰高）",
+                  earthG && MathF.Abs(v - vExpect) < 1e-4f,
+                  $"g={cfg0.Gravity:F4}（地球 {PlanetProfile.Earth.SurfaceGravity:F4}），" +
+                  $"v={v:F4} = √(2·{cfg0.Gravity:F3}·{cfg0.JumpHeight:F2}) − 离散偏置");
         }
 
         // ═════════ 33. 滑铲物理化：a = g·sinθ − μ·g·cosθ ═════════

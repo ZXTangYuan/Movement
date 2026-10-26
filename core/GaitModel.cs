@@ -49,18 +49,32 @@ namespace ApexMovement.Core;
 ///
 /// ## 数值落点（H = 1.95 m，vRun = 6.604 m/s）
 ///
-/// | 速度 | 步态 | 步频 | 步幅 | 腾空比 | 垂直半幅（峰到峰） | 点头 |
+/// | 速度 | 步态 | 步频 | 步幅 | 腾空比 | 垂直半幅（峰到峰） | 点头半幅（峰到峰） |
 /// |---|---|---|---|---|---|---|
-/// | 1.43 m/s（偏好步速） | 走 | 1.90 Hz | 0.75 m | 0 | 4.6 mm（9 mm） | 0.18° |
-/// | 4.41 m/s（本插件行走） | 跑 | 2.99 Hz | 1.48 m | 0.165 | 3.7 mm（7 mm） | 0.15° |
-/// | 6.60 m/s（本插件冲刺） | 跑 | 3.29 Hz | 2.01 m | 0.380 | 10.3 mm（21 mm） | 0.41° |
+/// | 1.43 m/s（偏好步速） | 走 | 1.90 Hz | 0.75 m | 0 | 2.7 mm（5.5 mm） | 0.06°（0.11°） |
+/// | 4.41 m/s（本插件行走） | 跑 | 2.99 Hz | 1.48 m | 0.165 | 2.2 mm（4.4 mm） | 0.04°（0.09°） |
+/// | 6.60 m/s（本插件冲刺） | 跑 | 3.29 Hz | 2.01 m | 0.380 | 6.2 mm（12.4 mm） | 0.12°（0.25°） |
 ///
-/// 舒适档判据（m02752）：**垂直峰到峰 ≤ 2.5 cm**、**点头 ≤ 0.8°**。
-/// 冲刺时峰到峰 2.1 cm、点头 0.41° —— 都在舒适档内，且仍明显可见。
+/// 舒适档判据（m02752）：**垂直峰到峰 ≤ 2.5 cm**、**点头 ≤ 0.8°**；
+/// v0.4.2 需求方再次反馈「走路/奔跑的持续摇晃还是太剧烈」后，把判据收紧到
+/// **垂直峰到峰 ≤ 1.5 cm、点头峰到峰 ≤ 0.3°**，并在相机侧把相位步频
+/// 压到 <see cref="BobCadenceMaxHz"/>（3.0 Hz）—— 见下方"三段收敛史"。
 ///
 /// 对照 v0.3 的"拍出来"版本：4.41 m/s 时 3.62 Hz、6.60 m/s 时 4.83 Hz，
-/// 幅度是 <c>clamp(speed/5,0,1.4)×26mm</c>（冲刺峰到峰 72 mm，是现在的 3.5 倍）。
-/// 新模型把频率降了 18~32%、把幅度降到 1/3，且**频率与幅度现在都由身高与速度解释**。
+/// 幅度是 <c>clamp(speed/5,0,1.4)×26mm</c>（冲刺峰到峰 72 mm，是现在的 6 倍）。
+///
+/// ## 三段收敛史（都是需求方逐轮反馈驱动的）
+///
+/// | 版本 | 冲刺垂直峰到峰 | 冲刺点头峰到峰 | 频率 | 需求方反馈 |
+/// |---|---|---|---|---|
+/// | v0.3 | 72 mm | ≈1.9° | 4.83 Hz | 「还是太剧烈」 |
+/// | v0.4 | 21 mm | 0.82° | 3.29 Hz | 「相机视角晃动函数你没改」 |
+/// | v0.4.2 | **12.4 mm** | **0.25°** | **3.0 Hz（封顶）** | 本轮 |
+///
+/// 注意 v0.4 → v0.4.2 这一跳：**幅度只降了 41%，但主观感受差别很大** ——
+/// 因为"难受"主要来自**旋转**（点头/侧倾）而不是平移。所以这一轮把
+/// <c>PitchPerCm</c> 从 0.40 砍到 0.20、<c>RollPerCm</c> 从 0.30 砍到 0.16，
+/// 旋转幅度直接减半，平移只按比例温和下调。
 /// </summary>
 public struct GaitParams
 {
@@ -99,12 +113,28 @@ public struct GaitParams
 
     /// <summary>
     /// 垂直起伏总缩放（舒适度总闸）。
-    /// 0.40 时冲刺峰到峰 ≈2.1 cm —— 对应 m02752 的「垂直起伏 ~2 cm」舒适档。
+    /// v0.4.2：0.40 → <b>0.24</b>。冲刺（7.6 m/s，带收枪 1.15 倍）峰到峰从
+    /// 2.0 cm 降到 ≈1.2 cm —— 需求方反馈「走路/奔跑的持续摇晃还是太剧烈」，
+    /// 这一步是主降幅旋钮。
     /// </summary>
     public float VerticalScale;
 
     /// <summary>侧向摆动 / 步幅。</summary>
     public float LateralPerStride;
+
+    /// <summary>
+    /// 起步软着陆跨度 (m/s)：幅度在 <c>MinSpeed → MinSpeed + RampInSpan</c>
+    /// 之间用 smoothstep 从 0 升到满值，避免「啪」地开始晃。
+    /// </summary>
+    public float RampInSpan;
+
+    /// <summary>
+    /// 相机摇晃使用的步频上限 (Hz)。相位推进用
+    /// <c>min(CadenceHz, BobCadenceMaxHz)</c>：
+    /// 冲刺真实步频 3.4 Hz 直接用在画面上会「嗡嗡」抖，压到 3.0 Hz 仍然跟得上
+    /// 步点，但明显更稳。<see cref="GaitSample.CadenceHz"/> 本身保持真实值（HUD 用）。
+    /// </summary>
+    public float BobCadenceMaxHz;
 
     /// <summary>侧向摆动下限 (m)。</summary>
     public float LateralMin;
@@ -150,14 +180,16 @@ public struct GaitParams
         MaxFlightFraction = 0.38f,
         WalkAbsorb = 0.16f,
         RunCompression = 0.05f,
-        VerticalScale = 0.40f,
-        LateralPerStride = 0.006f,
-        LateralMin = 0.004f,
-        LateralMax = 0.014f,
-        PitchPerCm = 0.40f,
-        RollPerCm = 0.30f,
-        MaxPitchDeg = 0.80f,
-        MaxRollDeg = 0.35f,
+        VerticalScale = 0.24f,
+        LateralPerStride = 0.004f,
+        LateralMin = 0.0025f,
+        LateralMax = 0.010f,
+        RampInSpan = 0.90f,
+        BobCadenceMaxHz = 3.0f,
+        PitchPerCm = 0.20f,
+        RollPerCm = 0.16f,
+        MaxPitchDeg = 0.45f,
+        MaxRollDeg = 0.30f,
         MinSpeed = 0.35f,
         CrouchCadenceDrop = 0.35f,
         CrouchAmplitudeDrop = 0.20f,
@@ -289,13 +321,16 @@ public static class GaitModel
         float ballistic = GaitParams.EarthGravity * halfFlight * halfFlight * 0.5f;
         float runTerm = (ballistic + p.RunCompression * lleg) * s.FlightFraction;
 
-        float vertical = (walkTerm + runTerm) * p.VerticalScale;
+        // 起步/收尾软着陆：速度刚从 MinSpeed 爬起来时幅度不该一步到位。
+        float ramp = SmoothStep01((speed - p.MinSpeed) / MathF.Max(1e-4f, p.RampInSpan));
+
+        float vertical = (walkTerm + runTerm) * p.VerticalScale * ramp;
         vertical *= 1f - p.CrouchAmplitudeDrop * crouch;
         s.VerticalAmplitude = vertical;
 
         // ── 7) 侧向摆动（一个完整步幅左右摆一次） ────────────────
-        float lateral = p.LateralPerStride * strideStand;
-        lateral = MathF.Max(p.LateralMin, MathF.Min(p.LateralMax, lateral));
+        float lateral = p.LateralPerStride * strideStand * ramp;
+        lateral = MathF.Max(p.LateralMin * ramp, MathF.Min(p.LateralMax, lateral));
         lateral *= 1f - p.CrouchAmplitudeDrop * crouch;
         s.LateralAmplitude = lateral;
 

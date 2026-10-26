@@ -267,13 +267,58 @@ public static class CameraTest
         }
 
         // ═════════ 11. 冲刺侧倾 ═════════
+        //
+        // v0.4.4 需求（m00818）：「奔跑状态下镜头会以当前面向的射线为轴，逆时针
+        // 转一点点角度（1.5° 左右），我希望**不要转角度**」。滚转因此默认关闭，
+        // 这里拆成两条：默认必须为 0（需求），打开开关后通道本身仍然可用（不回退能力）。
         {
-            var rig = new ApexCameraRig();
-            rig.Update(Snap(), dt);
-            CameraOutput o = default;
-            for (int i = 0; i < 120; i++) o = rig.Update(Snap(speed: 7.6f, sprinting: true), dt);
-            float deg = o.Roll * 180f / MathF.PI;
-            Check("冲刺侧倾（sprinttiltMaxRoll）", deg > 0.5f && deg < 3f, $"roll={deg:F2}°");
+            float SprintRollDeg(bool enabled)
+            {
+                var rig = new ApexCameraRig();
+                rig.Config.SprintRollEnabled = enabled;
+                rig.Update(Snap(), dt);
+                CameraOutput o = default;
+                for (int i = 0; i < 120; i++) o = rig.Update(Snap(speed: 7.6f, sprinting: true), dt);
+                return o.Roll * 180f / MathF.PI;
+            }
+            float off = SprintRollDeg(false);
+            float on = SprintRollDeg(true);
+            Check("⑪a 默认无滚转：奔跑时画面绕视线轴不转（需求 m00818）",
+                  MathF.Abs(off) < 1e-4f,
+                  $"关闭时 roll={off:F4}°（要求 0）");
+            Check("⑪b 打开 SprintRollEnabled 后冲刺侧倾仍可用（sprinttiltMaxRoll 通道未坏）",
+                  on > 0.5f && on < 3f,
+                  $"打开时 roll={on:F2}°（配置上限 {new CameraEffectsConfig().SprintMaxRollDeg:F2}°）");
+        }
+
+        // ═════════ 11b. ∞ 载体：只有「视线方向」一种（v0.5 定稿，需求 m01070）═════════
+        //
+        // 需求 m01070：「镜头方面就用新的 ∞ 载体开关的这个方式……原先的那种可以删了」。
+        // 所以平移模式已删除：**EyeOffset 不承载 ∞，YawOffset 反过来承载**。
+        {
+            float LatRange(out float yawRange)
+            {
+                var rig = new ApexCameraRig();
+                rig.Update(Snap(), dt);
+                float minLat = float.MaxValue, maxLat = float.MinValue;
+                float minYaw = float.MaxValue, maxYaw = float.MinValue;
+                for (int i = 0; i < 400; i++)
+                {
+                    // 必须用 GaitSnap：bob 的幅度来自步态样本，普通 Snap() 的
+                    // Gait 是 default（全 0）⇒ 波形恒为 0，测不出东西。
+                    CameraOutput o = rig.Update(
+                        GaitSnap(6.6f, bobPhase: i * 0.05f), dt);
+                    float lat = o.EyeOffset.X;   // yaw=0 时 right = +X
+                    minLat = MathF.Min(minLat, lat); maxLat = MathF.Max(maxLat, lat);
+                    minYaw = MathF.Min(minYaw, o.YawOffset); maxYaw = MathF.Max(maxYaw, o.YawOffset);
+                }
+                yawRange = (maxYaw - minYaw) * 180f / MathF.PI;
+                return maxLat - minLat;
+            }
+            float lat = LatRange(out float yawRange);
+            Check("⑪c ∞ 只由视线方向承载：眼位不横移、yaw 摆幅 ≈ 2·atan(A/参考距离)",
+                  MathF.Abs(lat) < 1e-4f && yawRange > 0.05f,
+                  $"EyeOffset 横向摆幅 {lat * 1000f:F4} mm，YawOffset 摆幅 {yawRange:F3}°");
         }
 
         // ═════════ 12. 走路摇晃：静止无 bob，移动有 bob（幅度来自步态模型）═════════
@@ -285,19 +330,23 @@ public static class CameraTest
 
             var rig2 = new ApexCameraRig();
             rig2.Update(Snap(), dt);
+            // v0.5：bob 不再进 EyeOffset，读相机输出的物理半幅（米）。
             float maxBob = 0f;
             for (int i = 0; i < 60; i++)
             {
                 var o = rig2.Update(GaitSnap(5.4f, i * 0.4f), dt);
-                maxBob = MathF.Max(maxBob, MathF.Abs(F3.Dot(o.EyeOffset, F3.Up)));
+                maxBob = MathF.Max(maxBob, MathF.Abs(o.BobVerticalMeters));
             }
             Check("走路摇晃（静止无 / 移动有）",
-                  MathF.Abs(F3.Dot(idle.EyeOffset, F3.Up)) < 1e-4f && maxBob > 0.002f,
-                  $"静止 bob={F3.Dot(idle.EyeOffset, F3.Up):E2}，移动最大 bob={maxBob:F4} m");
+                  MathF.Abs(idle.BobVerticalMeters) < 1e-4f && maxBob > 0.002f,
+                  $"静止 bob={idle.BobVerticalMeters:E2}，移动最大 bob={maxBob:F4} m");
 
-            // 舒适档上限：垂直起伏不超过 ~2.5 cm（5.4 m/s 时步态模型给出 ~1.4 cm）
-            Check("摇晃幅度落在舒适档（≤2.5 cm）", maxBob <= 0.025f,
-                  $"最大 bob={maxBob * 100f:F2} cm（上限 2.5 cm）");
+            // 舒适档上限：v0.4.2 把判据从「峰到峰 ≤ 2.5 cm」收紧到「峰到峰 ≤ 1.5 cm」。
+            // 5.4 m/s 时步态模型给出半幅 3.79 mm（峰到峰 7.59 mm），远在新上限内。
+            // 这里用 2×maxBob 作为峰到峰（maxBob 是相位扫过整周后的半幅峰值）。
+            float bobP2P = 2f * maxBob;
+            Check("摇晃幅度落在 v0.4.2 舒适档（垂直峰到峰 ≤1.5 cm）", bobP2P <= 0.015f,
+                  $"峰到峰 = 2×{maxBob * 1000f:F2}mm = {bobP2P * 1000f:F2}mm（上限 15mm）");
         }
 
         // ═════════ 13. 空中无 bob（步态样本为零）═════════
@@ -309,7 +358,7 @@ public static class CameraTest
             {
                 // 空中：核心不给步态（Gait=default）⇒ 相机不摇
                 var o = rig.Update(Snap(speed: 5.4f, onGround: false, bobPhase: i * 0.4f), dt);
-                maxBob = MathF.Max(maxBob, MathF.Abs(F3.Dot(o.EyeOffset, F3.Up)));
+                maxBob = MathF.Max(maxBob, MathF.Abs(o.BobVerticalMeters));
             }
             Check("空中无走路摇晃", maxBob < 0.002f, $"空中最大 bob={maxBob:F5} m");
         }

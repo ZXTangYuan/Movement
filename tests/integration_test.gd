@@ -1,5 +1,5 @@
 extends Node
-## ApexMovement **真实物理**集成测试（v0.4.1）。
+## ApexMovement **真实物理**集成测试（v0.4.2）。
 ##
 ## 为什么需要它：`determinism_test.tscn` 里的 FeatureTest 跑在 AnalyticWorld
 ## （纯数学测试替身）上，覆盖不到 Godot 桥接层与相机应用层。历史事故：
@@ -18,15 +18,15 @@ const TESTBED := "res://addons/apex_movement/testbed/apex_testbed.tscn"
 const EXPECT_WALK := 4.407        # m/s  173.5 hu/s（持枪）
 const EXPECT_SPRINT := 6.604      # m/s  260 hu/s（持枪）
 const EXPECT_SPRINT_HOLSTERED := 7.595   # m/s 299 hu/s（收枪 ×1.15）
-const EXPECT_CROUCH_WALK := 2.032 # m/s  80 hu/s（持枪）
-const EXPECT_JUMP_H := 1.4224     # m 56 hu
+const EXPECT_CROUCH_WALK := 2.0   # m/s（v0.5 取整，原 80hu/s=2.032）
+const EXPECT_JUMP_H := 0.75       # m 设计目标（v0.5 需求 m00952：从 56hu=1.4224 改成 0.75）
 const EXPECT_MANTLE_H := 6.0      # m（High 档，上限 273hu≈6.93m）
 
 # ── 期望值：需求方口径（角色尺寸，优先）──
-const EXPECT_STAND_H := 1.95      # m
-const EXPECT_CROUCH_H := 0.975    # m（站立一半）
-const EXPECT_CAM_STAND := 1.85    # m（最大高度 - 10cm）
-const EXPECT_CAM_CROUCH := 0.875  # m
+const EXPECT_STAND_H := 1.90      # m（v0.5 需求：1.95 → 1.90）
+const EXPECT_CROUCH_H := 0.95     # m（站立一半）
+const EXPECT_CAM_STAND := 1.80    # m（站立高度 − 10cm；v0.5：1.90 − 0.10）
+const EXPECT_CAM_CROUCH := 0.85   # m（蹲下高度 − 10cm；v0.5：0.95 − 0.10）
 
 var _player: Node3D
 var _fails: int = 0
@@ -35,7 +35,7 @@ var _report: PackedStringArray = PackedStringArray()
 
 
 func _ready() -> void:
-	print("=== APEX MOVEMENT 集成测试 v0.4.1（真实物理） ===")
+	print("=== APEX MOVEMENT 集成测试 v0.4.2（真实物理） ===")
 	var packed: PackedScene = load(TESTBED)
 	if packed == null:
 		push_error("测试场地加载失败")
@@ -76,13 +76,16 @@ func _run_all() -> void:
 	await _case_holster()
 	await _case_crouch()
 	await _case_jump()
+	await _case_planet_jump()
 	await _case_slide()
 	await _case_slide_hop_chain()
+	await _case_slide_hop_release()
 	await _case_mantle_classes()
 	await _case_mantle_6m()
 	await _case_climb_gate()
 	await _case_ramp()
 	await _case_slide_slope()
+	await _case_slope_run_speed()
 	await _case_mantle_13()
 	await _case_vault_wall()
 	await _case_window()
@@ -98,7 +101,7 @@ func _case_settle() -> void:
 	_expect("落地", _player.DebugOnGround, "onGround=%s" % _player.DebugOnGround)
 	_expect_near("脚底贴地", _player.DebugFeetY, 0.0, 0.05)
 	_expect_near("站立身高（需求方口径）", _player.DebugHeight, EXPECT_STAND_H, 0.01)
-	_expect_near("相机高度（站立 1.85）", _player.DebugCameraAboveFeet, EXPECT_CAM_STAND, 0.02)
+	_expect_near("相机高度（站立 1.80）", _player.DebugCameraAboveFeet, EXPECT_CAM_STAND, 0.02)
 	_expect_near("基础 FOV", _player.DebugFov, 90.0, 0.6)
 
 
@@ -168,7 +171,7 @@ func _case_crouch() -> void:
 	_expect_near("蹲下身高（站立一半）", h, EXPECT_CROUCH_H, 0.02)
 	_expect_near("蹲下时脚底不下沉", feet1, feet0, 0.05)
 	_expect("蹲下过程不掉入虚空", min_y > -0.5, "min_feet_y=%.3f" % min_y)
-	_expect_near("相机高度（蹲下 0.875）", cam, EXPECT_CAM_CROUCH, 0.02)
+	_expect_near("相机高度（蹲下 0.85）", cam, EXPECT_CAM_CROUCH, 0.02)
 
 	_press(KEY_CTRL, false)
 	await _frames(45)
@@ -188,9 +191,53 @@ func _case_jump() -> void:
 		await get_tree().physics_frame
 		apex = max(apex, _player.DebugFeetY)
 
-	_expect_near("跳跃高度（56 hu）", apex, EXPECT_JUMP_H, 0.18)
+	# v0.5：跳跃高度是"设计目标 0.75"，实际离散积分会多跳 v·dt/2 + g·dt²/8 ≈ +0.033 m，
+	# 所以容差给 0.10（而不是当年的 ±0.18）。物理口径见 docs/PHYSICS-AUDIT.md §0.3。
+	_expect_near("跳跃高度（设计目标 0.75）", apex, EXPECT_JUMP_H, 0.10)
 	await _frames(60)
 	_expect("跳后重新落地", _player.DebugOnGround, "onGround=%s" % _player.DebugOnGround)
+
+
+## v0.5.1（需求 m01619）：**起跳力度固定，换星球只改重力 ⇒ 跳跃高度按 v²/2g 变**。
+##
+## 用菜单同一条公开接口 ApplyPlanetPreset() 切星球，每颗星球实测脚底峰高，
+## 与解析值 JumpApexOnPlanet(g) 对比。地球 0.750 / 月球 4.380 / 火星 1.930 / Apex 0.371。
+func _case_planet_jump() -> void:
+	_release_all()
+	# 期望峰高（与 MovementConfig.JumpApexOnPlanet 的离散解一致，误差 < 2mm）
+	var want := [0.750, 4.380, 1.930, 0.371]
+	var names := ["地球", "月球", "火星", "Apex 重力"]
+	var gs := [9.80665, 1.62, 3.711, 20.7802]
+	for idx in range(4):
+		_player.ApplyPlanetPreset(idx)
+		_player.DebugTeleport(-70.0, 1.2, 30.0)
+		# 先真正落地（低重力下坠更久），否则"空中不能跳"会把起跳吃掉
+		for i in range(400):
+			await get_tree().physics_frame
+			if _player.DebugOnGround:
+				break
+		await _frames(10)
+
+		var feet0: float = _player.DebugFeetY
+		var apex: float = feet0
+		_press(KEY_SPACE, true)
+		await _frames(2)
+		_press(KEY_SPACE, false)
+		for i in range(400):
+			await get_tree().physics_frame
+			apex = max(apex, float(_player.DebugFeetY))
+			if i > 8 and _player.DebugOnGround:
+				break
+
+		_expect_near("换星球跳跃：%s（g=%.2f，起跳速度固定）" % [names[idx], gs[idx]],
+			apex - feet0, want[idx], 0.02)
+		_expect("换星球重力生效：%s" % names[idx],
+			abs(_player.DebugPlanetGravity - gs[idx]) < 1e-4,
+			"g=%.5f（期望 %.5f）" % [_player.DebugPlanetGravity, gs[idx]])
+
+	# 复位到地球，避免影响后续用例
+	_player.ApplyPlanetPreset(0)
+	await _frames(10)
 
 
 func _case_slide() -> void:
@@ -246,6 +293,47 @@ func _case_slide_hop_chain() -> void:
 	var hops: int = _player.DebugSlideHops - hops0
 	_expect("连续滑铲跳 ≥3 次", hops >= 3, "本轮 slideHop 计数=%d" % hops)
 	await _frames(60)
+
+
+func _case_slide_hop_release() -> void:
+	# v0.5 回归（用户 m01300 BUG 1）：
+	#   连续滑铲跳后松开所有按键，角色必须自己站起来。
+	#   历史 bug：空中起身时脚底向下伸 delta/2，伸进地面 4cm，而贴地吸附只向下不向上
+	#   ⇒ 永久陷在地面以下 ⇒ "站立头顶检测"把地面当障碍 ⇒ 蹲伏被钉死，只有跳一下才恢复。
+	_release_all()
+	await _frames(20)
+	_player.DebugTeleport(0.0, 1.05, 0.0)
+	await _frames(30)
+	_press(KEY_W, true)
+	_press(KEY_SHIFT, true)
+	await _frames(90)
+	_press(KEY_CTRL, true)
+	for i in range(120):
+		if i % 4 == 0:
+			_press(KEY_SPACE, true)
+		elif i % 4 == 2:
+			_press(KEY_SPACE, false)
+		await get_tree().physics_frame
+	_press(KEY_W, false)
+	_press(KEY_SHIFT, false)
+	_press(KEY_CTRL, false)
+	_press(KEY_SPACE, false)
+
+	var min_feet := 999.0
+	for i in range(90):
+		await get_tree().physics_frame
+		min_feet = min(min_feet, _player.DebugFeetY)
+
+	_expect("连续滑铲跳后松开按键：角色自己起身（蹲伏量归零）",
+		_player.DebugCrouch < 0.01 and abs(_player.DebugHeight - EXPECT_STAND_H) < 0.02,
+		"crouch=%.3f h=%.3f" % [_player.DebugCrouch, _player.DebugHeight])
+	_expect("空中起身过程中脚底不陷进地面（> -5mm）",
+		min_feet > -0.005,
+		"min_feet=%.4f" % min_feet)
+	_expect("起身后站立不被地面误判挡住",
+		not _player.DebugHeadBlocked,
+		"head_blocked=%s" % str(_player.DebugHeadBlocked))
+	await _frames(20)
 
 
 func _case_mantle_classes() -> void:
@@ -400,14 +488,20 @@ func _case_climb_gate() -> void:
 
 	# ② 跑向墙 + 空中按 W ⇒ 必须挂上（面向墙 + 朝墙速度 + 空中）
 	_release_all()
-	_player.DebugTeleport(44.0, 1.05, 0.0)
+	# ★ v0.5.2：空中控制收紧后（需求「空中只能靠惯性」），起跳后**不能再靠
+	#   空中加速把自己推向墙**。所以必须在地面就冲到足够速度，让惯性把人送到墙上：
+	#   从 42.0 起跑 1 秒到 ~6.6 m/s（离墙 7m），再起跳，滞空 0.78s 走 5.1m 正好够。
+	_player.DebugTeleport(42.0, 1.05, 0.0)
 	_player.DebugSetYaw(PI * 0.5)
 	await _frames(30)
+	_press(KEY_SHIFT, true)
 	_press(KEY_W, true)
-	await _frames(15)                            # 离墙 ~4m 时起跳，保挂上时仍有朝墙速度
+	await _frames(60)                            # 冲刺到 6.6 m/s（离墙约 7m）
 	_press(KEY_SPACE, true)
 	await _frames(2)
 	_press(KEY_SPACE, false)
+	await _frames(3)
+	_press(KEY_SHIFT, false)
 
 	var climb_at := -1
 	for i in range(150):
@@ -456,35 +550,121 @@ func _case_ramp() -> void:
 	await _frames(40)
 
 
+func _run_on_ramp(sx: float, deg: float, z0: float, yaw: float, sprint: bool) -> float:
+	# 在坡面上跑一段，返回"稳定段"的平均水平速度。
+	# 只收 状态=Ground 且 脚底 >0.5m 的样本（脚底低于 0.5m 说明已经跑到坡底平地）。
+	var surf: float = (z0 + 55.0) * tan(deg_to_rad(deg)) + 0.2 * cos(deg_to_rad(deg))
+	_release_all()
+	_player.DebugTeleport(sx, surf + 1.2, z0)
+	_player.DebugSetYaw(yaw)
+	await _frames(25)                  # 落到坡面上
+	if sprint:
+		_press(KEY_SHIFT, true)
+	_press(KEY_W, true)
+	var speeds: Array = []
+	for i in range(120):
+		await get_tree().physics_frame
+		if i >= 60 and _player.DebugState == "Ground" and _player.DebugFeetY > 0.5:
+			speeds.append(_player.DebugPlaneSpeed)   # 沿坡面速度（v0.5.2 口径）
+	_press(KEY_W, false)
+	_press(KEY_SHIFT, false)
+	await _frames(10)
+	if speeds.is_empty():
+		return 0.0
+	var sum := 0.0
+	for v in speeds:
+		sum += float(v)
+	return sum / float(speeds.size())
+
+
+func _case_slope_run_speed() -> void:
+	# v0.5（需求 m00914 ⑥）：「跑动和滑铲用基础移速随坡度变化 + 重力加成，
+	# 蹲走和正常行走时用制动防止摔倒那套」。
+	#
+	#   跑动：v_target = v_base + τ·g·sinθ·(下坡方向·期望方向)，τ = 0.25 s
+	#     30° 坡、地球 g：冲刺下坡 6.604 + 0.25·9.80665·0.5 = 7.830
+	#                     冲刺上坡 6.604 − 1.2258          = 5.378
+	#   走（不按冲刺）不吃坡度 ⇒ 两个方向都 ≈ 4.407（防滑档）
+	var deg := 30.0
+	var sx := -25.0
+	var g: float = 9.80665
+	var tau: float = 0.25
+	var sin_t: float = sin(deg_to_rad(deg))
+	var expect_down: float = EXPECT_SPRINT + tau * g * sin_t
+	var expect_up: float = EXPECT_SPRINT - tau * g * sin_t
+
+	var run_down: float = await _run_on_ramp(sx, deg, -38.0, 0.0, true)    # yaw=0 朝 -Z = 下坡
+	var run_up: float = await _run_on_ramp(sx, deg, -52.0, PI, true)       # yaw=π 朝 +Z = 上坡
+	var walk_down: float = await _run_on_ramp(sx, deg, -38.0, 0.0, false)
+	var walk_up: float = await _run_on_ramp(sx, deg, -52.0, PI, false)
+
+	# ★ v0.5.2 口径修正：这里量的是**沿坡面**的速度（DebugPlaneSpeed），
+	#   不是它的水平投影。需求原文「顺斜坡向下移动速度会大于 7.6」说的是沿坡速度；
+	#   水平投影还要再乘 cos30°，两者差 13.4%，混用会把正确的物理判成错误。
+	_expect_near("30° 坡：冲刺下坡吃重力加成（沿坡 %.2f m/s）" % expect_down,
+		run_down, expect_down, 0.45)
+	_expect_near("30° 坡：冲刺上坡掉速（沿坡 %.2f m/s）" % expect_up,
+		run_up, expect_up, 0.45)
+	_expect("坡面跑动方向性正确（下坡 > 平路冲刺 > 上坡）",
+		run_down > EXPECT_SPRINT + 0.3 and run_up < EXPECT_SPRINT - 0.3,
+		"下坡 %.2f / 上坡 %.2f（平路 %.2f）" % [run_down, run_up, EXPECT_SPRINT])
+	_expect_near("30° 坡：行走不吃坡度（沿坡仍 %.2f m/s，防滑档）" % EXPECT_WALK,
+		walk_down, EXPECT_WALK, 0.35)
+	_expect_near("30° 坡：行走上坡也保持 %.2f m/s" % EXPECT_WALK,
+		walk_up, EXPECT_WALK, 0.35)
+	await _frames(20)
+
+
 func _case_slide_slope() -> void:
 	# 滑铲物理化：a = g·sinθ − μ·g·cosθ
 	#   30° 坡（Ramp30 x=-25, z=-55..-35）：tan30°=0.577 > μ=0.45 ⇒ 下坡持续加速
 	#   15° 坡（Ramp15 x=-45）：tan15°=0.268 < μ        ⇒ 下坡仍被摩擦刹停
-	# 判据：取"滑铲已经稳定在坡面上"的窗口（跳过刚离开平台的落地瞬间），
-	#       用速度差 / 时间算实测加速度，与理论值比对。
+	# 判据：取"滑铲已经稳定在坡面上"的窗口（跳过起滑那几帧的 Slideboost 台阶），
+	#       用速度差 / 时间算实测加速度，与理论值比对；坡底平地的样本会被剔除。
+	# ★ v0.4.2 重写"怎么起滑"。旧版是：站到坡顶平台 → 冲刺 → 按 Ctrl 起滑 →
+	#   滑出平台边缘 → 落到坡面上继续滑。
+	#
+	#   重写理由（独立验证 task-3 的 A1 已把这条链路跑通复核）：
+	#   旧写法**依赖两条隐式条件**才能成立 ——
+	#     ① 滑出台沿后落地那一刻仍在滑铲（v0.4.1 靠"空中滑铲"续住，
+	#        而空中滑铲正是需求方要删的缺陷本身）；
+	#     ② 落地速度够得着 SlideMinStartSpeed（实测落地水平速度 7.99 ≥ 5.08，
+	#        靠的是 v0.4.2 新加的 9a「落地即滑铲」把落地当帧接回滑铲）。
+	#   也就是说：**这段用例一直在测别的机制，而不是它声称的"坡面滑铲物理"**。
+	#   现在改成**直接在坡面上助跑起滑**：起滑与测量都在同一段坡面上，
+	#   不依赖空中滑铲、也不依赖落地衔接。
+	#   （注：中间某个只有 ① 被删、9a 还没加进来的状态里，旧写法确实会
+	#    产出 0 个 Slide 样本；那属于中间态，不是当前代码的行为。）
 	var results := {}
 	for spec in [{"x": -25.0, "deg": 30.0}, {"x": -45.0, "deg": 15.0}]:
 		var sx: float = spec["x"]
 		var deg: float = spec["deg"]
-		var slope_len: float = 20.0
-		var h: float = slope_len * tan(deg_to_rad(deg))
-		# 站到坡顶平台（平台顶面 = h + 0.4，中心 z=-33）
+		# 坡面高度：坡底 z=-55 高 0，沿 +Z 每米抬 tan(deg)，面层再加 0.2·cos(deg)
+		# 坡长只有 20m：起点太靠下会在采样窗内滑到坡底平地，测出来的就是平地摩擦
+		# （实测教训：z0=-40 + 助跑 60 帧 ⇒ t=54 脚底已到 0.34m，t=60 起站在平地，
+		#  后半段 -9.4 m/s² 正是 μg 的平地值，把斜率整体拉负）。
+		# 所以起点放在坡顶附近，助跑缩短到 40 帧。
+		var z0 := -36.5
+		var surf: float = (z0 + 55.0) * tan(deg_to_rad(deg)) + 0.2 * cos(deg_to_rad(deg))
 		_release_all()
-		_player.DebugTeleport(sx, h + 1.4, -33.0)
-		_player.DebugSetYaw(0.0)              # 朝 -Z（下坡方向）
-		await _frames(30)
+		_player.DebugTeleport(sx, surf + 1.2, z0)   # y 是胶囊中心 ⇒ 脚底在坡面上方约 0.22m
+		_player.DebugSetYaw(0.0)                   # 朝 -Z（下坡方向）
+		await _frames(30)                          # 落到坡面上
 		_press(KEY_SHIFT, true)
 		_press(KEY_W, true)
-		await _frames(20)
+		await _frames(40)                          # 沿坡助跑到达冲刺速度
 		_press(KEY_CTRL, true)
 
-		# 采样：只要还在滑铲就记 (tick, speed)。前 24 帧留给"离开平台 → 落到坡面"。
+		# 采样：只要还在滑铲就记 (tick, speed)。前 8 帧跳过起滑瞬间
+		# （Slideboost 是瞬时速度台阶，不是加速度，算进去会污染斜率）。
 		var samples: Array = []
 		var tick := 0
 		for i in range(90):
 			await get_tree().physics_frame
 			tick += 1
-			if _player.DebugState == "Slide":
+			# 只统计"还在坡面上"的滑铲样本：脚底 <0.5m 说明已经滑到坡底平地，
+			# 那段是 μ·g 的平地减速，混进来会把斜率整体拉负。
+			if _player.DebugState == "Slide" and _player.DebugFeetY > 0.5:
 				samples.append([tick, _player.DebugSpeed])
 		_press(KEY_CTRL, false)
 		_press(KEY_W, false)
@@ -495,29 +675,42 @@ func _case_slide_slope() -> void:
 		var t0 := 0
 		var t1 := 0
 		for smp in samples:
-			if int(smp[0]) >= 24 and t0 == 0:
+			if int(smp[0]) >= 8 and t0 == 0:
 				t0 = int(smp[0]); v0 = float(smp[1])
-			if int(smp[0]) >= 24:
+			if int(smp[0]) >= 8:
 				t1 = int(smp[0]); v1 = float(smp[1])
 		var acc := 0.0
 		if t1 > t0:
 			acc = (v1 - v0) / (float(t1 - t0) / 60.0)
-		results[deg] = {"v0": v0, "v1": v1, "t0": t0, "t1": t1, "acc": acc}
+		results[deg] = {"v0": v0, "v1": v1, "t0": t0, "t1": t1, "acc": acc, "n": samples.size()}
 		await _frames(40)
 
-	var g: float = 20.7802
+	var g: float = 9.80665          # v0.5：常规系数用地球真实值（原 20.7802 是 Apex 等效）
 	var mu := 0.45
 	var r30: Dictionary = results[30.0]
 	var r15: Dictionary = results[15.0]
-	var a30_theory: float = g * sin(deg_to_rad(30.0)) - mu * g * cos(deg_to_rad(30.0))
-	var a15_theory: float = g * sin(deg_to_rad(15.0)) - mu * g * cos(deg_to_rad(15.0))
 
-	_expect("滑铲在 30° 坡（tanθ>μ）实测加速度 ≈ g·sinθ−μg·cosθ",
-		float(r30["acc"]) > 1.0 and absf(float(r30["acc"]) - a30_theory) < 1.2,
-		"实测 %+.2f m/s²（理论 %+.2f）v %.2f→%.2f" % [r30["acc"], a30_theory, r30["v0"], r30["v1"]])
-	_expect("滑铲在 15° 坡（tanθ<μ）实测减速 ≈ −(μg·cosθ−g·sinθ)",
-		float(r15["acc"]) < -2.0 and absf(float(r15["acc"]) - a15_theory) < 1.5,
-		"实测 %+.2f m/s²（理论 %+.2f）v %.2f→%.2f" % [r15["acc"], a15_theory, r15["v0"], r15["v1"]])
+	# ★ 理论值必须再乘一次 cosθ。
+	#   闭式解 a = g·sinθ − μ·g·cosθ 是**沿坡**的合加速度，而这里实测的是
+	#   DebugSpeed = HorizontalSpeed —— 水平面上的分量，两者差一个 cosθ 的投影。
+	#   独立验证（task-2 的 00_validate-world）逐位确认过这一点：
+	#     15°: 沿坡 −3.6541 → ×cos15 = −3.5296；实测 −3.5296（relErr 0）
+	#     30°: 沿坡 +2.2918 → ×cos30 = +1.9848；实测 +1.9847（relErr −1e-5）
+	#     45°: 沿坡 +8.0816 → ×cos45 = +5.7146；实测 +5.7146（relErr 0）
+	#   不补这个 cosθ 的话，30°/15° 只是"看起来在容差内"，45° 会差 29% 直接误报。
+	#   补上之后残差量级降到 1e-3，容差因此从 ±1.2/±1.5 收紧到 ±0.25。
+	var a30_theory: float = (g * sin(deg_to_rad(30.0)) - mu * g * cos(deg_to_rad(30.0))) * cos(deg_to_rad(30.0))
+	var a15_theory: float = (g * sin(deg_to_rad(15.0)) - mu * g * cos(deg_to_rad(15.0))) * cos(deg_to_rad(15.0))
+
+	_expect("滑铲在 30° 坡（tanθ>μ）实测水平加速度 ≈ (g·sinθ−μg·cosθ)·cosθ",
+		# v0.5：g 从 20.78 降到 9.81 后，30° 坡的滑铲加速度只有 +0.94（原来 +1.98），
+		# 所以"必须明显加速"的下限从 1.0 降到 0.5（仍能区分"加速"与"减速"）。
+		int(r30["n"]) >= 30 and float(r30["acc"]) > 0.5 and absf(float(r30["acc"]) - a30_theory) < 0.25,
+		"实测 %+.2f m/s²（水平分量理论 %+.2f = 沿坡 %+.2f × cos30°）v %.2f→%.2f，滑铲采样 %d 帧" % [r30["acc"], a30_theory, g * sin(deg_to_rad(30.0)) - mu * g * cos(deg_to_rad(30.0)), r30["v0"], r30["v1"], r30["n"]])
+	_expect("滑铲在 15° 坡（tanθ<μ）实测水平减速 ≈ −(μg·cosθ−g·sinθ)·cosθ",
+		# v0.5：g 减半后 15° 坡的水平减速度只有 −1.67（原来 −3.53），下限从 −2.0 放宽到 −1.0。
+		int(r15["n"]) >= 30 and float(r15["acc"]) < -1.0 and absf(float(r15["acc"]) - a15_theory) < 0.25,
+		"实测 %+.2f m/s²（水平分量理论 %+.2f = 沿坡 %+.2f × cos15°）v %.2f→%.2f，滑铲采样 %d 帧" % [r15["acc"], a15_theory, g * sin(deg_to_rad(15.0)) - mu * g * cos(deg_to_rad(15.0)), r15["v0"], r15["v1"], r15["n"]])
 	_expect("同样起滑速度下，陡坡越滑越快、缓坡被刹停",
 		float(r30["v1"]) > float(r30["v0"]) and float(r15["v1"]) < float(r15["v0"]),
 		"30° %s，15° %s" % [

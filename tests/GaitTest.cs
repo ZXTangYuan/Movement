@@ -1,5 +1,6 @@
 using System;
 using System.Text;
+using ApexMovement.Camera;
 using ApexMovement.Core;
 
 namespace ApexMovement.Tests;
@@ -13,6 +14,11 @@ namespace ApexMovement.Tests;
 ///   奔跑的略微腾空」
 /// 以及 m02752 的澄清答复：「抖动目标 = 舒适档：垂直 ~2 cm、点头 ≤0.8°、
 ///   落地冲击 1.5–2.5°」。
+///
+/// ★ v0.4.2：需求方再次反馈「走路/奔跑的持续摇晃还是太剧烈」，判据收紧为
+///   **垂直峰到峰 ≤ 1.5 cm、点头峰到峰 ≤ 0.30°**，相机侧相位步频封顶
+///   <see cref="GaitParams.BobCadenceMaxHz"/> = 3.0 Hz。本文件的幅度断言
+///   已按新口径重写（见 ⑫⑬⑭⑮㉒ 的推导注释），不是"为了变绿而放宽"。
 ///
 /// 本组断言要证明的不是"数看起来像"，而是**频率与幅度确实由身高与速度解释**：
 ///   · 腿长 = 0.53 × 身高 → Froude 偏好步速 → 走/跑切换阈值 → 步频 → 步幅 → 腾空比
@@ -39,6 +45,109 @@ public static class GaitTest
         => GaitModel.Evaluate(speed, height, RunSpeed, crouch, P);
 
     private static bool Near(float v, float target, float tol) => MathF.Abs(v - target) <= tol;
+
+    /// <summary>由 yaw 与 up 求水平前向（与 ApexCameraRig 内部同一套基，自检里用来投影眼位偏移）。</summary>
+    private static F3 ForwardFromYaw(float yaw, F3 up)
+    {
+        float cy = MathF.Cos(yaw), sy = MathF.Sin(yaw);
+        F3 fwd = new(sy, 0f, -cy);
+        if (MathF.Abs(up.Y) < 0.999f)
+        {
+            F3 right = F3.Cross(F3.Up, up).Normalized();
+            F3 realUp = F3.Cross(up, right).Normalized();
+            fwd = right * fwd.X + realUp * fwd.Z;
+        }
+        return F3.ProjectOnPlane(fwd, up).Normalized();
+    }
+
+    /// <summary>端到端实测的一次采样结果（峰到峰 / 相位频率 / 当时的步态样本）。</summary>
+    /// <param name="CyclesPerSec">**竖直**起伏每秒周期数（= 一步一次 ⇒ 应等于相机步频）。</param>
+    /// <param name="LatCyclesPerSec">**横向**摆动每秒周期数（= 一步幅一次 ⇒ 应为竖直的一半）。</param>
+    private readonly record struct LiveResult(
+        float VertP2Pmm, float LatP2Pmm, float PitchP2P, float RollP2P,
+        float CyclesPerSec, float LatCyclesPerSec, float Speed, GaitSample Gait);
+
+    /// <summary>
+    /// 跑真实的 core + rig 链路：预热后逐 tick 采样相机输出，量出各方向峰到峰。
+    /// 这是"相机侧真的用上了新参数"的唯一硬证据 —— 解析式断言只能证明模型算得对。
+    /// </summary>
+    /// <remarks>
+    /// ★ v0.5.3：测量窗口 180 tick(3 s) → **600 tick(10 s)**。
+    ///
+    /// 过零计数法的频率分辨率 = 0.5 周期 / 窗口长度：
+    ///   3 s  → ±0.167 Hz（比断言容差 0.15 还大 ⇒ 相位起点稍微偏一点就红）；
+    ///   10 s → ±0.05 Hz（稳稳落在容差内）。
+    /// 这不是"放宽断言"：容差没动，改的是**尺子的精度**。之前 180 tick 能过只是
+    /// 恰好落在整周期边界上；把驱动加速度从 10 提到 14 以后暖机段的相位积累变了，
+    /// 起点偏移就让计数差了半个周期。
+    /// </remarks>
+    private static LiveResult LiveMeasure(MovementConfig cfg, bool holster, float bobScale,
+                                          int warmTicks = 240, int measureTicks = 600)
+    {
+        var world = new AnalyticWorld(0f);
+        var core = new ApexMovementCore(cfg);
+        core.BindWorld(world);
+        core.Reset(new F3(0f, 1.0f, 0f));
+
+        var camCfg = new CameraEffectsConfig { BobGaitScale = bobScale };
+        var rig = new ApexCameraRig(camCfg);
+        rig.Reset();
+
+        var input = new MovementInput { MoveZ = 1f, SprintHeld = true, Holstered = holster };
+        float dt = cfg.FixedDelta;
+
+        for (int i = 0; i < warmTicks; i++)
+        {
+            core.Step(input, dt);
+            rig.Update(core.Snapshot, dt);
+        }
+
+        float minV = float.MaxValue, maxV = float.MinValue;
+        float minL = float.MaxValue, maxL = float.MinValue;
+        float minP = float.MaxValue, maxP = float.MinValue;
+        float minR = float.MaxValue, maxR = float.MinValue;
+        int vertSign = 0, latSign = 0, vertCross = 0, latCross = 0;
+
+        for (int i = 0; i < measureTicks; i++)
+        {
+            core.Step(input, dt);
+            CameraOutput o = rig.Update(core.Snapshot, dt);
+            MovementSnapshot s = core.Snapshot;
+
+            // v0.5（需求 m01070）：∞ 改由**视线方向**承载，位移不再进入 EyeOffset。
+            // 这里直接读相机输出的物理半幅（米），与 v0.4.x 的刻度完全等价，
+            // 所以下面所有"毫米"阈值都不需要改。
+            float up = o.BobVerticalMeters;
+            float lat = o.BobLateralMeters;
+
+            if (up < minV) minV = up;
+            if (up > maxV) maxV = up;
+            if (lat < minL) minL = lat;
+            if (lat > maxL) maxL = lat;
+            // v0.5：点头只量 bob 的**点头通道** —— PitchOffset 现在还含"竖直起伏
+            // 换算成的视线俯仰"（∞ 的竖直分量），混进来会把点头量成 0.91°。
+            if (o.BobPitchRad < minP) minP = o.BobPitchRad;
+            if (o.BobPitchRad > maxP) maxP = o.BobPitchRad;
+            if (o.BobRollRad < minR) minR = o.BobRollRad;
+            if (o.BobRollRad > maxR) maxR = o.BobRollRad;
+
+            // 频率用**过零次数**量，而不是量相位推进速率 ——
+            // 相位口径在 v0.4.3 从"步频相位"改成了"步幅相位"（见 BobWaveform），
+            // 直接看相位会得到步频的一半，但玩家耳朵/眼睛看到的是**起伏次数**。
+            int vs = up > 0f ? 1 : (up < 0f ? -1 : 0);
+            if (vs != 0) { if (vertSign != 0 && vs != vertSign) vertCross++; vertSign = vs; }
+            int ls = lat > 0f ? 1 : (lat < 0f ? -1 : 0);
+            if (ls != 0) { if (latSign != 0 && ls != latSign) latCross++; latSign = ls; }
+        }
+
+        float secs = measureTicks * dt;
+        const float RadToDeg = 180f / MathF.PI;
+        return new LiveResult(
+            (maxV - minV) * 1000f, (maxL - minL) * 1000f,
+            (maxP - minP) * RadToDeg, (maxR - minR) * RadToDeg,
+            vertCross / 2f / secs, latCross / 2f / secs,
+            core.HorizontalSpeed, core.Snapshot.Gait);
+    }
 
     // ───────────────────────── 主体 ─────────────────────────
 
@@ -169,54 +278,108 @@ public static class GaitTest
 
         // ═════════════ C. 幅度落点（舒适档） ═════════════
 
-        // 12. 垂直半幅落在舒适档（~2 cm）
+        // 12. 垂直半幅：走"看得见但温和"、跑"更强"，且都在收紧后的舒适档内
+        //
+        // v0.4.2 把舒适档从「峰到峰 ≤ 2.5 cm」收紧到「≤ 1.5 cm」，同时把
+        // VerticalScale 0.40 → 0.24。旧断言写的是"冲刺半幅 > 7 mm"（= 峰到峰
+        // > 1.4 cm，贴着旧上限），与新判据**直接矛盾** —— 冲刺一旦压到
+        // 1.5 cm 以内，旧断言必然红。所以这里按新口径重写，并且保留三件真实性质：
+        //   (a) 走 / 跑都必须**存在**（峰到峰有下限，不能靠"压没了"蒙混）；
+        //   (b) 冲刺不得超过新上限 1.5 cm（舒适档）；
+        //   (c) 跑必须比走**明显更晃**（否则走跑不分，就不是步态驱动了）。
         {
-            GaitSample walk = At(1.43f);
-            GaitSample run = At(RunSpeed);
-            Check("⑫ 垂直起伏半幅：慢走 ~4.5 mm / 冲刺 ~10 mm（峰到峰 ≈2 cm）",
-                  walk.VerticalAmplitude > 0.002f && walk.VerticalAmplitude < 0.008f &&
-                  run.VerticalAmplitude > 0.007f && run.VerticalAmplitude < 0.014f,
-                  $"1.43m/s={walk.VerticalAmplitude * 1000f:F1}mm / 6.60m/s={run.VerticalAmplitude * 1000f:F1}mm");
+            float walkP2P = 2f * At(1.43f).VerticalAmplitude;
+            float runP2P = 2f * At(RunSpeed).VerticalAmplitude;
+            const float walkLo = 0.004f;   // 走：≥4 mm 峰到峰 —— 再小就"看不见"，等于功能被压没
+            const float walkHi = 0.008f;   // 走：≤8 mm 峰到峰 —— 走不该晃得像跑
+            const float runLo = 0.008f;    // 跑：≥8 mm 峰到峰 —— 跑必须明显比走强
+            const float runHi = 0.015f;    // 跑：≤15 mm 峰到峰 —— v0.4.2 舒适档硬上限
+            Check("⑫ 垂直峰到峰：慢走 ∈[4,8]mm / 冲刺 ∈[8,15]mm / 跑 > 走×1.5",
+                  walkP2P >= walkLo && walkP2P <= walkHi &&
+                  runP2P >= runLo && runP2P <= runHi &&
+                  runP2P > walkP2P * 1.5f,
+                  $"1.43m/s={walkP2P * 1000f:F2}mm（区间 4–8）/ 6.60m/s={runP2P * 1000f:F2}mm（区间 8–15）" +
+                  $"/ 跑÷走 = {runP2P / walkP2P:F2}×");
         }
 
-        // 13. 峰值（峰到峰）不超过 2.5 cm 的舒适上限
+        // 13. 冲刺峰到峰不超过 v0.4.2 **收紧后**的 1.5 cm 舒适上限
+        //     （旧断言用的 2.5 cm 是 m02752 的第一版口径，已被需求方推翻）
         {
             float peakToPeak = 2f * At(RunSpeed).VerticalAmplitude;
-            Check("⑬ 冲刺时垂直峰到峰 ≤ 2.5 cm（m02752 舒适档上限）",
-                  peakToPeak <= 0.025f,
-                  $"峰到峰 = 2×{At(RunSpeed).VerticalAmplitude * 1000f:F1}mm = {peakToPeak * 1000f:F1}mm");
+            Check("⑬ 冲刺时垂直峰到峰 ≤ 1.5 cm（v0.4.2 收紧后的舒适档上限）",
+                  peakToPeak <= 0.015f,
+                  $"峰到峰 = 2×{At(RunSpeed).VerticalAmplitude * 1000f:F2}mm = {peakToPeak * 1000f:F2}mm（上限 15mm）");
         }
 
-        // 14. 点头半幅 ≤ 0.8°，且冲刺时确实存在（不是被压没）
+        // 14. 点头：峰到峰 ≤ 0.30°（v0.4.2 舒适档），且确实存在、上限只是保险丝
+        //
+        // 旧断言要求「半幅 ≥ 0.30°」，把**半幅**当成了舒适档指标 —— 但 v0.4.2 的
+        // 判据是**峰到峰 ≤ 0.30°**（即半幅 ≤ 0.15°）。两者差 2 倍，旧断言必然红。
+        // 重写后保留三件真实性质，谁也不掩盖谁：
+        //   (a) 峰到峰 ≤ 0.30°（新舒适档）；
+        //   (b) 半幅 ≥ 0.05° —— 点头确实存在、没被压没（冲刺 6.2 mm 垂直半幅 ×
+        //       0.20 °/cm = 0.124°，下限取 0.05° 是"还有一点点"而不是"归零"）；
+        //   (c) MaxPitchDeg 只作**保险丝**（未成为工作点）—— 否则"舒适档达标"
+        //       只是被 clamp 掩盖的结果，换个速度就爆。
         {
             float pitchRun = At(RunSpeed).PitchDeg;
-            Check("⑭ 点头半幅 ≤ MaxPitchDeg(0.8°) 且冲刺时 ≥0.3°（存在但轻）",
-                  pitchRun <= P.MaxPitchDeg + 1e-5f && pitchRun >= 0.30f,
-                  $"冲刺点头半幅 {pitchRun:F3}°（上限 {P.MaxPitchDeg:F2}°，要求 ≥0.30°）");
+            const float capP2P = 0.30f;
+            Check("⑭ 冲刺点头：峰到峰 ≤0.30°（v0.4.2 舒适档）且半幅 ≥0.05°（存在、未被压没）",
+                  pitchRun * 2f <= capP2P + 1e-5f && pitchRun >= 0.05f,
+                  $"冲刺点头半幅 {pitchRun:F3}°（峰到峰 {pitchRun * 2f:F3}°，上限 {capP2P:F2}°）");
+            Check("⑭b MaxPitchDeg 只作保险丝（未成为工作点，否则舒适档达标是被 clamp 掩盖的）",
+                  pitchRun < P.MaxPitchDeg * 0.9f,
+                  $"半幅 {pitchRun:F3}° < MaxPitchDeg {P.MaxPitchDeg:F2}° × 0.9 = {P.MaxPitchDeg * 0.9f:F3}°");
         }
 
-        // 15. 侧向摆动被夹在 [LateralMin, LateralMax]
+        // 15. 侧向摆动：稳态夹在 [LateralMin, LateralMax]；起步带按 ramp 软起
+        //
+        // 旧断言在 0.5 m/s 处取样，那时旧代码给的是硬下限 4 mm。v0.4.2 把下限改成
+        // LateralMin × ramp（起步软着陆），0.5 m/s 处 ramp ≈ 0.06 ⇒ 只有 0.2 mm。
+        // 这是**有意的**：一步跨出 4 mm 的侧向瞬移正是"啪"地开始晃的来源。
+        // 重写后把两条性质分开断言，谁也不会掩盖谁：
+        //   (a) 硬上限：所有速度都 ≤ LateralMax（10 mm 是真上限，不是摆设）；
+        //   (b) 软起步：0.5/0.8/1.0 m/s 处 < LateralMin（被 ramp 压着，未到硬下限）；
+        //   (c) 稳态区间：≥ 偏好步速后一律 ∈ [LateralMin, LateralMax]。
         {
-            bool allInRange = true;
+            float[] rampSpeeds = { 0.5f, 0.8f, 1.0f };
+            bool rampBelowMin = true;
+            for (int i = 0; i < rampSpeeds.Length; i++)
+                if (At(rampSpeeds[i]).LateralAmplitude >= P.LateralMin) rampBelowMin = false;
+
+            float[] steadySpeeds = { 1.43f, 3f, 4.407f, RunSpeed };
+            bool steadyInRange = true;
             float lo = float.MaxValue, hi = 0f;
-            float[] speeds = { 0.5f, 1.43f, 3f, 4.407f, RunSpeed };
-            for (int i = 0; i < speeds.Length; i++)
+            for (int i = 0; i < steadySpeeds.Length; i++)
             {
-                float lat = At(speeds[i]).LateralAmplitude;
-                if (lat < P.LateralMin - 1e-6f || lat > P.LateralMax + 1e-6f) allInRange = false;
+                float lat = At(steadySpeeds[i]).LateralAmplitude;
+                if (lat < P.LateralMin - 1e-6f || lat > P.LateralMax + 1e-6f) steadyInRange = false;
                 if (lat < lo) lo = lat;
                 if (lat > hi) hi = lat;
             }
-            Check("⑮ 侧向摆动被夹在 [LateralMin 4mm, LateralMax 14mm]",
-                  allInRange, $"实测区间 [{lo * 1000f:F1}mm, {hi * 1000f:F1}mm]");
+
+            float[] allSpeeds = { 0.5f, 0.8f, 1.0f, 1.43f, 3f, 4.407f, RunSpeed };
+            bool hardBounded = true;
+            for (int i = 0; i < allSpeeds.Length; i++)
+            {
+                float lat = At(allSpeeds[i]).LateralAmplitude;
+                if (lat < 0f || lat > P.LateralMax + 1e-6f) hardBounded = false;
+            }
+
+            Check("⑮ 侧向摆动：稳态 ∈[LateralMin 2.5mm, LateralMax 10mm]、起步带按 ramp 软起、全程 ≤LateralMax",
+                  steadyInRange && rampBelowMin && hardBounded,
+                  $"稳态区间 [{lo * 1000f:F2}mm, {hi * 1000f:F2}mm]；起步带 0.5/0.8/1.0 m/s = " +
+                  $"{At(0.5f).LateralAmplitude * 1000f:F2}/{At(0.8f).LateralAmplitude * 1000f:F2}/" +
+                  $"{At(1.0f).LateralAmplitude * 1000f:F2}mm（均 < LateralMin {P.LateralMin * 1000f:F1}mm）");
         }
 
-        // 16. 侧倾半幅 ≤ 0.35°（滑铲侧倾已删，走路侧倾是唯一的 roll 来源）
+        // 16. 侧倾半幅 ≤ MaxRollDeg（v0.4.2：0.35° → 0.30°）
+        //     （滑铲侧倾已删，走路侧倾是唯一的 roll 来源）
         {
             float rollRun = At(RunSpeed).RollDeg;
-            Check("⑯ 走路侧倾半幅 ≤ MaxRollDeg(0.35°)",
-                  rollRun <= P.MaxRollDeg + 1e-5f,
-                  $"冲刺侧倾半幅 {rollRun:F3}°（上限 {P.MaxRollDeg:F2}°）");
+            Check("⑯ 走路侧倾半幅 ≤ MaxRollDeg(0.30°) 且未被 clamp 掩盖",
+                  rollRun <= P.MaxRollDeg + 1e-5f && rollRun < P.MaxRollDeg * 0.9f,
+                  $"冲刺侧倾半幅 {rollRun:F3}°（上限 {P.MaxRollDeg:F2}°，保险丝未触发）");
         }
 
         // 17. 同一速度下，个子越高步频越低（腿越长 → 摆动周期越长）
@@ -254,7 +417,7 @@ public static class GaitTest
                   $"height=0 → cadence={a.CadenceHz:F3} Hz；height=-1/runSpeed=-5 → cadence={b.CadenceHz:F3} Hz");
         }
 
-        // 20. 参数区间自检（常数不是随手填的）
+        // 20. 参数区间自检（常数不是随手填的；v0.4.2 新增的三个旋钮也要有界）
         {
             bool ok = P.LegLengthRatio is > 0.45f and < 0.62f
                    && P.FroudePref is > 0.30f and < 0.60f
@@ -263,12 +426,24 @@ public static class GaitTest
                    && P.MaxFlightFraction is > 0f and <= 0.50f
                    && P.MaxPitchDeg is > 0f and <= 1.0f
                    && P.MaxRollDeg is > 0f and <= 1.0f
-                   && P.MinSpeed is > 0f and < 1.0f;
-            Check("⑳ 模型常数都在文献区间内（腿长比 0.53 / Froude 0.45 / 腾空 ≤0.5 …）",
+                   && P.MinSpeed is > 0f and < 1.0f
+                   // v0.4.2 新增 / 改动的旋钮
+                   && P.VerticalScale is > 0f and <= 1.0f
+                   && P.RampInSpan is > 0f and <= 3.0f
+                   && P.BobCadenceMaxHz is > 1.5f and < 4.0f
+                   && P.LateralMin is > 0f and < 0.05f
+                   && P.LateralMax is > 0f and < 0.05f
+                   && P.LateralMin < P.LateralMax
+                   && P.PitchPerCm is > 0f and <= 2.0f
+                   && P.RollPerCm is > 0f and <= 2.0f;
+            Check("⑳ 模型常数都在文献 / 手感区间内（腿长比 0.53、Froude 0.45、腾空 ≤0.5、步频封顶 1.5–4 Hz …）",
                   ok,
                   $"legRatio={P.LegLengthRatio:F2} froude={P.FroudePref:F2} " +
                   $"runStart={P.RunStartFroude:F1} flight≤{P.MaxFlightFraction:F2} " +
-                  $"pitch≤{P.MaxPitchDeg:F2}° roll≤{P.MaxRollDeg:F2}°");
+                  $"pitch≤{P.MaxPitchDeg:F2}° roll≤{P.MaxRollDeg:F2}° vScale={P.VerticalScale:F2} " +
+                  $"ramp={P.RampInSpan:F2} bobCap={P.BobCadenceMaxHz:F1}Hz " +
+                  $"lat=[{P.LateralMin * 1000f:F1}, {P.LateralMax * 1000f:F1}]mm " +
+                  $"pitchPerCm={P.PitchPerCm:F2} rollPerCm={P.RollPerCm:F2}");
         }
 
         // ═════════════ D. 与移动核心的联动（快照 / 相位） ═════════════
@@ -296,34 +471,31 @@ public static class GaitTest
                   $"(模型 {expect.CadenceHz:F2}) vAmp={live.VerticalAmplitude * 1000f:F1}mm");
         }
 
-        // 22. 相位推进速率 = 步频（帧率无关的基础：相位在 tick 内推进）
+        // 22. 频率口径 = min(步频, BobCadenceMaxHz)（v0.4.3 重新定义）
+        //
+        // v0.4.2 在 UpdateBobPhase 里加了 camCadence = min(CadenceHz, BobCadenceMaxHz)：
+        // 真实冲刺步频 3.29 Hz 直接推相位会在画面上「嗡嗡」抖，压到 3.0 Hz 更稳；
+        // HUD 里的 CadenceHz 仍报真实值（3.29）。
+        //
+        // ★ v0.4.3 把相位**改口径**成「步幅相位」（2π = 一个步幅 = 左右各一步），
+        //   于是相位推进速率变成步频的一半 —— 再断言「相位 = 步频」已经没有意义。
+        //   真正该断言的是**玩家眼睛看到的两个频率**（都用相机输出的过零次数量）：
+        //     (a) 竖直起伏 = camCadence（一步一次）
+        //     (b) 横向摆动 = camCadence / 2（一步幅一次）
+        //   两者之比必须是 2:1 —— 这正是屏幕平面能画出 ∞ 的必要条件。
+        //   另外仍要验证"封顶确实被走到"（真实步频 > 上限），否则断言空过。
         {
-            var world = new AnalyticWorld(0f);
-            var core = new ApexMovementCore(MovementConfig.Apex());
-            core.BindWorld(world);
-            core.Reset(new F3(0f, 1.0f, 0f));
-            for (int i = 0; i < 120; i++)
-                core.Step(new MovementInput { MoveZ = 1f, SprintHeld = true }, core.Config.FixedDelta);
-
-            float f0 = core.Snapshot.Gait.CadenceHz;
-            float p0 = core.Snapshot.BobPhase;
-            int ticks = 60;   // 1 秒
-            float dt = core.Config.FixedDelta;
-            float prev = p0;
-            float unwrapped = 0f;
-            for (int i = 0; i < ticks; i++)
-            {
-                core.Step(new MovementInput { MoveZ = 1f, SprintHeld = true }, dt);
-                float p = core.Snapshot.BobPhase;
-                float d = p - prev;
-                if (d < -MathF.PI) d += MathF.PI * 2f;   // 跨 2π 回绕
-                unwrapped += d;
-                prev = p;
-            }
-            float cycles = unwrapped / (MathF.PI * 2f);
-            Check("㉒ 步态相位每秒推进 = 步频周期数（相位在 tick 内推进，帧率无关）",
-                  MathF.Abs(cycles - f0) < 0.15f,
-                  $"1 秒推进 {cycles:F2} 个周期，步频 {f0:F2} Hz（差 {MathF.Abs(cycles - f0):F3}）");
+            LiveResult m22 = LiveMeasure(MovementConfig.Apex(), holster: false, bobScale: 1f);
+            float f0 = m22.Gait.CadenceHz;
+            float cap = MovementConfig.Apex().Gait.BobCadenceMaxHz;
+            float expect = MathF.Min(f0, cap);
+            Check("㉒ 相机实测：竖直起伏 = min(步频, BobCadenceMaxHz)，横向摆动 = 它的一半（2:1）",
+                  Near(m22.CyclesPerSec, expect, 0.15f) &&
+                  Near(m22.LatCyclesPerSec, expect * 0.5f, 0.15f) &&
+                  f0 > cap,
+                  $"1 秒内：竖直 {m22.CyclesPerSec:F2} 个周期、横向 {m22.LatCyclesPerSec:F2} 个（比 " +
+                  $"{(m22.LatCyclesPerSec > 1e-4f ? m22.CyclesPerSec / m22.LatCyclesPerSec : 0f):F2}:1）；" +
+                  $"min({f0:F2}, {cap:F2}) = {expect:F2} Hz（真实步频已超上限 ⇒ 封顶生效）");
         }
 
         // 23. 滑铲时步态按"蹲行"算，不按 10 m/s 的真实滑行速度算
@@ -344,6 +516,61 @@ public static class GaitTest
             Check("㉓ 滑铲时步态按蹲行速度算（步频 ≤2.0 Hz，不跟着 10 m/s 滑行速度飙）",
                   sliding && cadence > 0f && cadence <= 2.0f,
                   $"state={core.State} speed={core.HorizontalSpeed:F2} → cadence={cadence:F2} Hz");
+        }
+
+        // ═════════════ E. 相机侧真的用上了新参数（端到端，实测而非解析） ═════════════
+
+        // 24. 冲刺（含收枪 1.15 倍速，最坏档）的相机实际输出 = 模型推导，且落在 v0.4.2 舒适档
+        //
+        // 前面 ⑫⑭ 断言的是**模型**给的值。这一条走完整链路：
+        //   AnalyticWorld → ApexMovementCore（UpdateBobPhase 推相位）
+        //   → MovementSnapshot.Gait/BobPhase → ApexCameraRig.BuildOutput（读幅度）
+        // 用 60 Hz 逐 tick 采样 3 秒，从**相机输出本身**量峰到峰。
+        // 它能抓到 ⑫⑭ 抓不到的东西：相机没读 Gait、幅度单位搞错（mm/cm）、
+        // 相位与幅度用了不同的步频等等。
+        {
+            var cfg = MovementConfig.Apex();
+            var m = LiveMeasure(cfg, holster: true, bobScale: 1f);
+            GaitSample g = m.Gait;
+            float expectV = 2f * g.VerticalAmplitude * 1000f;
+            float expectP = 2f * g.PitchDeg;
+            float expectL = 2f * g.LateralAmplitude * 1000f;
+            float camCad = MathF.Min(g.CadenceHz, cfg.Gait.BobCadenceMaxHz);
+
+            bool ampOk = Near(m.VertP2Pmm, expectV, expectV * 0.05f) &&
+                         Near(m.LatP2Pmm, expectL, expectL * 0.05f) &&
+                         Near(m.PitchP2P, expectP, expectP * 0.05f);
+            bool comfortOk = m.VertP2Pmm <= 15f && m.PitchP2P <= 0.30f;
+            // 频率口径（v0.4.3）：竖直 = camCadence、横向 = camCadence/2，见 ㉒ 的说明。
+            bool freqOk = Near(m.CyclesPerSec, camCad, 0.15f) &&
+                          Near(m.LatCyclesPerSec, camCad * 0.5f, 0.15f);
+
+            Check("㉔ 收枪冲刺端到端：相机实测峰到峰 = 模型推导（≤5% 偏差），且垂直 ≤1.5cm / 点头 ≤0.30°",
+                  ampOk && comfortOk && freqOk,
+                  $"speed={m.Speed:F2} m/s → 垂直 {m.VertP2Pmm:F2}mm（模型 {expectV:F2}）、" +
+                  $"侧向 {m.LatP2Pmm:F2}mm（模型 {expectL:F2}）、" +
+                  $"点头 {m.PitchP2P:F3}°（模型 {expectP:F3}）、" +
+                  $"侧倾 {m.RollP2P:F3}°、竖直 {m.CyclesPerSec:F2} Hz / 横向 {m.LatCyclesPerSec:F2} Hz" +
+                  $"（camCadence {camCad:F2}）");
+        }
+
+        // 25. 调试菜单的「步态摇晃倍率」(BobGaitScale) 真的接在相机输出上
+        //
+        // 需求要求这个滑条"默认 1.0 / 范围 0–2"且能实时改摇晃。只断言字段默认值
+        // 是没用的 —— 必须证明 k 确实乘进了 BuildOutput。所以量三档：
+        //   k=0 → 摇晃完全关掉（峰到峰 ≈ 0）
+        //   k=1 → 物理值
+        //   k=0.5 → 恰好一半（线性，不是被别的东西夹住）
+        {
+            var cfg = MovementConfig.Apex();
+            LiveResult k0 = LiveMeasure(cfg, holster: false, bobScale: 0f);
+            LiveResult k1 = LiveMeasure(cfg, holster: false, bobScale: 1f);
+            LiveResult kh = LiveMeasure(cfg, holster: false, bobScale: 0.5f);
+            float ratio = k1.VertP2Pmm > 1e-6f ? kh.VertP2Pmm / k1.VertP2Pmm : 0f;
+            Check("㉕ BobGaitScale 线性生效：0× 关掉摇晃、0.5× = 1× 的一半（默认 1.0，范围 0–2）",
+                  k0.VertP2Pmm < 0.01f && Near(ratio, 0.5f, 0.02f),
+                  $"k=0 → {k0.VertP2Pmm:F3}mm；k=1 → {k1.VertP2Pmm:F2}mm；" +
+                  $"k=0.5 → {kh.VertP2Pmm:F2}mm（比值 {ratio:F3}）");
         }
 
         sb.AppendLine();

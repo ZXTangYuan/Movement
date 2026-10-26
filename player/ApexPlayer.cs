@@ -52,8 +52,11 @@ public partial class ApexPlayer : Node3D
     [Export] public bool StartHolstered = true;
 
     [ExportGroup("Body")]
-    [Export] public float StandHeight = 1.95f;
-    [Export] public float CrouchHeight = 0.975f;
+    // v0.5（需求 m00952）：站立 1.95 → 1.90，蹲下随之 0.975 → 0.95。
+    // 注意：这里的 [Export] 默认值会**覆盖** MovementConfig 的字段初值，
+    // 场景里已经序列化的旧值同样会覆盖 —— 改体型必须同时改这两处 + 场景里的实例。
+    [Export] public float StandHeight = 1.90f;
+    [Export] public float CrouchHeight = 0.95f;
     [Export] public float EyeHeightOffset = 0.10f;
 
     [ExportGroup("Camera")]
@@ -89,6 +92,41 @@ public partial class ApexPlayer : Node3D
     private Label _hud = null!;
     /// <summary>运行时调试菜单（`\` 键开关，v0.4 新增）。未启用时为 null。</summary>
     private ApexDebugMenu? _debugMenu;
+
+    // ── v0.5 三维调试渲染器 / 第三人称 / 星球预设（需求 m01621）──
+    private ApexDebugRenderer? _debugRenderer;
+    private bool _debugRendererOn;
+    private bool _thirdPerson;
+    private float _thirdPersonDistance = 4.0f;
+    private PlanetProfile _planet = PlanetProfile.Earth;
+    private RichTextLabel? _legend;
+
+    // ── v0.5.3 眼位竖直平滑（需求 m02395 第 3 点：上台阶顿挫）──
+    //
+    // TryStepUp 是"一帧把人抬到台面"（0.20m 台阶单帧 0.2010m ≈ 12 m/s），
+    // 相机每渲染帧直读 _core.Position 就会一帧硬跳。这里只限制**站在地面时
+    // 眼位的上升速率**，向下/腾空/下坡一律不平滑（见 SmoothEyeRise）。
+    //
+    // ## 4 m/s 这个数是怎么定的
+    //
+    //   · 上限：连续跑上 0.20 m 高的楼梯时，平均抬升速率 =
+    //     0.20 m ÷ (0.5 m 踏面 ÷ 6.604 m/s = 0.0757 s) = **2.64 m/s**。
+    //     取 4 m/s 高于它 ⇒ 连续爬楼时**不会累积滞后**（额度一直有富余）。
+    //   · 下限：0.20 m 台阶用 4 m/s 只需 0.05 s（3 个物理 tick）抬完，
+    //     单帧竖直位移从 0.2010 m 降到 0.0667 m —— 硬跳消失，又不会"飘"。
+    //   · 30° 斜坡冲刺的正常抬升 = 6.604×tan30° = 3.81 m/s < 4 ⇒ 走斜坡不触发。
+    //
+    // 调 0 = 关闭平滑（回到 v0.5.2 的硬跟手）。
+    [Export] public float StairEyeSmoothSpeed = 4.0f;
+    private Vector3 _eyeSmooth;
+    private bool _eyeSmoothValid;
+    private long _eyeSmoothTick;
+    /// <summary>眼位上升的**累积额度**（米）。按模拟时间发放，用不完可留到下一帧。</summary>
+    private float _eyeSmoothBudget;
+    /// <summary>眼位平滑被限速的次数（调试/自检用）。</summary>
+    public int EyeSmoothClamps { get; private set; }
+    /// <summary>眼位平滑被调用的次数（调试/自检用）。</summary>
+    public int EyeSmoothCalls { get; private set; }
 
     /// <summary>调试面板（截图 / 自检脚本用；未构建时为 null）。</summary>
     public ApexDebugMenu? DebugMenu => _debugMenu;
@@ -137,7 +175,35 @@ public partial class ApexPlayer : Node3D
     // （不继承 GodotObject），无法直接跨边界传递，所以在这里投影成基元类型。
     public float DebugFeetY => _core.FeetPosition.Y;
     public float DebugHeight => _core.CurrentHeight;
+    /// <summary>蹲伏插值量：0 = 站立，1 = 全蹲。自检/调试用。</summary>
+    public float DebugCrouch => _core.CrouchAmount;
+    /// <summary>站立时头顶是否被挡（"蹲着起不来"的判别量）。</summary>
+    public bool DebugHeadBlocked => _core.HeadBlockedForStanding;
     public float DebugSpeed => _core.HorizontalSpeed;
+
+    /// <summary>
+    /// 沿**地面平面**的速度（坡上 ≠ HorizontalSpeed，差一个 cosθ）。
+    ///
+    /// v0.5.2 起"跑速"的口径统一到**沿坡**：需求说的是"顺斜坡向下移动速度会大于 7.6"，
+    /// 指的是沿坡面的速度，而不是它的水平投影。自检与集成测试都用这个量。
+    /// </summary>
+    public float DebugPlaneSpeed => _core.GroundPlaneSpeed;
+
+    /// <summary>当前抓地力比值（1 = 完全抓地；&lt;1 = 打滑，冰面上接近 0）。</summary>
+    public float DebugGrip => _core.GripRatio;
+
+    /// <summary>体重 (kg)，BMI × 身高²。</summary>
+    public float DebugBodyMass => _core.Config.BodyMass;
+
+    /// <summary>最大静摩擦力 (N)。</summary>
+    public float DebugMaxStaticFriction => _core.Config.MaxStaticFrictionForce(1f);
+
+    /// <summary>滑动摩擦力 (N)。</summary>
+    public float DebugMaxKineticFriction => _core.Config.MaxKineticFrictionForce(1f);
+
+    /// <summary>是否正在打滑（静摩擦顶到极限 / 抱死刹车）。</summary>
+    public bool DebugSliding => _core.IsSlidingFriction;
+
     public bool DebugOnGround => _core.OnGround;
     public int DebugSlideHops => _core.SlideHopCount;
     public int DebugBunnyHops => _core.BunnyHopCount;
@@ -153,6 +219,8 @@ public partial class ApexPlayer : Node3D
     public bool DebugSlideBoostReady => !_core.SlideBoostOnCooldown;
     public float DebugFallStun => _core.FallStunRemaining;
     public float DebugFov => _rig.Fov;
+    /// <summary>相机节点（自检/复现脚本读相机实际位置用）。</summary>
+    public Camera3D? DebugCamera => _camera;
     public float DebugRollDeg => _camOut.Roll * 180f / Mathf.Pi;
     public float DebugTraversalBlend => _camOut.TraversalBlend;
     public float DebugVerticalSpeed => _core.VerticalSpeed;
@@ -186,6 +254,7 @@ public partial class ApexPlayer : Node3D
         _core.Reset(F3.From(GlobalPosition));
         _rig.Reset();
         _pendingLandingTier = LandingTier.None;
+        _eyeSmoothValid = false;      // 瞬移不要"平滑飞过去"
     }
 
     /// <summary>手动触发一次相机视角踢（测试 / 受击反馈）。</summary>
@@ -290,6 +359,13 @@ public partial class ApexPlayer : Node3D
         // 而不必硬编码节点路径。截图脚本 shot_testbed.gd 依赖这个组名。
         if (!_camera.IsInGroup("player_cameras")) _camera.AddToGroup("player_cameras");
 
+        // v0.5：三维调试渲染器（速度/加速度箭头 + 半透明胶囊）。
+        // 需求 m01621：「我需要一个调试渲染器……以玩家重心，向玩家的速度方向射出
+        // 三维空间的箭头，箭头长度随着速度大小变化，并在箭头上标注速度大小」。
+        _debugRenderer = new ApexDebugRenderer { Name = "DebugRenderer" };
+        AddChild(_debugRenderer);
+        _debugRenderer.BindPlayer(this);
+
         if (ShowDebugHud) BuildHud();
         if (ShowDebugMenu)
         {
@@ -316,7 +392,8 @@ public partial class ApexPlayer : Node3D
         AddChild(_debugMenu);
         _debugMenu.Build(FovBase, MouseSensitivity,
                          _rig.Config.BobGaitScale, _rig.Config.KickScale,
-                         CameraEffectsEnabled, ShowDebugHud);
+                         CameraEffectsEnabled, ShowDebugHud,
+                         PlanetPresetIndex(), _thirdPerson, _debugRendererOn);
 
         _debugMenu.FovChanged += v =>
         {
@@ -328,11 +405,72 @@ public partial class ApexPlayer : Node3D
         _debugMenu.KickScaleChanged += v => _rig.Config.KickScale = v;
         _debugMenu.CameraEffectsToggled += on => CameraEffectsEnabled = on;
         _debugMenu.HudToggled += SetHudVisible;
+        _debugMenu.PlanetPresetChanged += ApplyPlanetPreset;
+        _debugMenu.ThirdPersonToggled += SetThirdPerson;
+        _debugMenu.DebugRendererToggled += SetDebugRenderer;
+        // v0.5（需求 m01070）：滚转开关与 ∞ 载体开关已从菜单删除 ——
+        // ∞ 固定为「转动视线方向」，滚转固定关。
         _debugMenu.CloseRequested += CloseDebugMenu;
 
         // 初始不可见（_Ready 里已设，这里再确认一次语义）
         _debugMenu.Visible = false;
         _debugMenuOpen = false;
+    }
+
+    // ── v0.5 调试功能（需求 m01621）──────────────────────────
+
+    /// <summary>当前星球在菜单里的序号（Earth=0 / Moon=1 / Mars=2 / Apex=3）。</summary>
+    private int PlanetPresetIndex() => _planet.Name switch
+    {
+        "Moon" => 1,
+        "Mars" => 2,
+        "Apex-like" => 3,
+        _ => 0,
+    };
+
+    /// <summary>
+    /// 切换星球预设（重力）。
+    ///
+    /// 需求（m00818）：「常规系数虽然默认是真实地球的量，但是要设为快捷可调的，
+    /// 因为我要设计不同的星球」。切换只改**常规系数**（g、空气密度），
+    /// 设计目标（跳跃高度、跑速…）与人体力度（起跳速度）都**不动** ——
+    /// 所以换星球后跳跃高度会按 v²/2g 变（月球跳得高、Apex 重力跳得低）。
+    /// </summary>
+    public void ApplyPlanetPreset(int index)
+    {
+        _planet = index switch
+        {
+            1 => PlanetProfile.Moon,
+            2 => PlanetProfile.Mars,
+            3 => PlanetProfile.ApexDefault,
+            _ => PlanetProfile.Earth,
+        };
+        _core.Config.ApplyPlanet(_planet);
+        // 换星球后速度/跳跃手感都会变，把相机抖动与落地冲击清一下避免残留踢动。
+        _rig.Reset();
+        _debugMenu?.SyncDebugToggles(PlanetPresetIndex(), _thirdPerson, _debugRendererOn);
+    }
+
+    /// <summary>当前星球重力（调试/自检读取）。</summary>
+    public float DebugPlanetGravity => _core.Config.Gravity;
+
+    /// <summary>当前星球名（调试/自检读取）。</summary>
+    public string DebugPlanetName => _core.Config.Planet.Name;
+
+    /// <summary>第三人称视角开关（调试用，需求 m01621）。</summary>
+    public void SetThirdPerson(bool on)
+    {
+        _thirdPerson = on;
+        _debugMenu?.SyncDebugToggles(PlanetPresetIndex(), _thirdPerson, _debugRendererOn);
+    }
+
+    /// <summary>三维速度/加速度调试器开关。</summary>
+    public void SetDebugRenderer(bool on)
+    {
+        _debugRendererOn = on;
+        _debugRenderer?.SetEnabled(on);
+        if (_legend != null) _legend.Visible = on;
+        _debugMenu?.SyncDebugToggles(PlanetPresetIndex(), _thirdPerson, _debugRendererOn);
     }
 
     /// <summary>切换调试菜单显隐（`\` 键）。</summary>
@@ -412,12 +550,46 @@ public partial class ApexPlayer : Node3D
         {
             Name = "DebugHud",
             Position = new Vector2(16, 16),
-            Text = "ApexMovement v0.4.1",
+            Text = "ApexMovement v0.5.3",
         };
         _hud.AddThemeColorOverride("font_color", new Color(0.9f, 1f, 0.9f));
         _hud.AddThemeColorOverride("font_outline_color", new Color(0, 0, 0, 1));
         _hud.AddThemeConstantOverride("outline_size", 4);
         layer.AddChild(_hud);
+
+        // v0.5（需求 m01621）：三维调试器的**颜色图例**。
+        // 颜色与 ApexDebugRenderer 的箭头一一对应，玩家不必猜"这根红箭头是什么"。
+        _legend = new RichTextLabel
+        {
+            Name = "AccelLegend",
+            BbcodeEnabled = true,
+            FitContent = true,
+            ScrollActive = false,
+            Position = new Vector2(16, 318),
+            CustomMinimumSize = new Vector2(560, 0),
+            Visible = false,
+        };
+        _legend.AddThemeFontSizeOverride("normal_font_size", 15);
+        _legend.AddThemeColorOverride("default_color", new Color(0.9f, 0.95f, 1f));
+        // ★ v0.5.3：图例加**半透明黑底**。
+        //   原来只有文字直接画在场景上，亮天空/亮地面时白字与青字几乎读不出来
+        //   （需求 m02395 第 1 点「不容易区分」的一部分）。加底 + 描边后任何背景都可读。
+        _legend.AddThemeStyleboxOverride("normal",
+            new StyleBoxFlat
+            {
+                BgColor = new Color(0f, 0f, 0f, 0.62f),
+                ContentMarginLeft = 10,
+                ContentMarginRight = 10,
+                ContentMarginTop = 6,
+                ContentMarginBottom = 6,
+                CornerRadiusTopLeft = 4,
+                CornerRadiusTopRight = 4,
+                CornerRadiusBottomLeft = 4,
+                CornerRadiusBottomRight = 4,
+            });
+        _legend.AddThemeColorOverride("font_outline_color", new Color(0, 0, 0, 1));
+        _legend.AddThemeConstantOverride("outline_size", 4);
+        layer.AddChild(_legend);
     }
 
     /// <summary>注入重力方向（球形行星时传行星局部 up）。</summary>
@@ -604,6 +776,16 @@ public partial class ApexPlayer : Node3D
 
         UpdateCamera();
 
+        // 三维调试渲染器（渲染帧刷新，读的是最近一个物理 tick 的结果）
+        if (_debugRenderer != null && _debugRendererOn)
+        {
+            Vector3 center = _core.Position.ToGodot();
+            Vector3 up = _core.Up.ToGodot();
+            _debugRenderer.RefreshCapsule(center, up, _core.CurrentHeight, _core.Config.CapsuleRadius);
+            _debugRenderer.Refresh(center, _core.Velocity.ToGodot(), _core.LastAccel,
+                                   _core.Config.FixedDelta);
+        }
+
         if (ShowDebugHud) UpdateHud();
     }
 
@@ -619,6 +801,7 @@ public partial class ApexPlayer : Node3D
         _jumpQueued = false;
         _pendingLandingTier = LandingTier.None;
         _pendingLandingTick = -1;
+        _eyeSmoothValid = false;      // 瞬移/重生不要"平滑飞过去"
     }
 
     /// <summary>
@@ -638,6 +821,84 @@ public partial class ApexPlayer : Node3D
             if (node is Node3D n3) volumes.Add(n3);
         }
         _world.SetSlipVolumes(volumes);
+    }
+
+    /// <summary>
+    /// 眼位竖直方向的**上台阶平滑**（v0.5.3，需求 m02395 第 3 点）。
+    ///
+    /// ## 为什么要做
+    ///
+    /// 走上台阶时 <c>TryStepUp</c> 是**一帧**把人抬到台面上（0.20 m 台阶 =
+    /// 单帧 0.2010 m，等价竖直速度 12 m/s），而相机每个渲染帧直接读
+    /// <c>_core.Position</c> ⇒ 画面一帧硬跳。逐 tick 实测这是"顿挫感"的主因
+    /// （<c>max|Δ²p| = 0.2010</c>，每级台阶恰好一次孤立尖峰）。
+    ///
+    /// ## 怎么做的
+    ///
+    /// 只限制**站在地面时眼位的上升速率**（默认 4 m/s），其余一律不平滑：
+    ///   · 向下（走下台阶、坠落、落地）→ 不限速，永远跟手；
+    ///   · 腾空（跳跃、下落）→ 不限速，绝不拖泥带水；
+    ///   · 站在坡道上 → 抬升速率 = 速度×tanθ（30° 冲刺 3.8 m/s &lt; 4）⇒ 不触发，无滞后；
+    ///   · 上台阶 → 0.2 m 需要 3 帧抬完，正好把"离散台阶"抹成"连续斜坡"。
+    ///
+    /// 这是**纯表现层**的平滑：物理位置、速度、碰撞一行都没改。
+    /// 滞后的量有上限（一帧最多差 <c>StairEyeSmoothSpeed × dt</c>），
+    /// 而且只可能发生在向上抬的那几帧，肉眼不可见。
+    /// </summary>
+    private Vector3 SmoothEyeRise(Vector3 target, F3 up)
+    {
+        if (!_eyeSmoothValid)
+        {
+            _eyeSmooth = target;
+            _eyeSmoothValid = true;
+            _eyeSmoothTick = _core.TickCount;
+            _eyeSmoothBudget = 0f;
+            return target;
+        }
+
+        Vector3 delta = target - _eyeSmooth;
+        Vector3 upG = up.ToGodot();
+        float along = delta.Dot(upG);                  // 沿"上"的分量
+        Vector3 lateral = delta - upG * along;         // 其余分量（水平 + 视线轴上的偏移）
+
+        // 上限按**经过的物理 tick 数**算，而不是按渲染帧 delta。
+        //
+        // 为什么不按渲染帧：眼位是每个渲染帧刷新的，若用 GetProcessDeltaTime()
+        // 做速率上限，限速额度就取决于渲染帧率 —— 高刷/低刷下手感不同，
+        // 而且渲染帧比物理 tick 密得多时（本机实测约 10:1），每帧额度极小、
+        // 一个物理 tick 里能涨的量仍被拆成很多小步，看起来"没生效"。
+        // 用 tick 数算就与帧率完全解耦：0.2 m 台阶恒定 3 个物理 tick 抬完。
+        long ticks = _core.TickCount - _eyeSmoothTick;
+        if (ticks < 0) ticks = 0;
+        _eyeSmoothTick = _core.TickCount;
+
+        // ★ 用**累积额度**而不是"每帧上限"。
+        //
+        //   只写"每帧最多涨 StairEyeSmoothSpeed·ticks·dt"是不够的：渲染帧比
+        //   物理 tick 密时（本机实测约 10:1），大多数渲染帧 ticks==0 拿不到额度，
+        //   于是被限速后**剩下的那段位移会在下一个 ticks==0 的帧里一次性补完** ——
+        //   实测 max_cam_dy 完全没有变化（0.1399 → 0.1399），限速形同虚设。
+        //
+        //   改成"按模拟时间发放额度、每帧消耗、用不完可以留到下一帧"：
+        //   额度 += 速度×ticks×dt，本帧最多涨 min(delta, 额度)，然后扣掉。
+        //   于是 0.2 m 台阶恒定 3 个物理 tick 抬完，与渲染帧率无关。
+        if (_core.OnGround && StairEyeSmoothSpeed > 0f)
+            _eyeSmoothBudget += StairEyeSmoothSpeed * ticks * _core.Config.FixedDelta;
+
+        if (along > 0f && _core.OnGround && StairEyeSmoothSpeed > 0f)
+        {
+            if (along > _eyeSmoothBudget) { along = _eyeSmoothBudget; EyeSmoothClamps++; }
+            _eyeSmoothBudget -= along;
+            if (_eyeSmoothBudget < 0f) _eyeSmoothBudget = 0f;
+        }
+        else
+        {
+            _eyeSmoothBudget = 0f;      // 下落/腾空/瞬移后不留额度
+        }
+        EyeSmoothCalls++;
+
+        _eyeSmooth += lateral + upG * along;
+        return _eyeSmooth;
     }
 
     private void UpdateCamera()
@@ -664,16 +925,44 @@ public partial class ApexPlayer : Node3D
 
         // 眼位 = 脚底 + (当前身高 − EyeHeightOffset) + 相机偏移
         Vector3 feet = (_core.Position - up * (_core.CurrentHeight * 0.5f)).ToGodot();
-        Vector3 eye = feet
+        Vector3 eyeTarget = feet
                     + up.ToGodot() * (_core.CurrentHeight - _core.Config.EyeHeightOffset)
                     + _camOut.EyeOffset.ToGodot();
+        Vector3 eye = SmoothEyeRise(eyeTarget, up);
 
         var basis = new Basis(
             new Vector3(right.X, right.Y, right.Z),
             new Vector3(upR.X, upR.Y, upR.Z),
             new Vector3(-fwd.X, -fwd.Y, -fwd.Z));
 
-        _camera.GlobalTransform = new Transform3D(basis, eye);
+        // ── 第三人称（v0.5 调试用，需求 m01621）────────────────────
+        //
+        // 沿**视线反方向**后退一段距离，并把视点抬高到胸口高度。
+        // 保持与第一人称完全相同的朝向（basis 不变）⇒ 鼠标转向手感一致，
+        // 摇摆/踢动的角度也照旧，只是"眼睛离开了头部"。
+        Vector3 camPos = eye;
+        if (_thirdPerson)
+        {
+            Vector3 fwdG = new(fwd.X, fwd.Y, fwd.Z);
+            Vector3 upG = new(upR.X, upR.Y, upR.Z);
+            Vector3 rightG = new(right.X, right.Y, right.Z);
+
+            // **越肩**机位：后退 + 右上偏移。
+            //
+            // 为什么不用正后方：速度箭头是沿视线方向的，正后方看过去它被
+            // 透视压缩成一个小点（长度信息完全丢失）。侧后方让速度轴与视线
+            // 成一个夹角，箭头长度才看得见 —— 这也是所有第三人称游戏的做法。
+            //
+            // ★ 以**平滑后的眼位**为基准（而不是 _core.Position）：
+            //   上台阶时身体一帧抬 0.2 m，机位若跟原始位置会同样一帧硬跳。
+            camPos = eye
+                   + (_core.Position.ToGodot() - eyeTarget)   // 眼位 → 身体中心的固定偏移
+                   - fwdG * _thirdPersonDistance
+                   + rightG * 1.15f
+                   + upG * 0.75f;
+        }
+
+        _camera.GlobalTransform = new Transform3D(basis, camPos);
         _camera.Fov = _camOut.Fov;
     }
 
@@ -695,8 +984,16 @@ public partial class ApexPlayer : Node3D
             : "no";
 
         // v0.4：步态摘要（频率来自步态模型，是"抖动频率"最直接的证据）
+        //
+        // v0.4.2：补上 cam= 与 bob×=。
+        // 原来只打真实的步频 CadenceHz（冲刺 3.29Hz），但相机实际是用
+        // min(CadenceHz, Gait.BobCadenceMaxHz) 推相位的（v0.4.2 封顶 3.00Hz）——
+        // 玩家照着 HUD 会以为画面在抖 3.29Hz。现在两个值都打出来，
+        // 并列上实时摇晃倍率 BobGaitScale（调试菜单里可调）。
+        float camCadence = Mathf.Min(_snapshot.Gait.CadenceHz, _core.Config.Gait.BobCadenceMaxHz);
         string gait = _snapshot.Gait.CadenceHz > 0.05f
-            ? $"{_snapshot.Gait.CadenceHz:F2}Hz stride={_snapshot.Gait.StrideLength:F2}m " +
+            ? $"{_snapshot.Gait.CadenceHz:F2}Hz cam={camCadence:F2}Hz " +
+              $"bob×{_rig.Config.BobGaitScale:F2} stride={_snapshot.Gait.StrideLength:F2}m " +
               $"fly={_snapshot.Gait.FlightFraction:F2} vAmp={_snapshot.Gait.VerticalAmplitude * 1000f:F1}mm"
             : "idle";
 
@@ -704,9 +1001,24 @@ public partial class ApexPlayer : Node3D
         float tiltDeg = _core.StepTiltAngle * (180f / Mathf.Pi);
         if (tiltDeg > 0.05f) gait += $" step={tiltDeg:F1}deg";
 
+        // v0.5：星球 / 坡度摘要（常规系数可切星球 + 坡面合速度的直接证据）
+        //   g= 当前星球重力；mu= 库仑摩擦系数；slope= 脚下地面倾角。
+        //   跑动加成是 v_base + τ·g·sinθ，所以 g 与 θ 都得能看到。
+        float cosT = Mathf.Clamp(F3.Dot(_core.GroundNormal, _core.UpDirection), 0f, 1f);
+        float slopeDeg = Mathf.Acos(cosT) * (180f / Mathf.Pi);
+        // v0.5.3：把**当前制动加速度**也打出来 —— 需求「停止移动时先给一个速度反向的
+        // 最大制动，然后逐渐降低到滑动摩擦」，玩家要能看见这条曲线在动。
+        float brake = _core.BrakeAccel;
+        string brakeStr = brake > 0.05f ? $" brake={brake:F2}m/s2" : "";
+        string planet = $"g={_core.Config.Gravity:F2} {_core.Config.Planet.Name} " +
+                        $"mu={_core.Config.GroundFrictionCoefficient:F2} slope={slopeDeg:F0}deg" +
+                        brakeStr;
+
         _hud.Text =
-            $"ApexMovement v0.4.1  tick={_core.TickCount}\n" +
-            $"state={_core.State}  speed={_core.HorizontalSpeed:F2} m/s  vy={_core.VerticalSpeed:F2}\n" +
+            $"ApexMovement v0.5.3  tick={_core.TickCount}\n" +
+            // v0.5（需求 m01621）：「先前的 hud 内关于速度的监视器可以删掉了，
+            // 用新实现的三维调试器监测数据」—— 速度与竖直分量不再打在这里。
+            $"state={_core.State}\n" +
             $"ground={_core.OnGround}  crouch={_core.CrouchAmount:F2}  h={_core.CurrentHeight:F2}  {holster}\n" +
             $"fov={_camOut.Fov:F1}°  roll={_camOut.Roll * 180f / Mathf.Pi:F1}°  bobPhase={_snapshot.BobPhase:F2}\n" +
             $"gait={gait}\n" +
@@ -714,7 +1026,31 @@ public partial class ApexPlayer : Node3D
             $"slip={slip}  hang={hang}\n" +
             $"slideBoost={boost}  slideHops={_core.SlideHopCount}  bhops={_core.BunnyHopCount}  mantles={_core.MantleCount}\n" +
             $"jumpFatigue={fatigue}  fallstun={stun}\n" +
+            $"planet={planet}\n" +
             $"[WASD] move  [Space] jump/vault  [Ctrl] crouch  [Shift] sprint\n" +
             $"[W贴墙+Space] 爬墙  [松W] 扒住  [S] 松手直落  [A/D] 横移  [H] 收枪  [ [ / ] ] FOV  [R] 复位  [\\] 调试菜单";
+
+        // 三维调试器图例（颜色 ↔ 箭头一一对应）
+        if (_legend != null)
+        {
+            _legend.Visible = _debugRendererOn;
+            if (_debugRendererOn && _debugRenderer != null)
+            {
+                // 力的口径：N = m·g·cosθ，再用当前脚底法线取真实倾角
+                float legCos = Mathf.Clamp(
+                    _core.UpDirection.ToGodot().Dot(_core.GroundNormal.ToGodot()), 0f, 1f);
+                _legend.Text = _debugRenderer.LegendBbcode(
+                    _core.Velocity.ToGodot(), _core.LastAccel,
+                    _core.Config.BodyMass,
+                    _core.Config.NormalForce(legCos),
+                    _core.Config.MaxStaticFrictionForce(legCos),
+                    _core.Config.MaxKineticFrictionForce(legCos),
+                    _core.GripRatio,
+                    _core.IsSlidingFriction);
+                // 跟随 HUD 的**实际**高度排下去：HUD 行数会随状态增减（蹲伏/打滑/扒墙
+                // 各自多一行），写死坐标迟早压住某一行文字。
+                _legend.Position = new Vector2(_hud.Position.X, _hud.Position.Y + _hud.Size.Y + 6f);
+            }
+        }
     }
 }

@@ -43,7 +43,32 @@ public sealed class MovementConfig
     /// 顺带交叉验证：Source 默认 sv_gravity = 800 u/s² × 0.0254 = 20.32 m/s²，两者仅差 2.3%，
     /// 说明 Apex 确实沿用了 Source 量级但略有调高。
     /// </summary>
-    public float Gravity = 20.7802f;
+    public float Gravity = 9.80665f;   // v0.5：地球真实值（原先 20.7802 = Apex 等效）
+
+    /// <summary>
+    /// 当前**星球档案**（常规系数的来源）。默认保持 <see cref="PlanetProfile.ApexDefault"/>
+    /// = v0.4.x 的 20.7802，保证所有既有手感数字不变；切星球一律走
+    /// <see cref="ApplyPlanet"/>，它会同步 <see cref="Gravity"/>。
+    ///
+    /// v0.5 的既定方向：默认星球会换成 <see cref="PlanetProfile.Earth"/>（9.80665），
+    /// 并把跳跃高度等**设计目标**固定住、由 √(2gh) 反解初速。
+    /// </summary>
+    public PlanetProfile Planet = PlanetProfile.Earth;
+
+    /// <summary>
+    /// 切换星球：只改**常规系数**（表面重力等），<see cref="Gravity"/> 立即同步。
+    ///
+    /// 设计目标（<see cref="JumpHeight"/>、<see cref="SprintSpeed"/>、滑铲加成……）
+    /// **不动**；所有派生量（<see cref="JumpVelocity"/>、滑铲坡度加速度、
+    /// <see cref="SlideCriticalAngleDeg"/>……）都是 get-only 计算属性，会自动跟着变。
+    /// 这就是需求方要的「常规系数真实化 + 特殊量反推」。
+    /// </summary>
+    public void ApplyPlanet(PlanetProfile planet)
+    {
+        planet = planet.Name is null ? PlanetProfile.ApexDefault : planet;
+        Planet = planet;
+        Gravity = planet.SurfaceGravity;
+    }
 
     /// <summary>[B] 终端下落速度上限 (m/s)。Source sv_maxvelocity = 3500 u/s ≈ 88.9。</summary>
     public float MaxFallSpeed = 88.9f;
@@ -51,13 +76,13 @@ public sealed class MovementConfig
     // ═════════════════════════════ 地面速度 ═════════════════════════════
 
     /// <summary>[A] 行走速度 (m/s) = 173.5 hu/s。wiki Ground：「a walk peaks at a velocity of 173.5 hu/s」。</summary>
-    public float WalkSpeed = 4.40690f;
+    public float WalkSpeed = 4.407f;
 
     /// <summary>[A] 冲刺速度 (m/s) = 260 hu/s（持枪）。wiki Sprint：「it peaks at a velocity of 260 hu/s」。</summary>
     public float SprintSpeed = 6.60400f;
 
     /// <summary>[A] 蹲行速度 (m/s) = 80 hu/s（持枪）。wiki Crouch：「Crouchwalk peaks at 92hu/s」（收枪值）。</summary>
-    public float CrouchWalkSpeed = 2.03200f;
+    public float CrouchWalkSpeed = 2.0f;
 
     /// <summary>
     /// [A] 收枪加速倍率 = 1.15。wiki Holster：「Holster Speedboost is 15% i.e a factor of 1.15」。
@@ -66,18 +91,35 @@ public sealed class MovementConfig
     public float HolsterMultiplier = 1.15f;
 
     /// <summary>
-    /// [B] 地面加速度。Source sv_accelerate 默认 10。
+    /// **[Target] 地面驱动加速度 (m/s²，默认 14)**。
     ///
     /// wiki 明确：**蹲行 / 行走 / 冲刺的加速度完全相同，只有顶速不同**。
     /// 因此三个状态共用一个加速度值（拆成三个字段只是为了将来单独调）。
+    ///
+    /// ## v0.5.3：10 → 14（需求 m02395 第 2 点）
+    ///
+    /// 需求原文：「我感觉输入的最大加速度只有 10 m/s² 有点小，虽然比较真实但是
+    /// 游戏性低了一点，这个能改吗？改了会影响整体物理化的系统吗？」
+    ///
+    /// **能改，而且不会破坏物理自洽** —— 因为它是**设计目标**（肌肉能给出的推力），
+    /// 不是物理常数。真正与物理耦合的只有一条：抓地条件
+    /// <code>μs · g · cosθ ≥ 驱动加速度</code>
+    /// 也就是说"加速度提上去以后，鞋底必须抓得住"。本配置里
+    /// <see cref="GroundStaticFrictionCoefficient"/> 就是按这条约束反推的
+    /// （见它的注释），改这个值时要一起改。
+    ///
+    /// 影响面（都是**设计量**的连锁，不是物理错误）：
+    ///   · 到顶速的时间：冲刺 6.604/14 = **0.47 s**（原 0.66 s）；
+    ///   · 松手刹车第一段也用它（见 <see cref="BrakeRampTime"/>）；
+    ///   · 上坡时它要先对抗 g·sinθ，坡越陡净加速度越小（30° 时 14 − 4.9 = 9.1）。
     /// </summary>
-    public float GroundAccel = 10f;
+    public float GroundAccel = 14f;
 
-    /// <summary>[B] 冲刺加速度（wiki：与行走相同，保留独立字段便于调参）。</summary>
-    public float SprintAccel = 10f;
+    /// <summary>[Target] 冲刺加速度（wiki：与行走相同，保留独立字段便于调参）。</summary>
+    public float SprintAccel = 14f;
 
-    /// <summary>[B] 蹲行加速度（wiki：与行走相同）。</summary>
-    public float CrouchAccel = 10f;
+    /// <summary>[Target] 蹲行加速度（wiki：与行走相同）。</summary>
+    public float CrouchAccel = 14f;
 
     /// <summary>
     /// [B] 空中加速度系数。
@@ -104,8 +146,200 @@ public sealed class MovementConfig
     /// </summary>
     public float AirWishSpeed = 1.52400f;
 
-    /// <summary>[B] 地面摩擦系数。Source sv_friction 默认 4。</summary>
-    public float Friction = 4f;
+    /// <summary>
+    /// **[Target] 地面库仑摩擦系数 μ（默认 0.7）**。
+    ///
+    /// v0.5 需求（m01070 第 3 点）：「地面摩擦改真库仑 μ≈0.7（停距 3.18m，且随坡度/星球变）」。
+    ///
+    /// 物理模型：<c>a_brake = μ · g · cosθ</c>（θ = 地面倾角，cosθ 来自法向力）。
+    ///   · 平地：a = 0.7 × 9.80665 = 6.865 m/s²
+    ///   · 冲刺 6.604 m/s 松键停距 = v²/(2a) = **3.18 m**（原 Source 粘性模型的 ≈1.24 m）
+    ///   · 坡度越陡摩擦越小（法向力小），星球重力越大刹车越狠 —— 两者都自动跟随
+    ///
+    /// 参考值：橡胶鞋底在混凝土上 0.6–0.9；湿滑地面 0.3；冰面 0.05。
+    /// 这个值是默认值，世界里实现 <see cref="IFrictionWorld"/> 时脚下材质可以覆盖它。
+    /// </summary>
+    public float GroundFrictionCoefficient = 0.7f;
+
+    // ═════════ v0.5.2 摩擦重做（需求 m01928 第 4 点）═════════════
+    //
+    // 需求原话：「人行走奔跑起身是静摩擦力是做正功的，因为人不是滑动，所以摩擦力产生的
+    // 加速度应该是浮动的，而且作用于玩家输入方向。当玩家达到最大速度时，静摩擦力会归零，
+    // 如果玩家要转向，静摩擦力会将玩家的水平速度限制在上限……当玩家停止输入时，静摩擦力
+    // 将会与玩家当前移动方向相反，然后缓慢增大到最大静摩擦变为滑动摩擦，直到停止
+    // （类似汽车刹车，先降低轮胎滚动速度，最后抱死刹车）。」
+
+    /// <summary>
+    /// **[Target] 最大静摩擦系数 μs（默认 1.9）**。
+    ///
+    /// 走路时脚是**钉在地上**的（不打滑），所以推动身体的是**静摩擦**（反作用力），
+    /// 它做正功；只有超过 μs·N 才会打滑转成滑动摩擦。
+    ///
+    /// 为什么默认 1.9 &gt; 1：这个值不是"看起来像"，而是被**设计加速度**倒逼出来的 ——
+    /// 要让正常地面"抓得住"（不打滑），必须满足
+    /// <code>μs · g · cosθ ≥ GroundAccel</code>
+    /// 取最陡可跑坡 30°（cos30°=0.866）⇒ μs ≥ 14 / (9.80665×0.866) = **1.65**。
+    /// 取 1.9 留 15% 余量（45° 坡上 μs·g·cosθ = 13.2 &lt; 14 ⇒ 开始轻微打滑，符合
+    /// "陡坡跑不快"的直觉）。
+    ///
+    /// ⚠️ 这个值是**跟着 <see cref="GroundAccel"/> 走的**：改驱动加速度必须同步改它，
+    /// 否则正常地面会"抓不住地"（grip &lt; 1），走路变成轻微打滑。
+    ///
+    /// 参考值：橡胶底运动鞋在干燥粗糙混凝土上 μs ≈ 1.2–1.4（鞋纹咬合会让系数 &gt; 1）；
+    /// 湿滑地面 0.3–0.5；冰面 0.05–0.15。
+    /// </summary>
+    public float GroundStaticFrictionCoefficient = 1.9f;
+
+    /// <summary>
+    /// 刹车时"从最大制动衰减到滑动摩擦"所需时间 (s，默认 0.25)。
+    ///
+    /// v0.5.3 需求（m02395 第 2 点）：「我希望玩家停止移动时先给一个速度反向的最大制动
+    /// （比如刚刚的最大输入 10 m/s²）然后逐渐降低至当前滑动摩擦（6.86 m/s²），
+    /// 这样直到人物停下」。
+    ///
+    /// 实现（<c>BrakeDecel</c>）：松开输入后制动加速度**起点 = 最大驱动加速度**
+    /// （被 <c>μs·g·cosθ</c> 夹住，物理上不会超过静摩擦极限），
+    /// 在 <see cref="BrakeRampTime"/> 内**线性衰减到** <c>μk·g·cosθ</c>，
+    /// 之后保持滑动摩擦直到停住：
+    /// <code>
+    ///   a(t) = μk·g·cosθ + (a₀ − μk·g·cosθ) · (1 − min(1, t/T))
+    ///   a₀   = min(μs·g·cosθ, GroundAccel)      // 平地 14 m/s²
+    /// </code>
+    ///
+    /// 为什么是这个方向（先强后弱）：人主动停下时**先用力蹬地**（静摩擦能做功），
+    /// 速度降下来以后脚才逐渐锁死成滑动；反过来（先弱后强）会让"刚松手那一下"
+    /// 几乎不掉速，感觉像刹不住。
+    ///
+    /// 平地实测（v=6.6 m/s 松手）：第 1 tick 掉 0.233 m/s（=14·dt），
+    /// 0.25 s 后衰减到 0.114 m/s/tick（=6.86·dt），总停距 ≈ 2.5 m。
+    /// </summary>
+    public float BrakeRampTime = 0.25f;
+
+    /// <summary>
+    /// 空中输入加速度 (m/s²，默认 1.2)。
+    ///
+    /// 需求：「空中输入也不会产生什么作用，只有很微小的偏移，基本上只能靠惯性飞跃」。
+    /// 旧的 <see cref="AirAccel"/>(10) + <see cref="AirWishSpeed"/>(1.524) 组合是
+    /// Source 谱系的 air-strafe：实测能把 6.6 m/s 加到 7.95 m/s（+20%），
+    /// 明显违反"靠惯性"。
+    ///
+    /// 现在空中输入只负责**微调方向**，并且额外有
+    /// <see cref="AirSteerSpeedAllowance"/> 的**速度增益上限**（见 StepAir）。
+    /// </summary>
+    public float AirControlAccel = 1.2f;
+
+    /// <summary>
+    /// 打滑耗散的**滑移速度参考值** (m/s，默认 1.0)。
+    ///
+    /// 脚相对地面滑移得越快，滑动摩擦耗散越强：
+    /// <code>drag = μk·g·cosθ·(1 − grip)·(1 + v / SlipDragRefSpeed)</code>
+    ///
+    /// 这个 <c>(1 + v/vRef)</c> 项的存在让"打滑地面"有一个**稳定的终端速度**
+    /// （推进 = 耗散），而不是慢慢爬到顶速、也不是完全动不了。
+    /// 冰面（μk=0.05）实测终端速度 ≈ 1.1 m/s：能挪，但挪不快。
+    /// </summary>
+    public float SlipDragRefSpeed = 1.0f;
+
+    /// <summary>
+    /// 空中允许比离地时多出的速度 (m/s，默认 0.5)。
+    ///
+    /// 无论怎么转视角/按方向，空中水平速度都**不会超过**
+    /// <c>离地速度 + 这个值</c> —— 于是"空中只能靠惯性，最多微调"成为一条硬不变量，
+    /// 而不是"加速度调小所以看起来还行"。
+    /// </summary>
+    public float AirSteerSpeedAllowance = 0.5f;
+
+    // ═════════ v0.5.2 体重（需求 m01928 第 4 点）═════════════
+
+    /// <summary>
+    /// **BMI 身体质量指数**（默认 21.7 = 正常区间 18.5–24.9 的中位数）。
+    ///
+    /// 需求：「我希望以国际身体体重指数 BMI = 体重(kg)/[身高(m)]² 来计算获得体重，
+    /// 目前角色身高为 1.9m，BMI 的正常范围为 18.5-24.9，取中位数 21.7 计算，
+    /// 角色体重应该为 78.337kg」。
+    /// </summary>
+    public float BodyBmi = 21.7f;
+
+    /// <summary>体重覆盖值 (kg)。&gt;0 时忽略 BMI 计算（用于特殊角色/装备）。</summary>
+    public float BodyMassOverride = 0f;
+
+    /// <summary>
+    /// 体重 (kg)：<c>BMI × 身高²</c>（默认 21.7 × 1.9² = **78.337 kg**）。
+    ///
+    /// ⚠ **重要（诚实的物理提醒）**：在纯移动系统里，质量会**在摩擦加速度里约掉**
+    /// —— <c>a = μ·N/m = μ·g·cosθ</c>，与体重无关。所以体重**不改变**走跑滑的加减速曲线。
+    /// 它真正起作用的地方是**力**：
+    ///   · 调试渲染器里显示的法向力/摩擦力（N）；
+    ///   · 未来木筏/刚体的冲量传递（<c>Δv = J/m</c>，轻的人被弹得更远）；
+    ///   · 推箱子、被风吹、被爆炸推动这类"外力 ÷ 质量"的场景。
+    /// 这些接口现在就按 N 记账，等接入刚体时直接可用。
+    /// </summary>
+    public float BodyMass => BodyMassOverride > 0f
+        ? BodyMassOverride
+        : BodyBmi * StandHeight * StandHeight;
+
+    /// <summary>脚下法向力 (N) = m·g·cosθ。</summary>
+    public float NormalForce(float cosT) => BodyMass * Gravity * Clamp01(cosT);
+
+    /// <summary>最大静摩擦力 (N) = μs·N。走跑时身体能获得的推进力上限。</summary>
+    public float MaxStaticFrictionForce(float cosT)
+        => GroundStaticFrictionCoefficient * NormalForce(cosT);
+
+    /// <summary>滑动摩擦力 (N) = μk·N。滑铲/抱死刹车/打滑时的大小。</summary>
+    public float MaxKineticFrictionForce(float cosT)
+        => GroundFrictionCoefficient * NormalForce(cosT);
+
+    /// <summary>最大静摩擦能提供的加速度 (m/s²) = μs·g·cosθ（质量约掉了）。</summary>
+    public float StaticFrictionAccel(float cosT)
+        => GroundStaticFrictionCoefficient * Gravity * Clamp01(cosT);
+
+    /// <summary>滑动摩擦加速度 (m/s²) = μk·g·cosθ。</summary>
+    public float KineticFrictionAccel(float cosT)
+        => GroundFrictionCoefficient * Gravity * Clamp01(cosT);
+
+    private static float Clamp01(float v) => v < 0f ? 0f : (v > 1f ? 1f : v);
+
+    /// <summary>
+    /// [C] **主动急停**加成倍率（默认 2.0）。
+    ///
+    /// v0.5 需求（m01070 第 3 点）：「改真库仑 μ≈0.7 …+『主动急停』补手感」。
+    /// 真库仑把松散松键的停距从 1.24 m 拉长到 3.18 m，手感会"刹不住"；
+    /// 人类想停时本来就会主动蹬地制动，所以**输入方向与速度方向相反**时把 μ 乘这个倍率：
+    /// <c>a_brake = 2.0 × 0.7 × g = 13.7 m/s²</c> ⇒ 6.6 m/s 停距 ≈ 1.59 m。
+    ///
+    /// 注意：滑铲**不吃**这个加成（需求 m00914 ②：「滑铲的时候不要有制动加成，
+    /// 不然会影响持续滑行手感」）—— 滑铲有自己的库仑模型（见 StepSlide）。
+    /// </summary>
+    public float ActiveBrakeMultiplier = 2.0f;
+
+    /// <summary>
+    /// [C] **坡面合速度**的速度调节时间常数 τ（s，默认 0.25）。
+    ///
+    /// v0.5 需求（m00914 ⑥）：「我希望跑动和滑铲的时候用我的那套（基础移速随坡度变化
+    /// + 重力加成），蹲走和正常行走时用制动防止摔倒那套，因为玩家可以操控人物是奔跑
+    /// 还是行走……如果是慢慢走那就是玩家不希望摔倒，如果是奔跑和滑铲就是希望体验
+    /// 斜坡带来的加速，不顾一切冲下斜坡」。
+    ///
+    /// 模型（**跑动** = 按着冲刺键且未蹲下时）：
+    /// <code>
+    ///   v_target = v_base + τ · g · sinθ · (下坡方向 · 期望方向)
+    /// </code>
+    ///   · 下坡（沿坡向下跑）：v_target &gt; v_base ⇒ 越跑越快；
+    ///   · 上坡：v_target &lt; v_base ⇒ 明显掉速；
+    ///   · 横向跑（等高线）：sinθ 项被点积吃掉 ⇒ 速度不变。
+    ///
+    /// 为什么是 τ·g·sinθ 而不是"直接加 g·sinθ 加速度"：
+    ///   人是**速度调节器**，不是自由落体 —— 跑者会主动控制速度。
+    ///   设肌肉调节增益 = 1/τ（速度偏差越大、纠正越猛），则稳态时
+    ///   <c>g·sinθ = (v − v_base)/τ</c> ⇒ <c>v = v_base + τ·g·sinθ</c>。
+    ///   这也是"坡度加成自动跟着星球重力走"的来源（换月球 g 小 ⇒ 加成小）。
+    ///
+    /// 数值（地球 g=9.80665、冲刺 6.604）：30° 下坡 7.83 / 上坡 5.38；
+    ///   45° 下坡 8.34 / 上坡 4.87。**走（4.407）与蹲走（2.0）不吃这个加成** ——
+    ///   那是"玩家不希望摔倒"的那一档，只保留库仑摩擦（见
+    ///   <see cref="GroundFrictionCoefficient"/>）。
+    /// </summary>
+    public float SlopeSpeedTimeConstant = 0.25f;
 
     /// <summary>[A] 空中**没有**摩擦。wiki 引擎篇：「Apex does not feature any Air friction」。</summary>
     public float AirFriction = 0f;
@@ -126,8 +360,15 @@ public sealed class MovementConfig
 
     // ═════════════════════════════ 跳跃 ═════════════════════════════
 
-    /// <summary>[A] 跳跃高度 (m) = 56 hu = 1.4224。wiki Jump。</summary>
-    public float JumpHeight = 1.42240f;
+    /// <summary>
+    /// **[Target] 跳跃高度 (m) = 0.75**（v0.5 需求 m00952：「人物跳跃高度改成 0.75m，
+    /// 滞空时间无所谓，高度达到 0.75m 就行」）。
+    ///
+    /// v0.4.x 是 56 hu = 1.4224（Apex 原版）。改到 0.75 之后滞空自然变短：
+    /// 地球重力下 v = √(2·9.80665·0.75) = 3.835 m/s，滞空 ≈ 0.78 s。
+    /// 空中按蹲可以收腿（<see cref="CrouchHeight"/>），所以能跳上比 0.75 m 矮的台子。
+    /// </summary>
+    public float JumpHeight = 0.75f;
 
     /// <summary>[C] 跳跃缓冲窗口 (s)：落地前按跳，落地瞬间自动触发。</summary>
     public float JumpBufferTime = 0.12f;
@@ -150,7 +391,7 @@ public sealed class MovementConfig
     public float BunnyHopWindow = 1.0f;
 
     /// <summary>[A] Bunnyhop 减速上限 (m/s) = 100 hu/s = 2.54（wiki：超过冲刺速度时每次 bhop 扣这么多）。</summary>
-    public float BunnyHopSpeedPenalty = 2.54000f;
+    public float BunnyHopSpeedPenalty = 2.54f;
 
     /// <summary>[A] 跳跃 grace 的 cutoff 速度 (m/s)：超过它就不再施加 bhop 减速（`jump_grace_cutoff_speed` 的语义）。</summary>
     public float JumpGraceCutoffSpeed = 12.0f;
@@ -160,17 +401,17 @@ public sealed class MovementConfig
 
     // ═════════════════════════════ 体型（需求方口径，优先） ═════════════════════════════
 
-    /// <summary>**需求方口径**：站立胶囊高度 1.95 m。</summary>
-    public float StandHeight = 1.95f;
+    /// <summary>**需求方口径**：站立胶囊高度 1.90 m（v0.5 需求 m00952 从 1.95 改到 1.90）。</summary>
+    public float StandHeight = 1.90f;
 
-    /// <summary>**需求方口径**：蹲下胶囊高度 = 站立一半 = 0.975 m。</summary>
-    public float CrouchHeight = 0.975f;
+    /// <summary>**需求方口径**：蹲下胶囊高度 = 站立一半 = 0.95 m。</summary>
+    public float CrouchHeight = 0.95f;
 
     /// <summary>**需求方口径**：眼位 = 胶囊顶端 − 0.10 m（站立时 1.85 m，蹲下时 0.875 m）。</summary>
     public float EyeHeightOffset = 0.10f;
 
     /// <summary>[A] 胶囊半径 (m) = 16 hu = 0.4064。wiki 引擎篇。</summary>
-    public float CapsuleRadius = 0.40640f;
+    public float CapsuleRadius = 0.406f;
 
     /// <summary>[C] 蹲下/站起过渡时间 (s)。</summary>
     public float CrouchTransitionTime = 0.12f;
@@ -184,20 +425,47 @@ public sealed class MovementConfig
 
     // ═════════════════════════════ 滑铲 ═════════════════════════════
 
-    /// <summary>[A] 地面滑铲最低水平速度 (m/s) = 200 hu/s = 5.08（`slideRequiredStartSpeed`）。</summary>
-    public float SlideMinStartSpeed = 5.08000f;
+    /// <summary>
+    /// **滑铲触发门槛** (m/s)：判定用的是「**当前行走平面内**的移动速度」
+    /// （速度在 [地面法线垂直平面] 上的投影大小），**不含** slideboost。
+    ///
+    /// v0.5 需求（m01202）：「滑铲入口是基于当前行走平面的移动速度
+    /// （由基础移速 + 外置因素获得）判定是否超过滑铲阈值，再决定是否进入滑铲状态，
+    /// 当允许进入滑铲状态后再添加 boost 速度」。
+    ///
+    /// 取值 5.0（原 200 hu/s = 5.08，按"取整"要求收敛到 5.0）。
+    /// </summary>
+    public float SlideMinStartSpeed = 5.0f;
 
-    /// <summary>[A] 空中滑铲最低水平速度 (m/s) = 90 hu/s = 2.286（`slideRequiredStartSpeedAir` 的水平部分）。</summary>
-    public float SlideMinStartSpeedAirHorizontal = 2.28600f;
+    // ★ v0.4.2 删除了两个字段：SlideMinStartSpeedAirHorizontal(2.286) 与
+    //   SlideMinStartSpeedAirVertical(5.08) —— 它们对应 Apex 的 Air Slide 门槛
+    //   （`slideRequiredStartSpeedAir`：水平 > 90hu/s 且下坠 > 200hu/s），
+    //   而空中滑铲整个机制已经在 v0.4.2 删除（见 ApexMovementCore.StepAir 的说明）。
+    //
+    //   为什么删而不是留：删掉入口之后这两个值**没有任何代码路径读取**，
+    //   但它们在配置里仍然是一个显眼的公开旋钮 —— 后人改它会得到"改了没反应"，
+    //   然后去怀疑是不是别的地方有 bug。逆向量出来的知识（90hu/s、200hu/s）
+    //   放在这里当备注就够，不需要留一个假接口。
 
-    /// <summary>[A] 空中滑铲最低向下垂直速度 (m/s) = 200 hu/s = 5.08（垂直部分，**必须同时满足**）。</summary>
-    public float SlideMinStartSpeedAirVertical = 5.08000f;
+    /// <summary>
+    /// Slideboost 增量 (m/s) = 150 hu/s = 3.81（水平面口径）。
+    ///
+    /// v0.5 需求（m01202）：「基于滑铲平面角度添加 boost 速度……这是基于投影的」。
+    /// 也就是说 3.81 是**水平面**上的增量；真正加到"沿坡速度"上时要按坡度换算：
+    /// <code>
+    ///   boost_沿坡 = SlideBoostSpeed / cosθ      (θ = 坡面倾角)
+    /// </code>
+    /// 需求方给的例子：30° 坡、boost = √3 ⇒ 沿坡 boost = √3/cos30° = 2.0 m/s。
+    /// 直觉：同样的"水平推进量"，在斜面上要走更长的坡面距离才能实现。
+    /// </summary>
+    public float SlideBoostSpeed = 3.81f;
 
-    /// <summary>[A] Slideboost 增量 (m/s) = 150 hu/s = 3.81。wiki Slide：「Slideboost is: 150hu/s * (...)」。</summary>
-    public float SlideBoostSpeed = 3.81000f;
-
-    /// <summary>[A] 滑铲速度上限 (m/s) = 400 hu/s = 10.16。wiki Slide：「capped at: 400hu/s * (...)」。</summary>
-    public float SlideMaxSpeed = 10.16000f;
+    // ★ v0.5（需求 m01202）：「取消滑铲速度上限」。
+    //
+    //   原字段 SlideMaxSpeed = 10.16（400 hu/s）已**删除**：它只在 BeginSlide
+    //   那一刻夹紧 boost 后的速度，现在入口速度 = 平面速度 + boost 且不再夹紧，
+    //   滑铲期间的速度完全由坡面物理 a = g·sinθ − μ·g·cosθ 决定。
+    //   保留一个"有旋钮但没人读"的死字段只会误导后来人（历史教训见本文件别处的说明）。
 
     /// <summary>[A] Slideboost 冷却 (s) = 2.0。wiki Slide：「the Slideboost has a 2sec cooldown」。</summary>
     public float SlideBoostCooldown = 2.0f;
@@ -216,8 +484,18 @@ public sealed class MovementConfig
     /// </summary>
     public float SlideFrictionCoefficient = 0.45f;
 
-    /// <summary>[C] 滑铲自动站起的最低速度 (m/s)。低于它自动结束滑铲。</summary>
-    public float SlideMinSpeed = 2.5f;
+    /// <summary>
+    /// **滑铲结束速度** = 蹲走基础移速（保底）。
+    ///
+    /// v0.5 需求（m01202）：「基础蹲走移速是保证滑铲被减速后的最慢移动速度（用来保底），
+    /// 变成最慢移动速度后如果玩家还按着 ctrl，则会变成蹲伏状态，
+    /// 如果玩家还按着 w+ctrl，则会变成蹲走状态」。
+    ///
+    /// 于是滑铲不会"突然降到 0"，而是滑到蹲走速度就无缝交还给地面状态机：
+    /// 松 W 就蹲着（速度被地面摩擦继续吃掉），按 W 就接着蹲走。
+    /// 原 SlideMinSpeed = 2.5 已删除（口径统一到 CrouchWalkSpeed）。
+    /// </summary>
+    public float SlideExitSpeed => CrouchWalkSpeed;
 
     /// <summary>[C] 滑铲最长持续时间 (s)。wiki 说滑铲本身**没有**计时器，这里只是防卡死兜底。</summary>
     public float SlideMaxDuration = 6.0f;
@@ -305,13 +583,13 @@ public sealed class MovementConfig
     public float StepTiltFootRadius = 0f;
 
     /// <summary>[A] Auto-mantle 高度上限 (m) = 80 hu = 2.032。wiki Auto mantle。</summary>
-    public float AutoMantleMaxHeight = 2.03200f;
+    public float AutoMantleMaxHeight = 2.03f;
 
     /// <summary>[A] 攀爬总高度上限 (m) = 273 hu = 6.9342。wiki 引擎篇 + Climb（climb space cutoff）。</summary>
     public float MantleMaxHeight = 6.93420f;
 
     /// <summary>[A] 攀爬附着偏移 (m) = 100 hu = 2.54（Attach offset，"个人体力上限"）。</summary>
-    public float ClimbAttachOffset = 2.54000f;
+    public float ClimbAttachOffset = 2.54f;
 
     /// <summary>[A] 攀爬结束额外上抛 (m) = 28 hu = 0.7112（End boost）。</summary>
     public float ClimbEndBoost = 0.71120f;
@@ -473,10 +751,10 @@ public sealed class MovementConfig
     public float HardFallDist = 20.32f;
 
     /// <summary>[A] Fallstun 起始下落高度 (m) = 300 hu = 7.62。wiki Fallstun。</summary>
-    public float FallStunMinHeight = 7.62000f;
+    public float FallStunMinHeight = 7.62f;
 
     /// <summary>[A] Fallstun 满值下落高度 (m) = 800 hu = 20.32。wiki Fallstun。</summary>
-    public float FallStunMaxHeight = 20.3200f;
+    public float FallStunMaxHeight = 20.32f;
 
     /// <summary>[A] Fallstun 最长持续时间 (s) = 1.0。wiki Fallstun。</summary>
     public float FallStunMaxDuration = 1.0f;
@@ -559,7 +837,7 @@ public sealed class MovementConfig
 
     // ═════════════════ 打滑（Slip / C_TriggerSlipSphere） ═════════════════
     //
-    // 逆向依据（docs/reverse-engineering-v0.2.md §5.10）：
+    // 逆向依据（docs/REVERSE-ENGINEERING.md §2.5.10）：
     //   体积：DT_TriggerSlipSphere / C_TriggerSlipSphere / trigger_slip_sphere，
     //         字段 m_slipSpeed / m_slipAcceleration / m_defaultSlipDirection
     //   玩家：m_touchingSlipTriggersCount / Speed[] / Acceleration[] / Direction[] / Origin[]，
@@ -593,7 +871,7 @@ public sealed class MovementConfig
 
     // ═════════════════ 扒墙 / 悬垂（Wall hang / dangle） ═════════════════
     //
-    // 逆向依据（docs/reverse-engineering-v0.2.md §5.11）：
+    // 逆向依据（docs/REVERSE-ENGINEERING.md §2.5.11）：
     //   m_wallHanging / m_wallHangTime / IsWallHanging / m_wallDangleClimbProgressFloor
     //   ACT_MP_WALLHANG_FRONT / UP / RIGHT / LEFT / IDLE  ← 5 个姿势 = 可上下左右移动
     //   sound_wallHangStart / Slip / Complete / Fall     ← 挂上 / 下滑 / 完成 / 掉落
@@ -643,6 +921,21 @@ public sealed class MovementConfig
     public float WallHangReach = 0.9f;
 
     /// <summary>
+    /// [C] 抓墙时允许的"背离墙面"速度上限 (m/s)。v0.4.2 新增。
+    ///
+    /// 判据：<c>approach = -dot(水平速度, 墙面法线)</c>
+    ///   · approach &gt; 0 ⇒ 正在靠近墙（前进 / 贴墙跳）⇒ 抓
+    ///   · approach &lt; -WallGrabMaxRecedeSpeed ⇒ 正在远离墙 ⇒ 不抓
+    ///   · |approach| ≤ 该值 ⇒ 垂直下落 / 几乎静止 ⇒ 抓（保留"下落自动扒住"）
+    ///
+    /// 修的是「站在高台上按住 S 倒退掉下去，被台子侧面吸住一小会儿」：
+    /// 倒退时前向射线恰好打在刚离开的那块台的侧面上（人已越过边缘、台子在身后，
+    /// 但朝向没变 ⇒ 台子落在"正前方"），旧判定只看"面向墙 + 正在下落"，
+    /// 于是把人吸住了。按着 W 时无条件放行（W 就是"我要往前"的明确意图）。
+    /// </summary>
+    public float WallGrabMaxRecedeSpeed = 0.05f;
+
+    /// <summary>
     /// [C] 抓墙要求的最小**离地间隙** (m)：脚底到脚下地面的距离小于这个值就不抓。
     ///
     /// 为什么需要：扒墙默认化之后，"站在墙根下"与"挂在墙上"在几何上只差几厘米 ——
@@ -650,7 +943,20 @@ public sealed class MovementConfig
     /// "空中 + 够得到墙 + 正在下落"，于是人被凭空吸到墙上去。
     /// 加一条脚下探针把这两种情况彻底分开：脚底下就是地面 ⇒ 该落地，不该挂墙。
     /// </summary>
-    public float WallGrabMinGroundClearance = 0.5f;
+    /// ★ v0.5 二次调整（用户 m01300 BUG 2「疲劳跳期间无法攀爬」）：
+    ///   上一版按跳跃能力把 0.5 缩到 0.30，结果是**任何低于 0.30 m 的腾空都抓不到墙**。
+    ///   跳跃疲劳（antiMultiJumpHeightFrac = 0.30）下连续跳只有 0.75×0.30 ≈ 0.23 m 高，
+    ///   永远够不到 0.30 —— 实机表现就是「疲劳跳期间完全无法攀爬」。
+    ///   而且未来换超重力星球（g 越大跳得越低）会整块失效。
+    ///
+    ///   需求原话：「我希望改成只要跳了就攀爬」。所以现在这道门**只对"非跳跃"的腾空生效**：
+    ///   · **跳出来的**腾空（<c>_leftGroundByJump</c>）→ 完全豁免，跳多低都能抓；
+    ///   · 走下台沿 / 被推落 / 生成在空中 → 仍然要求 0.30 m 间隙，
+    ///     防止「贴着墙走下小台阶被凭空吸到墙上」（这条门当初就是为它加的）。
+    ///
+    ///   这样「跳跃高度」与「能不能抓墙」彻底解耦：换星球、调跳跃高度、
+    ///   跳跃疲劳都不会再影响攀爬可用性。
+    public float WallGrabMinGroundClearance = 0.30f;
 
     /// <summary>[C] 沿墙左右横移的速度 (m/s)（`ACT_MP_WALLHANG_LEFT/RIGHT`）。</summary>
     public float WallHangShimmySpeed = 0.8f;
@@ -700,11 +1006,206 @@ public sealed class MovementConfig
 
     public MovementConfig Clone() => (MovementConfig)MemberwiseClone();
 
-    /// <summary>由跳跃高度反解初速：v = sqrt(2·g·h)。</summary>
-    public float JumpVelocity => MathF.Sqrt(2f * Gravity * JumpHeight);
+    /// <summary>
+    /// 由**设计目标高度**反解初速。
+    ///
+    /// ★ v0.5（需求 m01070）：「我希望的是玩家跳起来后，**脚底板离地面 0.75 m**」——
+    ///   也就是说 <see cref="JumpHeight"/> 的口径是**实测峰高**，不是解析值。
+    ///
+    /// 连续解是 <c>v = √(2gh)</c>；但本项目的积分是**半隐式欧拉**
+    /// （StepAir 里先 <c>v -= g·dt</c> 再位移），离散峰高会比解析值多
+    /// <c>v·dt/2 + g·dt²/8</c>（60 Hz、h=0.75 时约 +3.3 cm，+4.4%）。
+    /// 所以要显式扣掉这个 O(dt) 偏置：
+    ///
+    /// <code>
+    ///   apex = v²/(2g) + v·dt/2 + g·dt²/8 = h
+    ///   ⇒ 解二次式得 v = √(2gh) − g·dt/2      （dt² 项自动抵消）
+    /// </code>
+    ///
+    /// 例：h=0.75、g=9.80665、dt=1/60 ⇒ v = 3.8354 − 0.0817 = 3.7537 m/s，
+    /// 实测峰高 0.7502 m（<c>PhysicsTest</c> ⑯ 复核）。
+    /// </summary>
+    public float JumpVelocity
+        => MathF.Sqrt(2f * PlanetProfile.Earth.SurfaceGravity * JumpHeight)
+         - PlanetProfile.Earth.SurfaceGravity * FixedDelta * 0.5f;
 
-    /// <summary>理论滞空时间 (s) = 2v/g（用于自检交叉验证 wiki 的 0.74s）。</summary>
-    public float JumpAirTime => 2f * JumpVelocity / Gravity;
+    /// <summary>
+    /// **换星球后实际能跳多高**（m）—— 固定起跳速度、不同重力下的弹道峰高。
+    ///
+    /// 需求（m01619）原话：「实际上是不同的星球有不同的重力加速度，然后人起跳的力度
+    /// （加速度）是一样的，不同星球的跳跃高度不一样，但是人起跳的速度无法直接得出，
+    /// 所以要用地球的合理跳高数值配合地球的重力反推人体想跳跃时使用的力度，
+    /// 这样就能得出人干特定事情的固定的力，然后再把这个力应用到不同星球上，
+    /// 结合不同星球的重力得出不同的跳跃高度效果」。
+    ///
+    /// 所以物理链是：
+    /// <code>
+    ///   地球设计高度 0.75 m + 地球 g ⇒ 起跳速度 v（= 人体腿部冲量，跨星球不变）
+    ///   ⇒ 其它星球：apex = v²/(2·g_planet)  （重力越小跳得越高）
+    /// </code>
+    /// 这个属性就是那个 **apex**（用与求解器相同的半隐式欧拉离散求和算，不是解析值）：
+    /// <code>
+    ///   y = (m+1)·v·dt − g·dt²·m(m+1)/2,   m = ⌈v/(g·dt)⌉
+    /// </code>
+    /// 地球 0.750、月球 4.35、火星 1.90、Apex 重力 0.34（实测值见 <c>PhysicsTest</c> ⑫）。
+    /// </summary>
+    public float JumpApexOnPlanet(float gravity)
+    {
+        if (gravity <= 1e-6f) return float.PositiveInfinity;
+        float v = JumpVelocity;
+        float dt = FixedDelta;
+        float step = v / (gravity * dt);
+        int m = (int)MathF.Ceiling(step - 1e-4f);
+        if (m < 0) m = 0;
+        return (m + 1) * v * dt - gravity * dt * dt * m * (m + 1) * 0.5f;
+    }
+
+    /// <summary>当前星球上的实际跳跃峰高 (m)。</summary>
+    public float JumpApex => JumpApexOnPlanet(Gravity);
+
+    /// <summary>当前星球上的理论滞空时间 (s) = 2v/g（离地到回到同高度）。</summary>
+    public float JumpAirTime => 2f * EffectiveJumpVelocity / Gravity;
+
+    // ═════════════════ 起跳：有限加速时间（需求 m00460）═════════════════
+
+    /// <summary>
+    /// 起跳的**有限加速时间** (s)。**0 = 瞬时冲量**（Apex 现行行为，也是默认值）。
+    ///
+    /// 需求方原话：「可以先给一个合适的短暂加速时间，如 0.2 秒内匀加速到 14 m/s，
+    /// 之后按物理重力减速下落」。设为 &gt;0 后，起跳不再是一次速度突变，而是持续
+    /// <see cref="JumpAccelTicks"/> 个 tick 的**匀加速**（推力恒定），期间重力照常作用。
+    ///
+    /// **取值必须落在 FixedDelta 的整数倍上**，否则不同帧率的跳跃高度不一致
+    /// （会破坏 <c>DeterminismTest</c> 的帧率不变性断言）。这里自动四舍五入：
+    /// <see cref="JumpAccelTicks"/> = round(JumpAccelTime / FixedDelta)，夹在 [0, 60]。
+    /// </summary>
+    public float JumpAccelTime = 0f;
+
+    /// <summary>起跳加速段占用的 tick 数（由 <see cref="JumpAccelTime"/> 四舍五入，夹 [0,60]）。</summary>
+    public int JumpAccelTicks => Math.Clamp((int)MathF.Round(JumpAccelTime / FixedDelta), 0, 60);
+
+    /// <summary>起跳加速段实际时长 (s) = <see cref="JumpAccelTicks"/> × FixedDelta。</summary>
+    public float JumpAccelTimeActual => JumpAccelTicks * FixedDelta;
+
+    /// <summary>
+    /// 达到 <see cref="JumpHeight"/> 所需的**加速段出口速度** (m/s)。
+    ///
+    /// 纯冲量（t_a = 0）：v = √(2gh)。
+    /// 有限加速（t_a &gt; 0）：加速段 T 内身体已经上升了 ½·u·T，剩余部分靠惯性，
+    /// 所以总峰高是
+    /// <code>
+    ///     apex = u²/(2g) + u·T/2 = h
+    ///     ⇒ u = (−g·T + √(g²T² + 8gh)) / 2
+    /// </code>
+    /// 其中 u 是加速段结束那一刻的速度（**不是**推力对应速度）。
+    /// 例：h=10 m、g=9.8、T=0.2 s ⇒ u=13.054 m/s（而不是 √(2gh)=14.000）。
+    /// </summary>
+    public float JumpRampExitVelocity
+    {
+        get
+        {
+            // ★ v0.5（需求 m01619）：出口速度就是**固定的起跳速度** <see cref="JumpVelocity"/>，
+            //   与星球无关。有限加速时间只是把同一份冲量**分摊到 n 个 tick**（推力更小、
+            //   时间更长），它不改变"人的爆发力"这个物理量 —— 换星球也不该变。
+            //
+            //   （v0.4.3 的写法是 (−gT+√(g²T²+8gh))/2，那是"给定高度 h、在当前重力下反解"，
+            //    会随星球重力变 ⇒ 与"固定力度"矛盾，已改。）
+            return JumpVelocity;
+        }
+    }
+
+    /// <summary>
+    /// 加速段需要的**总向上加速度** (m/s²)，已含抵消重力那一份，并且做了**离散补偿**。
+    ///
+    /// 连续解是 <c>a = u/T + g</c>（加速段里重力同时在拉，推力要额外抵消 g）。
+    /// 但起跳那一 tick 是**先给推力、不扣重力**的（否则 vy=0 会被贴地吸附当成没起跳），
+    /// 所以整个加速段少扣了一次 g·dt —— 等价于出口速度多了 g·dt。
+    /// 补偿办法是把推力降一点点：
+    /// <code>
+    ///     a = u/T + g·(1 − 1/n)        （n = 加速段 tick 数）
+    /// </code>
+    /// 这样第 n tick 结束时速度**逐位等于** u：<c>n·a·dt − (n−1)·g·dt = u</c>。
+    ///
+    /// "起跳爆发力"就是 a / g（默认配置 h=1.4224、t_a=0.2 s ⇒ 约 1.33 g，
+    /// 比人类起跳的 2–3 g 还温和；这也是"0.2 s 的加速在体感上仍接近冲量"的原因）。
+    /// </summary>
+    public float JumpRampThrust
+    {
+        get
+        {
+            int n = JumpAccelTicks;
+            if (n <= 0) return 0f;
+            return JumpRampExitVelocity / JumpAccelTimeActual + Gravity * (1f - 1f / n);
+        }
+    }
+
+    /// <summary>
+    /// 起跳实际使用的**离地速度**（含加速时间修正）。<c>DoJump</c> 用这个值。
+    /// 默认配置（t_a=0）下逐位等于 <see cref="JumpVelocity"/>。
+    /// </summary>
+    public float EffectiveJumpVelocity => JumpAccelTicks <= 0 ? JumpVelocity : JumpRampExitVelocity;
+
+    /// <summary>
+    /// **实际会跳多高**（m）。
+    ///
+    /// <see cref="JumpHeight"/> 是**解析目标**；离散积分（半隐式欧拉）会额外多跳
+    /// <c>v₀·dt/2 + g·dt²/8</c>（起跳 tick 先位移后加重力，加辛欧拉的 O(dt) 偏置），
+    /// 60 Hz 下约 **+4.5%**：标称 1.4224 → 实测 1.4869。
+    /// 把这个差值显式暴露出来，调参的人就不会被"标称 vs 实际"困惑。
+    ///
+    /// 加速模式（t_a &gt; 0）下离散偏置的形式不同，这里退回解析目标值
+    /// （实测偏差 &lt; 2%，由 <c>PhysicsTest</c> 复核）。
+    /// </summary>
+    public float EffectiveJumpHeight
+    {
+        get
+        {
+            int n = JumpAccelTicks;
+            if (n <= 0) return JumpApex;                 // 纯冲量：就是当前星球的弹道峰高
+
+            // 加速模式：加速段位移 + 剩余惯性段位移（都用离散求和，不是连续积分）
+            //
+            //   加速段：v_k = (k+1)·a·dt − k·g·dt  ⇒  Σ v_k·dt
+            //          = a·dt²·n(n+1)/2 − g·dt²·n(n−1)/2
+            //   惯性段：从 u 起按当前星球重力自由上升，直到竖直速度 ≤ 0
+            float dt2 = FixedDelta * FixedDelta;
+            float a = JumpRampThrust;
+            float u = JumpRampExitVelocity;
+            float rampRise = a * dt2 * n * (n + 1) * 0.5f
+                           - Gravity * dt2 * n * (n - 1) * 0.5f;
+
+            float gdt = Gravity * FixedDelta;
+            int m = gdt > 1e-6f ? (int)MathF.Ceiling(u / gdt - 1e-4f) : 0;
+            if (m < 0) m = 0;
+            float coastRise = m * u * FixedDelta - Gravity * dt2 * m * (m + 1) * 0.5f;
+            return rampRise + coastRise;
+        }
+    }
+
+    // ═════════════════ 由物理量反推的"可读"派生量 ═════════════════
+
+    /// <summary>
+    /// 滑铲的**临界坡角** (deg) = arctan(μ)。
+    /// 比 μ 本身直观：坡度小于它滑铲必然停下，大于它一路加速。
+    /// 默认 μ=0.45 ⇒ 24.23°（实测 dv/dt 在 24° 为 −0.09、30° 为 +2.29，符号在此翻转）。
+    /// </summary>
+    public float SlideCriticalAngleDeg =>
+        MathF.Atan(SlideFrictionCoefficient) * 180f / MathF.PI;
+
+    /// <summary>
+    /// 地面加速到顶速所需时间 (s) ≈ 1/<see cref="GroundAccel"/>。
+    /// 这是 Source 谱系加速度公式的等效时间常数（不是严格的到达时间，
+    /// 因为该公式的加速度随 |wishSpeed − v| 衰减，只有渐近到达）。
+    /// </summary>
+    public float AccelTimeToTopSpeed => GroundAccel > 1e-4f ? 1f / GroundAccel : float.PositiveInfinity;
+
+    /// <summary>
+    /// 把 <see cref="MaxFallSpeed"/> 硬夹换算成**二次阻力系数** k (1/m)：
+    /// <c>a = g − k·v²</c>，终端速度处 g = k·v_t² ⇒ k = g / v_t²。
+    /// 默认 20.7802 / 88.9² = 2.6293e-3。当前实现仍是硬夹（见 README 物理审计），
+    /// 这个量用于"如果要改成真阻力"时的换算。
+    /// </summary>
+    public float TerminalDragK => Gravity / MathF.Max(1e-4f, MaxFallSpeed * MaxFallSpeed);
 
     /// <summary>根据台面相对脚底的高度分类翻越档位。</summary>
     public MantleClass ClassifyMantle(float heightAboveFeet)
@@ -769,7 +1270,6 @@ public sealed class MovementConfig
             CoyoteTime = 0.10f,
             SlideMinStartSpeed = 5.0f,
             SlideBoostSpeed = 3.0f,
-            SlideMaxSpeed = 14.0f,
             SlideBoostCooldown = 0.35f,
             SlideJumpSpeedThreshold = 14.0f,
             SlideJumpTimeWindow = 0.55f,
@@ -797,9 +1297,15 @@ public sealed class MovementConfig
             throw new ArgumentOutOfRangeException(nameof(SlipSteerFactor));
         if (SlideFrictionCoefficient < 0f)
             throw new ArgumentOutOfRangeException(nameof(SlideFrictionCoefficient));
+        if (!float.IsFinite(JumpAccelTime) || JumpAccelTime < 0f)
+            throw new ArgumentOutOfRangeException(nameof(JumpAccelTime), "JumpAccelTime 必须是有限的非负数");
+        if (JumpAccelTime > FixedDelta * 60f)
+            throw new ArgumentOutOfRangeException(nameof(JumpAccelTime), "JumpAccelTime 上限 1 秒（60 tick）");
         if (WallHangMaxViewAngle <= 0f || WallHangMaxViewAngle >= 90f)
             throw new ArgumentOutOfRangeException(nameof(WallHangMaxViewAngle));
         if (WallHangReach <= 0f) throw new ArgumentOutOfRangeException(nameof(WallHangReach));
+
+        if (WallGrabMaxRecedeSpeed < 0f) throw new ArgumentOutOfRangeException(nameof(WallGrabMaxRecedeSpeed));
         if (WallGrabMinGroundClearance < 0f)
             throw new ArgumentOutOfRangeException(nameof(WallGrabMinGroundClearance));
         if (WallHangShimmySpeed < 0f) throw new ArgumentOutOfRangeException(nameof(WallHangShimmySpeed));

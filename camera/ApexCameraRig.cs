@@ -23,6 +23,24 @@ public struct CameraOutput
 
     /// <summary>翻越相机脱开程度 0..1（调试 / 自检用）。</summary>
     public float TraversalBlend;
+
+    /// <summary>
+    /// 本帧 bob 的**物理半幅**（米，来自步态模型的质心起伏）。
+    ///
+    /// v0.5 起相机只输出**角度**（视线方向画 ∞），位移不再进入 EyeOffset，
+    /// 但自检/调参仍需要"这一帧的起伏有多少毫米"这个物理量 ——
+    /// 所以在输出里保留原始米制值，换算关系见 <see cref="YawOffset"/>。
+    /// </summary>
+    public float BobVerticalMeters;
+
+    /// <summary>本帧 bob 的横向物理半幅（米）。见 <see cref="BobVerticalMeters"/>。</summary>
+    public float BobLateralMeters;
+
+    /// <summary>本帧 bob 的**点头**通道（弧度，来自步态模型的头部位移，不含竖直项换算）。</summary>
+    public float BobPitchRad;
+
+    /// <summary>本帧 bob 的**滚转**通道（弧度；BobRollEnabled=false 时不参与最终 Roll）。</summary>
+    public float BobRollRad;
 }
 
 /// <summary>
@@ -158,9 +176,19 @@ public sealed class ApexCameraRig
         _sprintBlend = Approach(_sprintBlend, s.Sprinting ? 1f : 0f, 6f, dt);
         _slideBlend = Approach(_slideBlend, s.Sliding ? 1f : 0f, 10f, dt);
 
+        // ★ v0.5.2 平滑修复（P1-3）：把 Hang 也算进翻越过渡。
+        //
+        //   原来少了 Hang ⇒ 从 Climb 切到 Hang 的那一帧，_traversalTargetBlend 从 1
+        //   掉到 0（实测 blend 1.000 → 0.917 → 0.928 的 V 形），配合下面 rise × 0.45
+        //   的滞后项，相机眼位世界 Y 的单帧增量会先猛冲 6 倍再几乎卡死 50 倍 ——
+        //   这是"顿一下"在画面上最直接的来源。
+        //
+        //   注意**不要**把 WallHang 也加进来：那是可以长时间停留的独立状态，
+        //   挂着的时候不应该一直保持翻越的 FOV/滞后系数。
         bool traversing = s.TraversalProgress >= 0f ||
                           s.State is MovementState.Mantle or MovementState.Vault
-                                   or MovementState.Window or MovementState.Climb;
+                                   or MovementState.Window or MovementState.Climb
+                                   or MovementState.Hang;
         _traversalTargetBlend = traversing ? 1f : 0f;
 
         // 翻越相机的"脱开 → 回贴"用两个不同时长（对应 traversal_viewLerpOut / InDuration）
@@ -319,29 +347,53 @@ public sealed class ApexCameraRig
         bool gaitStateOk = s.State is not (MovementState.Mantle or MovementState.Vault
                                         or MovementState.Window or MovementState.Hang
                                         or MovementState.Climb or MovementState.WallHang);
-        // 腾空时是否保留 bob：只在**奔跑的腾空相**保留（FlightFraction > 0）。
-        // 普通跳跃/走下坡不掉 bob 会显得画面在自娱自乐，所以非奔跑的空中一律关掉。
-        bool gaitAirOk = s.OnGround || s.Gait.FlightFraction > 0.05f;
+        // 腾空时是否保留 bob：**不保留**（脚踩地才有 bob）。
+        //
+        // v0.4.2 更正：这里原来写的是 s.OnGround || s.Gait.FlightFraction > 0.05f，
+        // 想表达"奔跑的腾空相继续保留 bob"。但 UpdateBobPhase 只在 Ground/Slide
+        // 时才把真实速度交给 GaitModel，其余状态一律传 speed=0
+        // （见 ApexMovementCore.cs:2867-2869），于是空中 Evaluate 出来的一定是
+        // "站立"样本，FlightFraction 恒等于 0 —— 那个分支**永远为假**，
+        // 注释描述的是一个不会发生的行为，属于会误导后来人的死代码。
+        // 现在直接写成真实口径：只有踩在地上才有 bob，空中一律关。
+        bool gaitAirOk = s.OnGround;
         bool gaitActive = gaitStateOk && gaitAirOk && !s.Sliding;
 
         float bobVert = 0f, bobLat = 0f, bobPitch = 0f, bobRoll = 0f;
+
+        // 角度累加器：bob 的角度模式要往这里加，所以提前声明。
+        float yawOffset = _kickYaw;
+        float pitchOffset = _kickPitch;
         if (gaitActive)
         {
-            GaitSample g = s.Gait;
-            float k = _cfg.BobGaitScale;      // 调试菜单里的实时倍率（1 = 物理值）
-            float sinP = MathF.Sin(s.BobPhase);
-            float cosP = MathF.Cos(s.BobPhase);
-            // 横向摆动与同侧腿同频：一个完整步态周期（= 两步）左右各摆一次，
-            // 所以用相位的一半。
-            float cosHalfP = MathF.Cos(s.BobPhase * 0.5f);
+            // ★ v0.4.3：波形搬进 core/BobWaveform.cs 并**重写**。
+            //
+            //   v0.4.2 在这里直接写 sin(φ) / cos(φ/2)，其中 cos(φ/2) 的周期是 4π
+            //   而不是 2π —— 相位每次回绕，横向与侧倾就跳 2×幅度（每步一次）。
+            //   这就是需求方说的「缓慢向左倾斜一点点，然后迅速回正」「单脚跳」。
+            //   根因在相位口径，不在幅度，所以之前怎么调 VerticalScale 都没用。
+            //
+            //   现在：φ 是**步幅相位**（2π = 一个步幅），
+            //         lateral = A·sin(φ)   （1 次/步幅）
+            //         vertical = A·sin(2φ) （2 次/步幅 = 一步一次）
+            //   ⇒ 屏幕平面上的轨迹是横放的 ∞，处处光滑、无回绕跳变。
+            BobWaveform.Sample(
+                s.BobPhase, s.Gait, _cfg.BobGaitScale,
+                _cfg.BobVerticalPhaseDeg, _cfg.BobPitchPhaseDeg, _cfg.BobRollPhaseDeg,
+                out bobVert, out bobLat, out bobPitch, out bobRoll);
 
-            bobVert = sinP * g.VerticalAmplitude * k;
-            bobLat = cosHalfP * g.LateralAmplitude * k;
-            bobPitch = cosP * g.PitchDeg * k * MathF.PI / 180f;
-            bobRoll = cosHalfP * g.RollDeg * k * MathF.PI / 180f;
-
-            offset += up * bobVert;
-            offset += right * bobLat;
+            // ★ v0.5（需求 m01070）：**只保留角度模式**，平移模式已删除。
+            //
+            //   眼位不动，改让**视线方向**在垂直于前向的截面上画 ∞ ——
+            //   yaw/pitch 各自按同一组 ∞ 波形摆动。这样屏幕中心点始终对应当前
+            //   视线方向，∞ 是"看的方向在画"，而不是"眼睛在画"。
+            //
+            //   幅度换算：BobAngularRefDistance 是"把多少米的横向位移看作 1 米处的
+            //   视线偏移"，即 b 米 ⇔ atan(b/ref) 弧度。默认 1 m 时，
+            //   横向半幅 8 mm ⇒ 0.459° 的 yaw 摆幅。
+            float k = 1f / _cfg.BobAngularRefDistance;
+            yawOffset += MathF.Atan(bobLat * k);
+            pitchOffset += MathF.Atan(bobVert * k);
         }
 
         // ── 翻越相机：位置滞后 + 高度上限 ──────────────────────────
@@ -361,9 +413,13 @@ public sealed class ApexCameraRig
         }
 
         // ── 角度叠加 ──────────────────────────────────────────────
-        float pitchOffset = _kickPitch + bobPitch;
-        float yawOffset = _kickYaw;
-        float roll = _slideRoll + _sprintRoll + _kickRoll + bobRoll;
+        pitchOffset += bobPitch;
+        // ★ v0.4.4（需求 m00818）：滚转默认关 —— 跑步侧倾与 bob 滚转都要受开关控制。
+        //   滚转会让地平线倾斜（"镜头以视线为轴转一点点角度"），需求要的是
+        //   视线/视点在截面上画 ∞，不是画面歪，所以默认只留滑铲侧倾与落地冲击。
+        float sprintRoll = _cfg.SprintRollEnabled ? _sprintRoll : 0f;
+        float bobRollApplied = _cfg.BobRollEnabled ? bobRoll : 0f;
+        float roll = _slideRoll + sprintRoll + _kickRoll + bobRollApplied;
 
         // 翻越角度滞后：把俯仰往回压一部分（相机"慢半拍"）
         if (_traversalBlend > 1e-3f)
@@ -377,6 +433,11 @@ public sealed class ApexCameraRig
             YawOffset = yawOffset,
             EyeOffset = offset,
             TraversalBlend = _traversalBlend,
+            // 物理半幅（米）：位移已不进入 EyeOffset，但自检仍需要这个量。
+            BobVerticalMeters = gaitActive ? bobVert : 0f,
+            BobLateralMeters = gaitActive ? bobLat : 0f,
+            BobPitchRad = gaitActive ? bobPitch : 0f,
+            BobRollRad = gaitActive ? bobRoll : 0f,
         };
     }
 

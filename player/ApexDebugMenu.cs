@@ -33,6 +33,12 @@ public partial class ApexDebugMenu : CanvasLayer
     public event Action<float>? KickScaleChanged;
     public event Action<bool>? CameraEffectsToggled;
     public event Action<bool>? HudToggled;
+    // ── v0.5（需求 m01621）：星球预设 / 第三人称 / 三维调试渲染器 ──
+    public event Action<int>? PlanetPresetChanged;
+    public event Action<bool>? ThirdPersonToggled;
+    public event Action<bool>? DebugRendererToggled;
+    // v0.5（需求 m01070）：滚转开关与 ∞ 载体开关都已从菜单删除。
+    // ∞ 现在固定用「转动视线方向」这一种载体；滚转固定关（地平线永远水平）。
     public event Action? CloseRequested;
 
     // ── 控件 ───────────────────────────────────────────────────
@@ -47,6 +53,9 @@ public partial class ApexDebugMenu : CanvasLayer
     private HSlider _kickSlider = null!;
     private CheckButton _camToggle = null!;
     private CheckButton _hudToggle = null!;
+    private OptionButton _planetOption = null!;
+    private CheckButton _thirdPersonToggle = null!;
+    private CheckButton _rendererToggle = null!;
 
     /// <summary>面板是否已构建（重复调用 <see cref="Build"/> 只建一次）。</summary>
     public bool Built { get; private set; }
@@ -62,8 +71,10 @@ public partial class ApexDebugMenu : CanvasLayer
     /// 构建面板。参数是"当前值"，用于初始化滑条位置 —— 这样打开菜单看到的
     /// 就是玩家此刻真实在用的数值，而不是一份默认值。
     /// </summary>
+    // v0.5：滚转/∞载体开关已删（需求 m01070：∞ 固定为角度载体，滚转固定关）。
     public void Build(float fov, float sensitivity, float bobScale, float kickScale,
-                      bool cameraEffects, bool hud)
+                      bool cameraEffects, bool hud,
+                      int planetIndex = 0, bool thirdPerson = false, bool debugRenderer = false)
     {
         if (Built) return;
         Built = true;
@@ -79,8 +90,17 @@ public partial class ApexDebugMenu : CanvasLayer
         _root.AnchorRight = 1f;
         _root.AnchorTop = 0f;
         _root.AnchorBottom = 0f;
-        _root.OffsetLeft = -370f;
-        _root.OffsetRight = -28f;
+        // v0.5.2：**面板宽度不再写死**。
+        //
+        // 原来写死 OffsetLeft=-370 / OffsetRight=-28（宽 342），但内容的
+        // 最小宽度由子控件撑出来（标签列 210 + 下拉框 140 + 内边距 36 ≈ 394），
+        // PanelContainer 会按最小尺寸绘制 —— 于是右边被顶出屏幕（需求方实测「略微超出」）。
+        //
+        // 现在：① 给足宽度；② 锚在右边距 48px；③ GrowHorizontal = Begin，
+        // 万一将来加了更宽的控件，面板会向**左**长而不是向右溢出。
+        _root.OffsetLeft = -430f;
+        _root.OffsetRight = -48f;
+        _root.GrowHorizontal = Control.GrowDirection.Begin;
         _root.OffsetTop = 28f;
         _root.OffsetBottom = 28f;
         AddChild(_root);
@@ -157,6 +177,19 @@ public partial class ApexDebugMenu : CanvasLayer
 
         box.AddChild(new HSeparator());
 
+        // ── v0.5（需求 m01621）：星球预设 / 第三人称 / 三维调试渲染器 ──
+        _planetOption = AddOption(box, "星球预设（重力）",
+            new[] { "地球 9.81", "月球 1.62", "火星 3.71", "Apex 20.78" }, planetIndex);
+        _planetOption.ItemSelected += idx => PlanetPresetChanged?.Invoke((int)idx);
+
+        _thirdPersonToggle = AddToggle(box, "第三人称视角（调试用）", thirdPerson);
+        _thirdPersonToggle.Toggled += on => ThirdPersonToggled?.Invoke(on);
+
+        _rendererToggle = AddToggle(box, "三维速度/加速度调试器", debugRenderer);
+        _rendererToggle.Toggled += on => DebugRendererToggled?.Invoke(on);
+
+        box.AddChild(new HSeparator());
+
         var close = new Button { Text = "关闭（\\）" };
         close.Pressed += () => CloseRequested?.Invoke();
         box.AddChild(close);
@@ -210,18 +243,76 @@ public partial class ApexDebugMenu : CanvasLayer
         return slider;
     }
 
+    /// <summary>一行下拉框（左标题、右选项）。返回下拉框本身以便挂回调。</summary>
+    private static OptionButton AddOption(VBoxContainer parent, string label,
+                                          string[] items, int selected)
+    {
+        var row = new HBoxContainer();
+        row.AddThemeConstantOverride("separation", 8);
+
+        var name = new Label { Text = label };
+        name.AddThemeFontSizeOverride("font_size", 15);
+        name.CustomMinimumSize = new Vector2(196f, 0f);
+        row.AddChild(name);
+
+        var option = new OptionButton
+        {
+            CustomMinimumSize = new Vector2(132f, 26f),
+            SizeFlagsHorizontal = Control.SizeFlags.ExpandFill,
+        };
+        for (int i = 0; i < items.Length; i++) option.AddItem(items[i], i);
+        option.Select(Mathf.Clamp(selected, 0, items.Length - 1));
+        row.AddChild(option);
+
+        parent.AddChild(row);
+        return option;
+    }
+
+    /// <summary>
+    /// 一行开关。
+    ///
+    /// ★ 实测坑（v0.5.1 截图复现）：<c>CheckButton</c> 的**图标按下态不会随
+    ///   <c>SetPressedNoSignal()</c> 重算** —— 程序化设置状态后，截图里开关永远画成"关"，
+    ///   哪怕 <c>ButtonPressed</c> 已经是 true。这是 Godot 的绘制缓存问题，不是我们的逻辑错。
+    ///
+    /// 解决：把状态**同时写进文本**（"…：开 / …：关"）。文本一定会重绘，
+    /// 于是无论图标对不对，玩家都能读到真实状态。
+    /// </summary>
     private static CheckButton AddToggle(VBoxContainer parent, string label, bool value)
     {
         var toggle = new CheckButton { Text = label };
         toggle.AddThemeFontSizeOverride("font_size", 15);
+        toggle.SetMeta("base_label", label);
         parent.AddChild(toggle);
-        // ★ 必须等进树之后再设初值：在构造器里设 ButtonPressed，按钮图标的
-        //   按下态不会重算（实测截图里两个开关明明该是开着的，画出来却是关的）。
         toggle.SetPressedNoSignal(value);
+        ApplyToggleText(toggle, value);
+        toggle.Toggled += on => ApplyToggleText(toggle, on);
         return toggle;
     }
 
+    private static void ApplyToggleText(CheckButton toggle, bool on)
+    {
+        string label = toggle.HasMeta("base_label") ? (string)toggle.GetMeta("base_label") : toggle.Text;
+        toggle.Text = $"{label}：{(on ? "开" : "关")}";
+    }
+
+    /// <summary>程序化设置开关状态（文本与内部状态一起更新）。</summary>
+    private static void SetToggle(CheckButton toggle, bool on)
+    {
+        toggle.SetPressedNoSignal(on);
+        ApplyToggleText(toggle, on);
+    }
+
     // ── 外部同步（例如玩家用 [ / ] 改了 FOV，菜单里的滑条要跟上） ──
+
+    /// <summary>把"星球预设 / 第三人称 / 三维调试器"三个开关同步到当前真实状态（不触发回调）。</summary>
+    public void SyncDebugToggles(int planetIndex, bool thirdPerson, bool debugRenderer)
+    {
+        if (!Built) return;
+        _planetOption.Select(Mathf.Clamp(planetIndex, 0, _planetOption.ItemCount - 1));
+        SetToggle(_thirdPersonToggle, thirdPerson);
+        SetToggle(_rendererToggle, debugRenderer);
+    }
 
     /// <summary>把 FOV 滑条同步到指定值（不触发回调）。</summary>
     public void SyncFov(float fov)

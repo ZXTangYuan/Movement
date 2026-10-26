@@ -430,17 +430,23 @@ public static class SlipHangTest
                   $"state={core.State}");
         }
 
-        // ── 18. automantle_disable_hang：能自动翻越的矮墙不挂 ──
+        // ── 18. automantle_disable_hang：矮到该翻过去的障碍不挂 ──
         {
-            // 墙顶 1.5m < AutoMantleMaxHeight(2.032)：上方探针打空 ⇒ 不挂
-            var world = WallWorld(wallTop: 1.5f);
+            // ★ v0.5 口径修正：v0.4 已经把 auto-mantle 整体删掉，三档分级改成
+            //    小障碍档（≤ VaultMaxHeight = 1.00 m，W+Space 翻越）/ 墙（> 1.00 m，攀爬）。
+            //    抓墙里的「太矮不挂」探针也随之改成「脚底 + 0.6×VaultMaxHeight」：
+            //      · 墙顶 0.8 m（小障碍档）⇒ 探针在 0.5+0.6=1.1 m 处打空 ⇒ 不挂 ✔
+            //      · 墙顶 1.5 m（墙档）⇒ 探针命中 ⇒ 本来就该挂
+            //    所以原来这条用 1.5 m 墙的用例，测的其实是已经过期的 auto-mantle 口径。
+            //    换成 0.8 m 小障碍，才是这条测试真正想守的性质。
+            var world = WallWorld(wallTop: 0.8f);
             var core = MakeCore(world);
             core.Reset(new F3(0f, 1.0f, -1f));
             Run(core, 30, In(crouch: true));
 
-            Check("矮墙（能自动翻越）不会被挂住（automantle_disable_hang）",
+            Check("矮到该翻过去的障碍不会被挂住（automantle_disable_hang）",
                   core.State != MovementState.WallHang,
-                  $"state={core.State}（墙顶 1.5 < AutoMantleMaxHeight {cfg0.AutoMantleMaxHeight:F2}）");
+                  $"state={core.State}（墙顶 0.8 ≤ VaultMaxHeight {cfg0.VaultMaxHeight:F2}）");
         }
 
         // ── 19. 离墙太远 → 挂不上 ──

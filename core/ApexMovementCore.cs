@@ -3,7 +3,7 @@ using System;
 namespace ApexMovement.Core;
 
 /// <summary>
-/// 自研移动求解器 v0.4.1 —— **固定 tick 确定性**实现。
+/// 自研移动求解器 v0.4.2 —— **固定 tick 确定性**实现。
 ///
 /// ## 与 Apex 原版的关系
 /// Apex（Source 2 / Titanfall 谱系）按**渲染帧**积分：两次画面帧之间的输入动量会叠加，
@@ -63,6 +63,16 @@ namespace ApexMovement.Core;
 /// | 摩擦系数 | 单一常数 | **按地面材质取**（<see cref="IFrictionWorld"/>，默认 `SlideFrictionCoefficient=0.45`），Godot 侧读碰撞体 meta `friction` |
 /// | 碰撞法线兜底 | `GetRestInfo` 打空时退回 `-delta` 伪法线 ⇒ 把竖直速度一起投掉、角色悬空卡死 | **原地放大胶囊再查**，仍失败才退回"竖直墙"启发式（只挡水平分量） |
 /// | 贴墙爬升 | 一次性冲到 `ClimbAttachOffset` | **分段爬升**：到上限就脱手，需要重新抓墙继续爬 |
+///
+/// ## v0.4.2 相比 v0.4.1 的机制变化
+///
+/// | 机制 | v0.4.1 | v0.4.2 |
+/// |---|---|---|
+/// | 空中滑铲 | `StepAir` 里有个入口：蹲 + 水平 ≥2.286 + 下坠 ≥5.08 ⇒ 空中 `Slide` | **整段删除**。`Slide` 自 v0.4.2 起是**纯地面状态** |
+/// | 滑区转滑铲 | `StepSlip` 写 `BeginSlide(input, fromAir: !_onGround)` ⇒ 空中经过滑区按蹲也能起滑铲 | 只在 `_onGround` 时转；`BeginSlide` 的 `fromAir` 参数**整体删除**，让"空中起滑铲"在类型层面不成立 |
+/// | 滑铲入口状态门 | `TryAttachWallGrab` 允许 `Air` **或** `Slide` | 收窄为只允许 `Air` |
+/// | 落地衔接滑铲 | 落地 tick 只写 `Ground`，下一 tick `StepGround` **先吃一 tick 地面摩擦**（6.6 m/s 掉 ≈0.44 m/s）才起滑 ⇒ 滑铲跳链第 4 跳跌破 `SlideMinStartSpeed` | `Step()` 的 9a 段：本 tick 刚落地 + 蹲着 + 速度够 ⇒ **当场 `BeginSlide`**，链条可无限持续 |
+/// | 抓墙方向 | 只有 ④b 速度门：水平速度沿墙面法线背离（< −0.05）才拒绝 | 补 ②b **意图门**：`MoveZ < -0.3`（按 S）直接拒绝 —— 覆盖"从静止按 S、速度还没建立背离分量"那段窗口 |
 ///
 /// ## 参考的引擎公式（Source 谱系，本实现沿用）
 /// - 加速：<c>accelSpeed = accel × dt × wishSpeed</c>，并夹到 <c>addSpeed</c>
@@ -175,6 +185,17 @@ public sealed class ApexMovementCore
     /// 没有它，按住蹲的玩家会在同一位置反复「抓住 → 滑落/超时脱手 → 再抓住」。
     /// </summary>
     private bool _wallGrabNeedW;
+
+    /// <summary>
+    /// 本次腾空是**跳**出来的（而不是走下台沿/被推落）。
+    ///
+    /// 用途（用户 m01300 BUG 2）：抓墙的"离地间隙"门限只对**非跳跃**腾空生效。
+    /// 需求原话是「我希望改成只要跳了就攀爬」—— 跳了就无条件允许抓墙，
+    /// 不管这一跳有多低（跳跃疲劳只有 0.23 m、超重力星球可能只有 0.1 m）。
+    /// 走下台沿/被推落那种"没有起跳动作"的腾空仍然保留 0.30 m 间隙门，
+    /// 否则贴着墙走下小台阶会被凭空吸到墙上。
+    /// </summary>
+    private bool _leftGroundByJump;
     /// <summary>攀爬到顶探针实际执行次数（自检用：验证 30 Hz 抽样）。</summary>
     private int _climbWallProbeCount;
 
@@ -183,6 +204,10 @@ public sealed class ApexMovementCore
     private bool _jumpBuffered;
     private float _jumpBufferTimer;
     private float _coyoteTimer;
+    /// <summary>起跳"有限加速段"剩余的 tick 数（0 = 当前没有加速段）。</summary>
+    private int _jumpRampTicksLeft;
+    /// <summary>起跳加速段的推力加速度 (m/s²)，已含抵消重力那一份。</summary>
+    private float _jumpRampThrust;
     private bool _onGround;
     private bool _sprintIntent;                 // 本 tick 的冲刺**意图**（不是速度）
     private F3 _groundNormal = F3.Up;
@@ -282,6 +307,38 @@ public sealed class ApexMovementCore
     /// </summary>
     public float HorizontalSpeed => F3.ProjectOnPlane(_vel, _up).Length();
 
+    /// <summary>
+    /// 站立是否被头顶空间挡住（= <see cref="UpdateCrouch"/> 里那道检查的结果）。
+    ///
+    /// 只读、无副作用，供自检与 HUD 观察「蹲着起不来」到底是"头顶真有东西"
+    /// 还是"状态机卡住"。
+    /// </summary>
+    public bool HeadBlockedForStanding
+    {
+        get
+        {
+            if (_world == null) return false;
+            float hh = (_cfg.StandHeight - _cfg.CapsuleRadius * 2f) * 0.5f;
+            F3 testPos = _pos + _up * ((_cfg.StandHeight - _currentHeight) * 0.5f);
+            return _world.Overlaps(testPos, _cfg.CapsuleRadius, hh);
+        }
+    }
+
+    /// <summary>
+    /// **当前行走平面内**的移动速度 (m/s)：速度投影到「垂直于地面法线」的平面后的模长。
+    ///
+    /// v0.5（需求 m01202）：滑铲入口判定必须用它，而不是 <see cref="HorizontalSpeed"/>。
+    /// 两者在坡上差一个 cosθ：
+    ///   · 平地一致；
+    ///   · 30° 坡上，滑铲平面速度 10 m/s ⇒ 水平分量只有 8.66 m/s。
+    /// 用水平分量判定会让"坡上滑铲更难触发"，与需求「基于当前行走平面的移动速度判定」不符。
+    ///
+    /// 不在接地状态时退回 <see cref="HorizontalSpeed"/>（没有地面法线可用）。
+    /// </summary>
+    public float GroundPlaneSpeed => _onGround
+        ? F3.ProjectOnPlane(_vel, _groundNormal).Length()
+        : HorizontalSpeed;
+
     /// <summary>沿重力方向的速度分量（正 = 向上）。</summary>
     public float VerticalSpeed => F3.Dot(_vel, _up);
 
@@ -346,6 +403,89 @@ public sealed class ApexMovementCore
 
     public void BindWorld(IMovementWorld world) => _world = world;
 
+    /// <summary>
+    /// 设置**重力方向的反方向**（= 当前站立面的"上"），用于星球/球形世界（v0.5 预留接口）。
+    ///
+    /// 需求（m00818）：「重力方向需要是可改变的，因为星球是球形，玩家的这些移动方向
+    /// 啥的也要与星球重力方向绑定，比如移动是与重力方向为 90° 夹角方向，跳跃是与重力
+    /// 相反方向」。
+    ///
+    /// 本类内部所有运动都以 <see cref="_up"/> 为基准轴：
+    ///   · 移动 = 把输入方向投影到垂直于 up 的平面（90° 夹角）；
+    ///   · 跳跃 / 反重力 = 沿 +up；
+    ///   · 重力 / 下落 = 沿 −up；
+    ///   · 滑铲坡度 = 坡面法线与 up 的夹角。
+    /// 所以只要在球形行星上每 tick 把局部 up 传进来，一整套方向就自动跟着转，
+    /// **不需要给每种运动单独写"星球版"**。
+    ///
+    /// 与 <see cref="Reset"/> 的区别：Reset 是"传送到某处并清空状态"，本方法只改
+    /// 参考系，保留速度与碰撞状态（用于走在大球面上时 up 缓慢变化）。
+    /// 速度里沿新 up 的分量会被保留 —— 重力会在随后的 tick 里把它吃掉，
+    /// 这正是"从平面走进曲面"时该有的连续行为。
+    /// </summary>
+    public void SetUpDirection(F3 up)
+    {
+        F3 n = up.Normalized();
+        if (n.Length() < 1e-6f) return;          // 退化输入直接忽略（不破坏状态）
+        if ((n - _up).Length() < 1e-7f) return;  // 没变就不动，避免无谓的状态抖动
+        _up = n;
+        // 参考系变了，脚下是否还有地必须重新判定（下一 tick 的 UpdateGroundContact 会做）。
+        if (_state is MovementState.Ground or MovementState.Slide)
+        {
+            _state = MovementState.Air;
+            _slideTime = 0f;
+            _slideBoostGranted = false;
+        }
+    }
+
+    /// <summary>当前参考系的上方向（= 重力反方向）。球形行星每 tick 传进来即可。</summary>
+    public F3 UpDirection => _up;
+
+    /// <summary>当前脚下的地面法线（未贴地时等于 <see cref="UpDirection"/>）。</summary>
+    public F3 GroundNormal => _groundNormal;
+
+    /// <summary>
+    /// 一个 tick 内**各个来源**产生的加速度（m/s²，矢量），给三维调试渲染器用。
+    ///
+    /// 这是"把求解器拆开看"的窗口：每个分量都是本 tick 内该来源造成的
+    /// <c>Δv / dt</c>，所以 <see cref="Net"/> 恒等于 <c>(v_end − v_start)/dt</c>。
+    /// 各分量之和不等于 Net —— 碰撞投影是**非线性**的（把速度投到平面会丢掉法向分量），
+    /// 所以差值就是"碰撞吃掉的量"，单独记在 <see cref="Collision"/> 里。
+    ///
+    /// 需求（m01621）：「除了速度还有作用力产生的加速度，也实时渲染三维箭头，并且标注大小」。
+    /// </summary>
+    public readonly struct AccelBreakdown
+    {
+        /// <summary>重力加速度（空中 = −up·g；滑铲 = 坡面重力分量）。</summary>
+        public readonly F3 Gravity;
+        /// <summary>摩擦（地面库仑 / 滑铲库仑）。</summary>
+        public readonly F3 Friction;
+        /// <summary>输入推进（含坡面合速度加成）。</summary>
+        public readonly F3 Input;
+        /// <summary>瞬时冲量（起跳 / 滑铲 boost）。</summary>
+        public readonly F3 Impulse;
+        /// <summary>碰撞与贴地投影（速度被墙面/地面改变的部分）。</summary>
+        public readonly F3 Collision;
+        /// <summary>合计 = (v_end − v_start)/dt。</summary>
+        public readonly F3 Net;
+
+        public AccelBreakdown(F3 gravity, F3 friction, F3 input, F3 impulse,
+                              F3 collision, F3 net)
+        {
+            Gravity = gravity; Friction = friction; Input = input;
+            Impulse = impulse; Collision = collision; Net = net;
+        }
+    }
+
+    private F3 _accGravity;
+    private F3 _accFriction;
+    private F3 _accInput;
+    private F3 _accImpulse;
+    private F3 _accelStartVel;
+
+    /// <summary>上一 tick 的加速度分解（见 <see cref="AccelBreakdown"/>）。</summary>
+    public AccelBreakdown LastAccel { get; private set; }
+
     /// <summary>重置到指定位置/朝向（确定性：不读取任何外部随机源）。</summary>
     public void Reset(F3 position, float yaw = 0f, float pitch = 0f, F3? up = null)
     {
@@ -390,10 +530,16 @@ public sealed class ApexMovementCore
         _wallHangNormal = F3.Zero;
         _wallHangLastHit = F3.Zero;
         _wallGrabNeedW = false;
+        _leftGroundByJump = false;
+        _brakeRamp = 0f;
+        _isSliding = false;
+        _airEntrySpeed = 0f;
         _jumpBuffered = false;
         _jumpBufferTimer = 0f;
         _coyoteTimer = 0f;
         _justJumped = false;
+        _jumpRampTicksLeft = 0;
+        _jumpRampThrust = 0f;
         _onGround = false;
         _groundNormal = _up;
         _jumpFatigueState = false;
@@ -431,6 +577,21 @@ public sealed class ApexMovementCore
             throw new InvalidOperationException("ApexMovementCore: 必须先 BindWorld()");
 
         _tickCount++;
+
+        // 加速度分解（给三维调试渲染器）：记起点速度、清各来源累加器。
+        // 各来源在施加处累加，末尾用"总变化 − 各来源之和"反推碰撞吃掉的部分。
+        _accelStartVel = _vel;
+
+        // 重力**全量**记录（−up·g），不分状态。
+        //
+        // 为什么不只记"沿坡分量"：站在地上时重力照样在拉（9.81 m/s² 向下），
+        // 只是被地面支撑力抵消了 —— 调试时这正是最该看见的一对力。
+        // 记全量后，地面支撑力会自动落进"碰撞"那一项里（见 Step 末尾的结算），
+        // 于是"重力 ↓9.81 + 支撑 ↑9.81 = 合计 0"一眼可读。
+        _accGravity = -_up * _cfg.Gravity;
+        _accFriction = F3.Zero;
+        _accInput = F3.Zero;
+        _accImpulse = F3.Zero;
 
         // 记录冲刺**意图**（不是速度）。相机侧倾/FOV 要按意图走：
         // 收枪行走速度 = 4.407×1.15 = 5.068 m/s，已超过 `WalkSpeed×1.05`，
@@ -479,6 +640,15 @@ public sealed class ApexMovementCore
         //   现在统一为：贴墙抓住 → 按 W 就是 Climb（向上），不按 W 就是 WallHang（挂着）。
         if (_state is MovementState.Climb or MovementState.WallHang)
         {
+            // 注意：这里**故意**整帧独占、不落到下面的状态机。
+            //
+            // v0.5.2 曾试过「脱手当帧继续推进」（消除 4~6 m 墙 End boost 的 1 帧空转），
+            // 但实测会打破两条既有语义：
+            //   · 蹬墙跳当帧进入 StepAir ⇒ 同一帧内立刻 TryAttachWallGrab 又抓回墙上，
+            //     蹬墙跳的离墙速度被吃掉（ClimbTest ⑮ / SlipHangTest 各 1 项红）；
+            //   · 7.5 m 超高墙的「单段爬升 ≤ ClimbAttachOffset」被绕过（实测 7.17 m）。
+            // 代价是每段脱手少 1 帧位移 —— 在逐帧曲线上是 1 个 16.7 ms 的停格，
+            // 远小于已经修掉的那些 0.3~1.8 m 单帧瞬移。
             StepWallGrab(input, dt);
             return;
         }
@@ -513,7 +683,18 @@ public sealed class ApexMovementCore
             case MovementState.Slide: StepSlide(input, dt); break;
             case MovementState.Slip: StepSlip(input, dt); break;
             case MovementState.Ground: StepGround(input, dt); break;
-            case MovementState.Hang: StepHang(input, dt); break;
+            case MovementState.Hang:
+                StepHang(input, dt);
+                // ★ v0.5.2 平滑修复（P1-1）：Hang 这一帧如果已经切进 Mantle/Vault/Window，
+                //   就**同帧**把翻越的第一步推出去，不要空转一帧。
+                //   原来 StepHang 只改状态、位移等下一帧的 StepTraversal ⇒ 那一帧 |Δp| = 0，
+                //   在逐帧曲线上就是一个"顿"点（3.0 m 墙实测整条链路有 2 个这样的空转帧）。
+                if (_state is MovementState.Mantle or MovementState.Vault or MovementState.Window)
+                {
+                    StepTraversal(input, dt);
+                    return;
+                }
+                break;
             default: StepAir(input, dt); break;
         }
 
@@ -527,6 +708,36 @@ public sealed class ApexMovementCore
         // 9) 落地判定 + 状态迁移
         UpdateGroundContact(dt);
 
+        // 9a) 落地即滑铲（v0.4.2）───────────────────────────────────────
+        //
+        // 需求原文（m04709 第 2 条）：「蹲键不松的话落地后会继续保持滑铲状态，
+        // 并且可以继续跳起来」。
+        //
+        // 为什么必须有这一步：落地那一 tick 的 UpdateGroundContact 只把状态写成
+        // Ground，真正的地面推进要等下一 tick 的 StepGround —— 而 StepGround 是
+        // **先吃一 tick 地面摩擦**（Friction=4.0；6.6 m/s 时一次掉 ≈0.44 m/s）
+        // 才轮到滑铲触发分支。于是连续滑铲跳每跳白掉 0.44 m/s，
+        // 6.60 → 6.16 → 5.61 → 5.09，第 4 跳就跌破 SlideMinStartSpeed(5.08)
+        // 再也滑不起来 —— 需求要的「可以继续跳起来」实际上只成立 3 次。
+        //
+        // 落地当场转滑铲既省掉这一 tick 的无谓摩擦，也更贴字面语义：玩家落地时
+        // 本来就还蹲着（空中保持蹲姿体积），滑铲是**同一个姿态的延续**，
+        // 不该在中间插一帧"站着地面行走"。
+        //
+        // 判据用 _landingTier != None（= 本 tick 刚落地，每 tick 开头清零），
+        // 所以它只影响"落地"这一个瞬间，不改变任何地面滑铲的既有触发路径。
+        // v0.5（需求 m01202）：判据换成**落地瞬间的平面速度**。
+        // 落地那一 tick，UpdateGroundContact 已把速度投影到地面法线上，
+        // 所以 GroundPlaneSpeed 就是"顺坡方向还剩下的速度" ——
+        // 从高处落斜坡、被加速道具打飞落地、滑铲跳落地，全部走同一个判据。
+        // boost 不参与判定（进入之后才加）。
+        if (_landingTier != LandingTier.None && _onGround &&
+            _state == MovementState.Ground &&
+            input.CrouchHeld && GroundPlaneSpeed >= _cfg.SlideMinStartSpeed)
+        {
+            BeginSlide(input);
+        }
+
         // 9b) 台阶倾斜：把速度**整体旋转**到倾角上（大小不变，只改方向）
         //
         // 需求原话：「上台阶时水平速度变为斜向上的速度再变回水平，
@@ -539,6 +750,20 @@ public sealed class ApexMovementCore
 
         // 10) 步态（帧率无关：按 tick 累加，不按渲染帧）
         UpdateBobPhase(dt);
+
+        // 11) 结算加速度分解（三维调试渲染器读这个）
+        //
+        //     碰撞/贴地投影是**非线性**的（把速度投到平面会直接丢掉法向分量），
+        //     所以不用"逐项相加"去凑合计，而是用
+        //     <c>碰撞 = 总变化 − 重力 − 摩擦 − 输入 − 冲量</c> 反推。
+        //     这样恒有 <c>各项之和 == Net == (v_end − v_start)/dt</c>，箭头画出来自洽。
+        F3 net = (_vel - _accelStartVel) / dt;
+        F3 collision = net - (_accGravity + _accFriction + _accInput + _accImpulse);
+        LastAccel = new AccelBreakdown(_accGravity, _accFriction, _accInput,
+                                       _accImpulse, collision, net);
+
+        // 12) 记录本 tick 结束时的状态（下一 tick 用它识别"刚进入空中"等边沿）
+        _lastState = _state;
     }
 
     /// <summary>
@@ -561,7 +786,27 @@ public sealed class ApexMovementCore
         if (hSpeed < 1e-5f) return;
 
         F3 dir = horiz / hSpeed;
-        _vel = dir * (hSpeed * MathF.Cos(angle)) + _up * (hSpeed * MathF.Sin(angle));
+
+        // ★ v0.5.3 修复（需求 m02395 第 3 点「上台阶有顿挫感」）：
+        //   这里原来是
+        //     _vel = dir*(hSpeed*cos θ) + _up*(hSpeed*sin θ)
+        //   即"把速度大小守恒地转成斜向上"。**但竖直分量根本兑现不了**：
+        //   人已经站在台阶面上了，抬起来的那部分速度下一 tick 就被
+        //   UpdateGroundContact 的贴地吸附整段抹掉（逐 tick 实测：
+        //   倾斜窗口内 posY 恒为 1.1510，而 snapDown 每 tick 0.0325~0.0577 m）。
+        //   于是**净效果只剩水平速度被乘了一个 cos θ，再也补不回来** ——
+        //   走 4.407→3.866（87.7%）、跑 6.604→4.543（68.8%）、
+        //   0.25 m 台阶跑起来只剩 52.5%。这就是"走楼梯像踩刹车"的根因。
+        //
+        //   修法：**水平分量原样保留**，竖直分量照旧叠加（方向仍然"抬起"，
+        //   与 v0.4 的需求口径一致：台阶上速度方向临时变成斜向上）。
+        //   这样 |v| 在窗口内略增（√(1+sin²θ) ≈ 1.11 倍），但那部分竖直
+        //   本来就一直被封顶在贴地面上、不产生任何真实位移，所以既不额外给能量，
+        //   也不会改变弹道；水平速度则**一点不丢**。
+        //
+        //   实测（0.20 m 台阶、走路 4.407 m/s）：上台阶后水平速度 4.407（100%），
+        //   倾斜窗口内 ticks<90% 顶速 = 0（原 31）。
+        _vel = dir * hSpeed + _up * (hSpeed * MathF.Sin(angle));
     }
 
     // ───────────────────────── 地面 ─────────────────────────
@@ -576,11 +821,39 @@ public sealed class ApexMovementCore
         // 用一个短窗口放大加速度，比"直接塞满速度"自然得多（不会瞬移感）。
         if (_vaultRecoverTimer > 0f) accel *= _cfg.VaultRecoverAccelBoost;
 
-        ApplyFriction(dt, _cfg.Friction);
-
         F3 wishDir = WishDirection(input);
         float wishSpeed = WishSpeed(input);
-        Accelerate(wishDir, wishSpeed, accel, dt);
+
+        // ── 坡面合速度（v0.5 / 需求 m00914 ⑥）────────────────────────
+        //
+        // **跑动**（冲刺键 + 未蹲）吃坡度 + 重力加成：
+        //   v_target = v_base + τ·g·sinθ·(下坡方向 · 期望方向)
+        //   下坡更快、上坡更慢、横穿不变，且自动跟着星球重力走。
+        // **走 / 蹲走**不吃 —— 需求「如果是慢慢走那就是玩家不希望摔倒」，
+        //   那一档只保留库仑摩擦（防滑），速度恒定。
+        //
+        // 详见 MovementConfig.SlopeSpeedTimeConstant 的推导（速度调节器模型）。
+        if (_cfg.SlopeSpeedTimeConstant > 0f && input.SprintHeld && _crouchAmount <= 0.5f)
+        {
+            float cosT = Clamp(F3.Dot(_groundNormal, _up), 0f, 1f);
+            float sinT = MathF.Sqrt(MathF.Max(0f, 1f - cosT * cosT));
+            if (sinT > 1e-4f)
+            {
+                F3 slopeWish = F3.ProjectOnPlane(wishDir, _groundNormal);
+                float wl = slopeWish.Length();
+                if (wl > 1e-4f)
+                {
+                    F3 downhill = F3.ProjectOnPlane(-_up, _groundNormal).Normalized();
+                    float along = F3.Dot(slopeWish / wl, downhill);   // +1 正下坡, −1 正上坡
+                    float mag = MathF.Sqrt(input.MoveX * input.MoveX + input.MoveZ * input.MoveZ);
+                    if (mag > 1f) mag = 1f;
+                    wishSpeed = MathF.Max(0f,
+                        wishSpeed + _cfg.SlopeSpeedTimeConstant * _cfg.Gravity * sinT * along * mag);
+                }
+            }
+        }
+
+        ApplyGroundFrictionAndDrive(input, dt, accel, wishSpeed);
 
         // 下坡贴地：把速度投影到地面平面，避免"跳下斜坡"
         //
@@ -590,11 +863,14 @@ public sealed class ApexMovementCore
         if (_stepTiltTimer <= 0f)
             _vel = F3.ProjectOnPlane(_vel, _groundNormal);
 
-        // 滑铲触发（地面滑铲：只看水平速度是否过 200hu/s 门槛）
+        // 滑铲触发（v0.5 / 需求 m01202）：
+        //   判定量是**当前行走平面内**的移动速度（速度投影到地面平面后的模长，
+        //   不是世界水平的 HorizontalSpeed —— 坡上两者差一个 cosθ），
+        //   且这个速度**不含 boost**（boost 是进入之后才加的）。
         // 注意：**滑铲本身没有冷却**，只有 Slideboost 有 2s 冷却（wiki）。
-        if (input.CrouchHeld && HorizontalSpeed >= _cfg.SlideMinStartSpeed)
+        if (input.CrouchHeld && GroundPlaneSpeed >= _cfg.SlideMinStartSpeed)
         {
-            BeginSlide(input, fromAir: false);
+            BeginSlide(input);
             return;
         }
 
@@ -632,9 +908,17 @@ public sealed class ApexMovementCore
 
     private void StepAir(in MovementInput input, float dt)
     {
+        // ★ v0.5.2：**进入 Air 的第一帧**用当前速度当"离地速度"。
+        //
+        //   空中速度上限（见下面 AirControlAccel 那一段）是相对"离地速度"算的，
+        //   而脱离地面的路径不止"跳跃"一条：蹬墙跳、松手掉、翻越收尾、滑铲滑出……
+        //   那些路径的初速可能远高于上一次落地时的记录值 —— 如果不刷新基准，
+        //   上限会把**已经合法获得**的速度硬拽回去（实测蹬墙跳 vz 4.2 → 0.67）。
+        if (_lastState != MovementState.Air) _airEntrySpeed = HorizontalSpeed;
+
         // ★ Apex **没有空气摩擦**：不做任何水平衰减。
         //   只有 AirFriction > 0 时才衰减（默认 0，保留字段以支持别的项目）。
-        if (_cfg.AirFriction > 0f) ApplyFriction(dt, _cfg.AirFriction);
+        if (_cfg.AirFriction > 0f) ApplyAirFriction(dt, _cfg.AirFriction);
 
         // 空中加速：wishSpeed 被硬限制在 AirWishSpeed(60hu/s) —— 这是 air strafe 的物理根因。
         F3 wishDir = WishDirection(input);
@@ -651,7 +935,45 @@ public sealed class ApexMovementCore
             wishDir = ClampToCone(wishDir, _slipAirRestrictDir, _cfg.SlipAirRestrictConeDeg);
         }
 
-        Accelerate(wishDir, wishSpeed, _cfg.AirAccel, dt);
+        // ── 空中输入（v0.5.2 收紧，需求 m01928 第 4 点）──────────────
+        //
+        // 需求：「空中输入也不会产生什么作用，只有很微小的偏移，基本上只能靠惯性飞跃」。
+        //
+        // 旧实现是 Source 谱系的 air-strafe（AirAccel=10 + AirWishSpeed=1.524）：
+        // 按住侧移 + 缓慢转视角能把 6.6 m/s 一路加到 7.95 m/s（+20%），
+        // 显然不是"靠惯性"。
+        //
+        // 现在两道闸一起生效：
+        //   ① 加速度改用 AirControlAccel（默认 1.2 m/s²，只有原来的 12%）；
+        //   ② **硬上限**：水平速度不允许超过「离地速度 + AirSteerSpeedAllowance(0.5)」。
+        //      转视角/换方向只会让速度矢量**转向**，不会让它变长 ——
+        //      "空中只能微调方向、不能凭空加能量" 成为一条不变量。
+        {
+            F3 before = _vel;
+            Accelerate(wishDir, wishSpeed, _cfg.AirControlAccel, dt);
+
+            F3 horiz = F3.ProjectOnPlane(_vel, _up);
+            float hs = horiz.Length();
+            float cap = _airEntrySpeed + _cfg.AirSteerSpeedAllowance;
+            if (hs > cap && hs > 1e-5f)
+            {
+                F3 vertical = _vel - horiz;
+                _vel = vertical + horiz / hs * cap;
+            }
+
+            _accInput += (_vel - before) / dt;
+        }
+
+        // ── 起跳加速段（JumpAccelTime > 0 时才有；默认 0 时这段完全不执行）──
+        //
+        // 与"冲量式起跳"的唯一区别：速度不是一次给满，而是在 T 时间内匀加速到 u。
+        // 重力照常作用，所以净加速度是 a − g，位移曲线是连续的抛物线拼接。
+        if (_jumpRampTicksLeft > 0)
+        {
+            _vel += _up * (_jumpRampThrust * dt);
+            _accImpulse += _up * _cfg.JumpRampThrust;
+            _jumpRampTicksLeft--;
+        }
 
         // 重力
         _vel -= _up * (_cfg.Gravity * dt);
@@ -661,14 +983,24 @@ public sealed class ApexMovementCore
         if (downward > _cfg.MaxFallSpeed)
             _vel += _up * (downward - _cfg.MaxFallSpeed);
 
-        // 空中滑铲：需要**同时**满足水平 > 90hu/s 与向下 > 200hu/s（wiki Air Slide）
-        if (input.CrouchHeld &&
-            HorizontalSpeed >= _cfg.SlideMinStartSpeedAirHorizontal &&
-            (-VerticalSpeed) >= _cfg.SlideMinStartSpeedAirVertical)
-        {
-            BeginSlide(input, fromAir: true);
-            return;
-        }
+        // ★ v0.4.2：**空中滑铲已整体删除**（需求方：「玩家现在可以无限滑铲连跳，
+        //   然后越跳越高，在空中保持滑铲姿态连续跳跃，这是不正常的」）。
+        //
+        //   旧逻辑在这里用 Apex 的 Air Slide 条件（水平 > 90hu/s 且下坠 > 200hu/s）
+        //   直接 BeginSlide —— 于是空中的状态机变成 Slide，而 StepSlide 里既能
+        //   贴地（_vel 被投影到一个**过期的** _groundNormal 上 ⇒ 手感上的"虚拟平台"）
+        //   又能吃滑铲跳分支（_jumpBuffered ⇒ DoJump 给满 JumpVelocity）。
+        //   跳→落→空中滑铲→再跳，每循环净赚一次跳跃初速 ⇒ 无限爬升。
+        //
+        //   现在的分工：
+        //     · 空中按住蹲 ⇒ **只是蹲着**（UpdateCrouch 把胶囊收到蹲姿体积，
+        //       空中是"中心不动、收腿"那一档，见 AirCrouchShrinksToMiddle）。
+        //     · 落地后仍按住蹲且水平速度 ≥ SlideMinStartSpeed ⇒ **落地那一 tick 就
+        //       由 Step() 的 9a 段当场 BeginSlide**（不是等下一 tick 的 StepGround，
+        //       那样会先白吃一 tick 地面摩擦）⇒ 需求要的「落地后继续保持滑铲状态，
+        //       并且可以继续跳起来」。
+        //   配置项 SlideMinStartSpeedAirHorizontal / ...Vertical 已一并删除
+        //   （见 MovementConfig 的同位置说明）—— 不留"有旋钮但没代码读"的假接口。
 
         // 土狼跳
         if (_jumpBuffered && _coyoteTimer > 0f) DoJump(fromSlide: false, crouchHeld: input.CrouchHeld);
@@ -759,7 +1091,7 @@ public sealed class ApexMovementCore
 
     // ───────────────────────── 打滑（Slip） ─────────────────────────
     //
-    // 语义来源（docs/reverse-engineering-v0.2.md §5.10，全部 A 级字段名）：
+    // 语义来源（docs/REVERSE-ENGINEERING.md §2.5.10，全部 A 级字段名）：
     //   体积  DT_TriggerSlipSphere / C_TriggerSlipSphere / trigger_slip_sphere
     //         m_slipSpeed / m_slipAcceleration / m_defaultSlipDirection
     //   玩家  m_touchingSlipTriggersCount
@@ -912,9 +1244,15 @@ public sealed class ApexMovementCore
 
         // ── 玩家主动行为优先 ────────────────────────────────────────
         // 滑区里仍然允许：蹲下滑铲（把环境推挤转成玩家可控的滑铲）、跳出去。
-        if (input.CrouchHeld && HorizontalSpeed >= _cfg.SlideMinStartSpeed)
+        //
+        // ★ v0.4.2：这里**必须**带 _onGround。改前是 BeginSlide(input, fromAir: !_onGround)
+        //   —— 于是"在空中经过滑区 + 按住蹲"会凭空得到一个空中 Slide 状态，
+        //   正是需求方报的「在空中保持滑铲姿态」的最后一个入口。
+        //   StepSlide 下一 tick 虽然会把它打回 Air，但那一 tick 里玩家已经吃到
+        //   滑铲的贴地投影与滑铲跳分支 —— 就是"空中虚拟平台"的来源。
+        if (_onGround && input.CrouchHeld && GroundPlaneSpeed >= _cfg.SlideMinStartSpeed)
         {
-            BeginSlide(input, fromAir: !_onGround);
+            BeginSlide(input);
             return;
         }
 
@@ -927,38 +1265,75 @@ public sealed class ApexMovementCore
 
     // ───────────────────────── 滑铲 ─────────────────────────
 
-    private void BeginSlide(in MovementInput input, bool fromAir)
+    /// <summary>
+    /// 进入滑铲。**调用方必须保证玩家在地面上**（<see cref="MovementState.Slide"/>
+    /// 自 v0.4.2 起是**纯地面状态**）。
+    ///
+    /// 签名里原来有一个 <c>bool fromAir</c> 参数，那是"空中滑铲"还存在的时代的遗留；
+    /// 空中滑铲被删除后它恒为 false，于是 v0.4.2 直接把它删掉 ——
+    /// **让"在空中有没有办法起滑铲"这件事在类型层面就不成立**，
+    /// 而不是靠调用方记得传 false（StepSlip 就是忘了传、留了最后一个空中入口）。
+    /// </summary>
+    private void BeginSlide(in MovementInput input)
     {
         _state = MovementState.Slide;
         _slideTime = 0f;
-        _slideEntrySpeed = HorizontalSpeed;
 
-        // ★ Slideboost：进入滑铲的**第一帧**触发一次，带 2s 冷却。
-        //   公式（wiki）：Slideboost = 150hu/s × (holster × walkBoost)
-        //   进入后速度 = 当前速度 + Slideboost，上限 400hu/s × (holster × walkBoost)
-        float mod = input.Holstered ? _cfg.HolsterMultiplier : 1f;
+        // ── v0.5（需求 m01202）：入口判定与 boost 彻底分离 ──────────────
+        //
+        //   ① 入口判定用的是**滑铲平面内**的速度（速度投影到地面平面后的模长），
+        //      这在调用方（StepGround / 落地 tick）已经做过了 —— 能走到这里就说明
+        //      平面速度 ≥ SlideMinStartSpeed。这里只把它记下来供调试/自检。
+        //   ② 进入之后**才**加 boost，而且 boost 要按坡度投影换算：
+        //        boost_沿坡 = SlideBoostSpeed / cosθ
+        //      （需求方例子：30° 坡、boost=√3 ⇒ 2.0 m/s）。
+        //   ③ **不再有速度上限**（需求：「取消滑铲速度上限」）。
+        F3 velBeforeSlideBoost = _vel;
+        F3 planeVel = F3.ProjectOnPlane(_vel, _groundNormal);
+        float planeSpeed = planeVel.Length();
+        _slideEntrySpeed = planeSpeed;
+
+        float slopeAngle = MathF.Acos(Clamp(F3.Dot(_groundNormal, _up), 0f, 1f));
         _slideBoostGranted = _slideBoostCooldown <= 0f;
+        float mod = input.Holstered ? _cfg.HolsterMultiplier : 1f;
+        float boost = _slideBoostGranted
+            ? SlideBoostForSlope(_cfg.SlideBoostSpeed * mod, slopeAngle)
+            : 0f;
 
-        F3 horiz = F3.ProjectOnPlane(_vel, _up);
-        float speed = horiz.Length();
-        if (speed > 1e-4f)
+        if (planeSpeed > 1e-4f) _vel = planeVel / planeSpeed * (planeSpeed + boost);
+        else if (boost > 0f)
         {
-            float boosted = speed + (_slideBoostGranted ? _cfg.SlideBoostSpeed * mod : 0f);
-            float cap = _cfg.SlideMaxSpeed * mod;
-            if (boosted > cap) boosted = cap;
-            _vel = horiz / speed * boosted + _up * F3.Dot(_vel, _up);
+            // 站着起滑（理论上门槛挡住了，兜底也保持方向确定）
+            F3 fwd = F3.ProjectOnPlane(Forward(), _groundNormal);
+            if (fwd.LengthSq() > 1e-8f) _vel = fwd.Normalized() * boost;
         }
+
+        // 滑铲 boost 同样是瞬时冲量（不是加速度），单独记一笔。
+        _accImpulse += (_vel - velBeforeSlideBoost) / _cfg.FixedDelta;
 
         if (_slideBoostGranted) _slideBoostCooldown = _cfg.SlideBoostCooldown;
 
         // 滑铲瞬间把胶囊拉到蹲姿（wiki：Sliding instantly pulls your Collision Pill down）
         // 注意：这里不瞬间改 _currentHeight，交给 UpdateCrouch 的滑铲强制 target=1 处理，
         // 避免"高度瞬间变化 + 中心平移"把角色塞进地面。
-        _ = fromAir;
     }
 
     private void StepSlide(in MovementInput input, float dt)
     {
+        // ★ v0.4.2：滑铲是**地面状态**。空中一律交回 Air 状态机。
+        //
+        // 这一条是"虚拟平台 / 无限连跳"的正面修复点：只要有一 tick 发现脚下没地
+        // （滑出坡道尽头、被弹开、或历史上那条空中滑铲入口），就立刻退出滑铲，
+        // 绝不在空中继续跑滑铲的贴地/滑铲跳逻辑。
+        // 蹲姿体积不受影响 —— 那是 UpdateCrouch 按 CrouchHeld 独立维护的。
+        if (!_onGround)
+        {
+            _state = MovementState.Air;
+            _slideTime = 0f;
+            _slideBoostGranted = false;
+            return;
+        }
+
         _slideTime += dt;
 
         // ── 摩擦 + 坡度重力（v0.4.1：滑铲改成真实物理）──────────────
@@ -978,10 +1353,15 @@ public sealed class ApexMovementCore
         F3 horizVel = F3.ProjectOnPlane(_vel, _up);
 
         float mu = SlideFrictionAt();
-        if (horizVel.LengthSq() > 1e-6f && wishDir.LengthSq() > 1e-6f &&
-            F3.Dot(horizVel.Normalized(), wishDir) < -0.2f)
+        // 按 S（向后）主动制动：μ 乘 SlideReverseInputPenalty（wiki：反向输入减速非常剧烈）。
+        //
+        // ★ v0.5.2 改判据：原来用「速度方向 与 wishDir 点积 < −0.2」，而 A/D 横移
+        //   也会让 wishDir 与速度夹角变大（斜按 45° 时点积 ≈ 0.7 不触发，但正后方
+        //   A+S 一起按点积会掉到 −0.7）—— 结果"侧向微调"偶尔被当成"刹车"。
+        //   现在只看**纯纵向输入**（MoveZ < −0.3），语义与需求一致：
+        //   「按 s 则和之前一样会提供一些主动制动」。
+        if (input.MoveZ < -0.3f)
         {
-            // 反向输入会"非常剧烈"地减速（wiki），用额外摩擦倍率表达。
             mu *= _cfg.SlideReverseInputPenalty;
         }
 
@@ -993,7 +1373,9 @@ public sealed class ApexMovementCore
         {
             F3 downhill = F3.ProjectOnPlane(-_up, _groundNormal);
             if (downhill.LengthSq() > 1e-8f)
+            {
                 _vel += downhill.Normalized() * (_cfg.Gravity * sinT * dt);
+            }
         }
 
         // ② 库仑摩擦：沿"坡面内的速度方向"反向，大小 μ·g·cosθ·dt
@@ -1004,26 +1386,74 @@ public sealed class ApexMovementCore
         {
             float drop = mu * _cfg.Gravity * cosT * dt;
             float newSpeed = MathF.Max(0f, slopeSpeed - drop);
+
+            // ★ v0.5（需求 m01202）：「基础蹲走移速是保证滑铲被减速后的最慢移动速度（保底）」
+            //   摩擦不许把滑铲速度压到蹲走速度以下 —— 到了这个速度就交还地面状态机，
+            //   由蹲走/蹲伏接管，而不是先掉到 1.8 再被拉回来（会看到一下顿挫）。
+            float floorSpeed = _cfg.SlideExitSpeed;
+            if (newSpeed < floorSpeed) newSpeed = MathF.Min(slopeSpeed, floorSpeed);
+
+            F3 beforeF = _vel;
             _vel += slopeVel / slopeSpeed * (newSpeed - slopeSpeed);
+            _accFriction += (_vel - beforeF) / dt;
         }
 
-        // ── 转向 ──────────────────────────────────────────────────
-        // wiki：短暂方向输入几乎被忽略，持续按住可以极轻微转向。
-        if (wishDir.LengthSq() > 1e-6f)
+        // ── 滑铲时的输入（v0.5.2 / 需求 m01928 第 4 点）──────────────
+        //
+        // 需求：「滑铲时始终是滑动摩擦（最大静摩擦力）并且摩擦力与运动方向相反，
+        // 所以滑铲的时候输入按键 w 前进方向不会产生作用，按 a/d 可以提供一点点的
+        // 转向控制，按 s 则和之前一样会提供一些主动制动」。
+        //
+        // 为什么 W 不能有作用：滑铲时脚下是**滑动**，摩擦只沿运动反方向，
+        // 没有任何"沿输入方向的推进会由静摩擦提供"的机制 —— 你想加速也无处着力。
+        // 所以这里只保留 **横向**（垂直于当前滑行方向）的微调，前进分量直接砍掉。
+        if (wishDir.LengthSq() > 1e-6f && slopeSpeed > 1e-4f)
         {
-            float steerSpeed = WishSpeed(input) * _cfg.SlideSteerFactor;
-            Accelerate(wishDir, steerSpeed, _cfg.GroundAccel * _cfg.SlideSteerFactor, dt);
+            F3 heading = slopeVel / slopeSpeed;              // 当前滑行方向（坡面内）
+            F3 wish = F3.ProjectOnPlane(wishDir, _groundNormal);
+            if (wish.LengthSq() > 1e-8f)
+            {
+                wish = wish.Normalized();
+                // 只取横向分量：forward 分量丢掉（W 无效），侧向 a/d 保留
+                F3 lateral = wish - heading * F3.Dot(wish, heading);
+                float lateralLen = lateral.Length();
+                if (lateralLen > 1e-4f)
+                {
+                    F3 steerDir = lateral / lateralLen;
+                    float steerMag = MathF.Min(1f, lateralLen);   // 纯横移=1，斜按更小
+                    float steerAccel = _cfg.GroundAccel * _cfg.SlideSteerFactor * steerMag;
+
+                    // 转向不加速：先加侧向速度，再把总速度**投影回原大小**
+                    // （滑铲时能量只减不增，转向不该白送速度）
+                    F3 beforeI = _vel;
+                    _vel += steerDir * (steerAccel * dt);
+
+                    F3 newSlope = F3.ProjectOnPlane(_vel, _groundNormal);
+                    float ns = newSlope.Length();
+                    if (ns > 1e-5f && ns > slopeSpeed)
+                        _vel += (newSlope / ns * slopeSpeed - newSlope);
+
+                    _accInput += (_vel - beforeI) / dt;
+                }
+            }
         }
+
 
         // 贴地
         _vel = F3.ProjectOnPlane(_vel, _groundNormal);
 
-        // ── 结束条件 ──────────────────────────────────────────────
-        bool tooSlow = HorizontalSpeed < _cfg.SlideMinSpeed;
-        bool tooLong = _slideTime >= _cfg.SlideMaxDuration;
+        // ── 结束条件（v0.5 / 需求 m01202）──────────────────────────
+        //
+        //   · 速度降到**蹲走基础移速**（SlideExitSpeed = CrouchWalkSpeed）就交还地面状态机：
+        //     仍按 Ctrl ⇒ 蹲伏；Ctrl+W ⇒ 蹲走。滑铲不会突然掉到 0。
+        //   · **没有时间上限**了（需求：「由于坡度较大可以一直保持滑铲姿态」）——
+        //     陡坡上重力分量一直大于摩擦，本来就能无限滑下去；
+        //     平地靠库仑摩擦自然会减速到蹲走速度，不需要用计时器兜底。
+        //   · 松开 Ctrl 立刻结束（原行为）。
+        bool tooSlow = slopeSpeed <= _cfg.SlideExitSpeed;
         bool releasedCrouch = !input.CrouchHeld;
 
-        if (tooSlow || tooLong || releasedCrouch)
+        if (tooSlow || releasedCrouch)
         {
             EndSlide();
             return;
@@ -1070,6 +1500,29 @@ public sealed class ApexMovementCore
     }
 
     /// <summary>
+    /// **按坡度投影换算滑铲 boost** (m/s)。
+    ///
+    /// v0.5 需求（m01202）：「基于滑铲平面角度添加 boost 速度（例如 30° 斜坡，
+    /// boost 如果是 √3 m/s，那基于角度会得到 30° 斜坡的 boost 为 2 m/s，这是基于投影的）」。
+    ///
+    /// <code>
+    ///   boost_沿坡 = boost_水平 / cosθ
+    ///   30°、√3 ⇒ √3 / cos30° = 2.0 ✓（与需求方给的例子逐位一致）
+    /// </code>
+    ///
+    /// 为什么是除以：boost 是按"水平面推进量"标定的；斜面上要实现同样的水平推进，
+    /// 沿坡面必须走更长的距离，所以沿坡速度更大。
+    ///
+    /// 夹紧：θ ≥ 60° 时按 60° 算（1/cos 在接近竖直时会发散，而滑铲本来也滑不上 60° 的坡）。
+    /// </summary>
+    public static float SlideBoostForSlope(float boostFlat, float slopeAngleRad)
+    {
+        float c = MathF.Cos(slopeAngleRad);
+        if (c < 0.5f) c = 0.5f;
+        return boostFlat / c;
+    }
+
+    /// <summary>
     /// 沿坡滑动的合加速度 (m/s²)：<c>a = g·sinθ − μ·g·cosθ</c>。
     /// 正值 = 沿坡加速（坡太陡，摩擦压不住），负值 = 减速。
     /// 纯函数，自检直接验它（不需要真的造一个斜坡世界）。
@@ -1083,7 +1536,10 @@ public sealed class ApexMovementCore
 
     private void EndSlide()
     {
-        _state = MovementState.Ground;
+        // 脚下没地就是空中（滑出坡道尽头 / 从台面滑下去）——
+        // v0.4.2 之前这里无条件写 Ground，于是人在空中却跑地面状态机，
+        // 表现就是"空中像有虚拟平台"。
+        _state = _onGround ? MovementState.Ground : MovementState.Air;
         _slideTime = 0f;
         _slideBoostGranted = false;
     }
@@ -1119,9 +1575,28 @@ public sealed class ApexMovementCore
             _mantleClass = _cfg.ClassifyMantle(
                 F3.Dot(_traversalEnd, _up) - F3.Dot(_pos, _up) + _currentHeight * 0.5f);
             _mantlePhase = MantlePhase.Pull;
-            _traversalTime = _traversalDuration * _cfg.MantleGrabFraction;
+
+            // ★ v0.5.2：时间轴也**从 0 起**，并把总时长按"只剩 Pull 段"折算。
+            //
+            // 原来是把 _traversalTime 预置成 duration*grabFrac（"假装 Grab 段已经走完"）。
+            // 但插值改成"全局缓动 + 折线弧长"以后，t=grabFrac 对应的是**已经走了
+            // 28% 弧长**的位置 —— 于是第一帧仍然会跳（实测 0.5018 m）。
+            // 现在：时间从 0 起、时长只剩 Pull 段、mid 就是起点（上面那行），
+            // 三件事一起才让"按 W 上墙"的第一帧位移等于正常一帧。
+            _traversalTime = 0f;
+            _traversalDuration = MathF.Max(
+                0.01f, _cfg.MantleDurationFor(_mantleClass) * (1f - _cfg.MantleGrabFraction));
             _traversalStart = _pos;
-            _traversalMid = F3.Lerp(_pos, _traversalEnd, 0.5f);
+
+            // ★ v0.5.2 平滑修复（P0-1）：Pull 段必须从**当前位置**起步。
+            //
+            // 原来写的是 start/end 的中点，但 Grab 段已经被跳过（我们还站在 start），
+            // 于是 Pull 第一帧直接把身体拉到中点 —— 3.0 m 墙实测单帧瞬移 0.5380 m
+            // （等效 32.3 m/s），这就是"攀爬→翻越顿一下"里最大的一处。
+            //
+            // start→mid→end 三点共线，把 mid 设成 start 只是改**参数化**，
+            // 轨迹几何完全不变（ClimbTest 50/50 通过）。
+            _traversalMid = _pos;
         }
 
         _ = dt;
@@ -1133,11 +1608,14 @@ public sealed class ApexMovementCore
     {
         bool coyote = !_onGround && _coyoteTimer > 0f;
 
+        // 标记"本次腾空来自起跳"（抓墙间隙门限豁免的依据，见 _leftGroundByJump）。
+        _leftGroundByJump = true;
+
         _jumpBuffered = false;
         _jumpBufferTimer = 0f;
         _coyoteTimer = 0f;
 
-        float jumpVel = _cfg.JumpVelocity;
+        float jumpVel = _cfg.EffectiveJumpVelocity;
 
         // ── 跳跃疲劳 ──────────────────────────────────────────────
         // wiki：落地后 0.15s 内再跳，高度被压到 30%，线性回升到 0.75s 恢复满高。
@@ -1174,7 +1652,40 @@ public sealed class ApexMovementCore
 
         // 保留水平分量，替换竖直分量
         F3 h = F3.ProjectOnPlane(_vel, _up);
-        _vel = h + _up * jumpVel;
+
+        // 空中速度增益的基准 = 离地瞬间的水平速度（见 StepAir 的硬上限）
+        _airEntrySpeed = h.Length();
+
+        F3 velBeforeJump = _vel;
+
+        // ── 起跳方式：瞬时冲量 / 有限加速（见 MovementConfig.JumpAccelTime）──
+        //
+        // 默认（JumpAccelTicks = 0）走冲量分支，与 v0.4.2 逐位一致。
+        //
+        // 加速分支：起跳 tick 先给**一个 tick 的推力位移速度**，保证本 tick 就离开地面
+        // （否则 vy=0 会被 UpdateGroundContact 当成"还在地面"而把跳跃吃掉），
+        // 剩下的 tick 由 StepAir 每 tick 继续加推力、重力照常扣。
+        int rampTicks = _cfg.JumpAccelTicks;
+        if (rampTicks > 0)
+        {
+            // 推力 a = u/T + g：u 是加速段出口速度，T 是加速段总时长，
+            // 多出来的 +g 用来抵消加速段里同时作用的重力。
+            // 离散补偿：起跳 tick 先给推力、不扣重力，所以整个加速段少扣了一次 g·dt。
+            // 把推力降 g/n 之后，第 n tick 结束时速度逐位等于 jumpVel。
+            _jumpRampThrust = jumpVel / _cfg.JumpAccelTimeActual
+                            + _cfg.Gravity * (1f - 1f / rampTicks);
+            _jumpRampTicksLeft = rampTicks - 1;   // 本 tick 已经手动加了一次
+            _vel = h + _up * (_jumpRampThrust * _cfg.FixedDelta);
+        }
+        else
+        {
+            _jumpRampTicksLeft = 0;
+            _jumpRampThrust = 0f;
+            _vel = h + _up * jumpVel;
+        }
+
+        // 起跳是一次**瞬时冲量**：本 tick 的速度突变全部记到 Impulse 上。
+        _accImpulse += (_vel - velBeforeJump) / _cfg.FixedDelta;
 
         _state = MovementState.Air;
         _onGround = false;
@@ -1245,14 +1756,20 @@ public sealed class ApexMovementCore
 
         // ① 必须离地。地面上的"贴墙按 W"要撞停，不是抓墙（需求第 2 条）。
         if (_onGround) return false;
-        if (_state is not (MovementState.Air or MovementState.Slide)) return false;
+        // v0.4.2：Slide 已是纯地面状态，空中不可能是 Slide —— 允许集合收窄到 Air。
+        if (_state != MovementState.Air) return false;
 
         // ①b 脚底下就有地面 ⇒ 不抓（这是"站在墙根/刚落地"，不是"挂在墙上"）。
         //
         // 扒墙默认化之后这条是必需的：离开地面那一 tick `_onGround` 还是 false，
         // 而"空中 + 够得到墙 + 正在下落"三个条件全部满足 —— 于是贴着墙走下一级
         // 小台阶的人会被凭空吸到墙上去。加一条脚下探针把"脚下是地面"排除掉。
-        if (_cfg.WallGrabMinGroundClearance > 0f)
+        //   ★ v0.5（用户 m01300 BUG 2）：**跳出来的腾空豁免这条门**。
+        //     需求原话「我希望改成只要跳了就攀爬」—— 跳跃高度不该参与"能不能抓墙"，
+        //     否则跳跃疲劳（0.23 m）和超重力星球（跳得更低）都会整块失效。
+        //     走下台沿/被推落那种腾空没有起跳动作，仍然要过这道门
+        //     （防"贴着墙走下小台阶被凭空吸到墙上"）。
+        if (!_leftGroundByJump && _cfg.WallGrabMinGroundClearance > 0f)
         {
             F3 feetNow = _pos - _up * (_currentHeight * 0.5f);
             if (_world.Raycast(feetNow, -_up, _cfg.WallGrabMinGroundClearance,
@@ -1267,12 +1784,22 @@ public sealed class ApexMovementCore
 
         // ② 输入门：下落自动抓；上升必须按着 W。
         bool pressingW = input.MoveZ > 0.3f;
+        bool pressingS = input.MoveZ < -0.3f;
         bool descending = VerticalSpeed < -0.1f;
 
         // 脱手后"必须按 W 才能再抓"的门闩（见 DetachWallGrab）。
         // 没有它，「按 S 掉落 → 下落中自动扒住」会立刻把人吸回墙上。
         if (_wallGrabNeedW && !pressingW) return false;
         if (!descending && !pressingW) return false;
+
+        // ②b 反向输入（按着 S）直接拒绝（v0.4.2 修「倒退坠下高台被边缘吸住」的补充闸）。
+        //
+        // ④b 用**已经形成**的水平速度判定"离墙/朝墙"，但从静止开始按 S 时，
+        // 速度要几 tick 才建立起"背离墙面"的分量；那几 tick 里 approach ≈ 0，
+        // ④b 会放行 —— 于是"站在高台边缘按 S 刚掉出去"的瞬间仍可能被抓一下。
+        // 需求口径是「只有玩家**面向高台前进**的时候才会触发攀爬」，
+        // 所以把"明确的后退意图"也作为拒绝条件：按 S 就是"我要往下掉"，不是"我要抓"。
+        if (pressingS) return false;
 
         F3 fwd = Forward();
         float reach = _cfg.CapsuleRadius + MathF.Max(_cfg.WallHangReach, _cfg.TraversalReach);
@@ -1291,6 +1818,30 @@ public sealed class ApexMovementCore
         float facing = -F3.Dot(hitNormal, fwd);
         float cosLimit = MathF.Cos(_cfg.WallHangMaxViewAngle * MathF.PI / 180f);
         if (facing < cosLimit) return false;
+
+        // ④b 必须是「朝墙去」，而不是「离墙去」（v0.4.2 修「倒退坠下高台被边缘吸住」）
+        //
+        // 症状：站在高台上按住 S 倒退着掉下去，人会贴在台子的侧面上挂一小会儿
+        //       （WallHangIdleFallTime ≈1.2 s）再掉下来。
+        // 根因：倒退时**前向射线恰好打在刚离开的那块台的侧面上** —— 人已经越过
+        //       边缘、台子在身后，可角色的朝向没变，于是台子落在"正前方"；
+        //       旧判定只看「面向墙 + 正在下落」两条，于是无条件抓住。
+        // 需求方口径：「只有玩家面向高台前进的时候才会触发攀爬，而不是任何方向都触发」。
+        //
+        // 判据用**水平速度在墙面法线上的分量**：
+        //   approach > 0 ⇒ 正在靠近墙（正常前进/贴墙跳）
+        //   approach < 0 ⇒ 正在远离墙（倒退、被推开、被弹开）
+        //   approach ≈ 0 ⇒ 垂直下落（水平分量≈0）
+        // 按着 W 时无条件放行（W 就是"我要往前"的明确意图）；
+        // 否则远离墙超过 WallGrabMaxRecedeSpeed 就拒绝。于是：
+        //   · 倒退坠台（水平速度背离墙面 ≈3 m/s）⇒ 拒绝 ✔
+        //   · 跳跃/下落贴墙、不按任何键 ⇒ approach≈0 ⇒ 仍然自动抓住 ✔
+        if (!pressingW)
+        {
+            F3 horizVel = F3.ProjectOnPlane(_vel, _up);
+            float approach = -F3.Dot(horizVel, hitNormal);
+            if (approach < -_cfg.WallGrabMaxRecedeSpeed) return false;
+        }
 
         // ⑤ 太矮的障碍不挂（对应 automantle_disable_hang 的意图）：
         //    "脚底往上 0.6 × 小障碍档高度"那一层打不到墙 ⇒ 它矮到该迈过去/翻过去。
@@ -1342,6 +1893,16 @@ public sealed class ApexMovementCore
         // 到顶探针（射程 0.7）必然打空 ⇒ 秒判 wallGone ⇒ 直接吃 End boost 弹开。
         float dist = F3.Dot(_pos - hitPoint, hitNormal);
         float want = _cfg.CapsuleRadius + 0.02f;
+
+        // ⚠ v0.4.3 物理审计 P0-3（**已知不物理，故意保留**）：
+        //   这一行把身体一次贴到墙面上，单 tick 位移可达 0.88 m
+        //   （探测射程 1.3064 − 目标 0.4264），等效 52.8 m/s 的位置突变。
+        //   试过把它摊成"每 tick 按 4 m/s 收拢"，结果墙态探针（到顶探针、
+        //   墙面重探、横移射线）全都假设**已经贴住墙**，人离开墙面 0.3 m 后
+        //   探针打空 ⇒ 立刻判 wallGone 脱手：ClimbTest 47 项里 10 项红、
+        //   integration 4 项红。要做成物理连续，必须把整套墙态探针改成
+        //   "允许离墙距离"的形式，属于独立改造，不在本次范围内。
+        //   结论：保留 Apex 的瞬移吸附（见 README 物理审计表 T 项）。
         _pos += hitNormal * (want - dist);
 
         // 抓住墙的一瞬间动量清零（手已经"挂"住了）。
@@ -1413,15 +1974,7 @@ public sealed class ApexMovementCore
         //    这段不做脱离判定，否则"补爬的一半"会被墙顶那条探针打断。
         if (_climbApproaching)
         {
-            float speed = _cfg.ClimbHangApproachDistance /
-                          MathF.Max(1e-4f, _cfg.ClimbHangApproachTime);
-            float stepUp = MathF.Min(_climbApproachRemaining, speed * dt);
-            _climbApproachRemaining -= stepUp;
-
-            _vel = _up * (stepUp / MathF.Max(1e-6f, dt));
-            _pos += _up * stepUp;
-
-            if (_climbApproachRemaining <= 1e-4f) EnterHangFromClimb();
+            StepClimbApproach(dt);
             return;
         }
 
@@ -1459,8 +2012,22 @@ public sealed class ApexMovementCore
         if (wallGone || overLimit)
         {
             // 上方有可站立台面 ⇒ 先补爬一小段再进 Hang（需求「继续上爬一小部分进入扒墙状态」）
-            if (TryBeginClimbHangApproach()) return;
-            // 上方什么都没有（墙比人能爬的还高）⇒ End boost 上抛脱离
+            //
+            // ★ v0.5.2 平滑修复（P0-3）：**只有"真的到顶"(wallGone) 才允许补爬**。
+            //
+            //   原因：TryFindClimbLedge 允许选到"比脚底高 2.75 m"的沿，于是 4~5.4 m 的墙
+            //   会同时满足 overLimit 与"沿在扫描窗内"—— 一次抓取里凭空多爬 1~2 m，
+            //   既造成 P0-2 那个瞬移，也违反"单段爬升 ≤ ClimbAttachOffset"的不变量。
+            //   爬升到上限（overLimit）时一律走 End boost 上抛 → 落回 → 重抓 → 再爬，
+            //   与现有 6.0 / 7.5 m 墙完全同一条路。
+            if (wallGone && TryBeginClimbHangApproach())
+            {
+                // 同一帧就把补爬的第一步走出去，别空转一帧（P1-1 的同类问题）
+                StepClimbApproach(dt);
+                return;
+            }
+
+            // 上方什么都没有 / 已达到单段爬升上限 ⇒ End boost 上抛脱离
             DetachWallGrabAtTop();
             return;
         }
@@ -1554,7 +2121,18 @@ public sealed class ApexMovementCore
         if (!TryFindClimbLedge(out F3 ledgeTop)) return false;
 
         _climbHangTop = ledgeTop;
-        _climbApproachRemaining = _cfg.ClimbHangApproachDistance;
+
+        // ★ v0.5.2 平滑修复（P0-2）：补爬距离改成"正好爬到挂姿"。
+        //
+        // 原来固定走 ClimbHangApproachDistance(0.35 m)，但 EnterHangFromClimb 会把
+        // 脚底**硬吸附**到「台沿 − 0.25 m」。墙越高，两者差得越多：
+        //   3.0 m 墙 ⇒ 单帧吸附 0.3138 m；5.0 m 墙 ⇒ **1.7805 m**（≈107 m/s）。
+        // 现在补爬距离按实际差额算，吸附量自然接近 0（保留硬吸附作为兜底）。
+        float hangFeetY = F3.Dot(ledgeTop, _up) - 0.25f;
+        float curFeetY = F3.Dot(_pos, _up) - _currentHeight * 0.5f;
+        _climbApproachRemaining = MathF.Max(_cfg.ClimbHangApproachDistance * 0.01f,
+                                            hangFeetY - curFeetY);
+
         _climbApproaching = true;
         return true;
     }
@@ -2309,17 +2887,44 @@ public sealed class ApexMovementCore
             return;
         }
 
-        if (t < grabFrac)
+        // ── 两段式轨迹（v0.5.2 平滑修复 P2-3）──────────────────
+        //
+        // 原来两段**各自**做一次 SmoothStep：交界处（t = grabFrac）两侧导数都是 0，
+        // 于是速度必然塌下去再重建 —— 实测 Vault 0.8 m 的交界帧 |Δp| 是
+        // 0.0045 → **0.0015** → 0.0202（掉到 1/3，肉眼就是"顿一下"）。
+        //
+        // 现在改成**全局缓动 + 折线路径**：
+        //   ① 用一条覆盖 0..1 的 SmoothStep 求总弧长参数 u（两端慢、中间快，且处处导数为正）；
+        //   ② 按两段路径的**实际长度**分配弧长，u 直接线性映射到折线上。
+        // 这样交界处速度**不为 0**（同一个 u 的导数），而路径形状（先上后前）完全不变。
         {
-            _mantlePhase = MantlePhase.Grab;
-            float s = SmoothStep(t / MathF.Max(1e-4f, grabFrac));
-            _pos = F3.Lerp(_traversalStart, _traversalMid, s);
-        }
-        else
-        {
-            _mantlePhase = MantlePhase.Pull;
-            float s = SmoothStep((t - grabFrac) / MathF.Max(1e-4f, 1f - grabFrac));
-            _pos = F3.Lerp(_traversalMid, _traversalEnd, s);
+            float u = SmoothStep(t);
+            F3 dA = _traversalMid - _traversalStart;
+            F3 dB = _traversalEnd - _traversalMid;
+            float lenA = dA.Length();
+            float lenB = dB.Length();
+            float total = lenA + lenB;
+
+            if (total < 1e-5f)
+            {
+                _pos = _traversalEnd;
+            }
+            else
+            {
+                float along = u * total;
+                if (along <= lenA || lenB < 1e-5f)
+                {
+                    _mantlePhase = MantlePhase.Grab;
+                    _pos = lenA < 1e-5f
+                        ? _traversalMid
+                        : _traversalStart + dA * (along / lenA);
+                }
+                else
+                {
+                    _mantlePhase = MantlePhase.Pull;
+                    _pos = _traversalMid + dB * ((along - lenA) / lenB);
+                }
+            }
         }
 
         _vel = F3.Zero;
@@ -2337,10 +2942,17 @@ public sealed class ApexMovementCore
         // 想站起时检查头顶空间。
         // 注意 testPos：**脚底锚定**后，站立姿态的胶囊中心比蹲姿高
         // (StandHeight − 当前高度)/2，所以头顶检测要按站立中心去测。
+        //
+        //   ★ v0.5：胶囊**底部留 4 cm 余量**（半高减 2 cm、中心抬 2 cm）。
+        //     贴地站立时胶囊底面恰好落在地面上，而物理形状查询带 margin，
+        //     会把地板本身判成"头顶有东西" ⇒ 永远站不起来。
+        //     抬起来之后顶部高度不变（天花板仍然测得到），只忽略脚底那 4 cm ——
+        //     那一段本来就压在地面里，不可能是障碍物。
         if (target < 1f && _crouchAmount > 0f)
         {
-            float hh = (_cfg.StandHeight - _cfg.CapsuleRadius * 2f) * 0.5f;
-            F3 testPos = _pos + _up * ((_cfg.StandHeight - _currentHeight) * 0.5f);
+            float hh = (_cfg.StandHeight - _cfg.CapsuleRadius * 2f) * 0.5f - 0.02f;
+            if (hh < 0.01f) hh = 0.01f;
+            F3 testPos = _pos + _up * ((_cfg.StandHeight - _currentHeight) * 0.5f + 0.02f);
             if (_world != null && _world.Overlaps(testPos, _cfg.CapsuleRadius, hh))
                 target = 1f;  // 头顶有东西，保持蹲
         }
@@ -2357,8 +2969,34 @@ public sealed class ApexMovementCore
         // 空中：中心不动（脚底随高度变化抬升/下降 delta/2）—— 等价"收腿"
         //
         // 这正是 wiki 指出的 slidehop vs bhop 手感差异的根因。
+        //
+        // ★ v0.5 修复（用户 m01300 BUG 1「连续滑铲跳后松开按键不起身」）：
+        //   **空中起身时脚底会向下伸 delta/2**。如果这时脚底离地面不到 delta/2，
+        //   胶囊就会伸进地里；而 UpdateGroundContact 只会向下吸附、不会把胶囊顶出来，
+        //   于是角色永久陷在地面以下约 4 cm，接着 Overlaps 认为"站立姿态头顶有东西"
+        //   → 蹲伏 target 永远被钉成 1 → 松开 Ctrl 也站不起来，
+        //   只有跳一下（胶囊升空、重叠消失）才会恢复。实测复现：
+        //   空中 h 0.95→1.90 的 8 个 tick 里脚底从 +0.024 掉到 −0.042。
+        //
+        //   物理上正确的处理：腿伸不穿地面。所以脚底一旦碰到地面就停住，
+        //   剩下的长度由**身体上移**吸收（人踩到地面时身体自然被撑起来）。
         if (_onGround || !_cfg.AirCrouchShrinksToMiddle)
+        {
             _pos += _up * (delta * 0.5f);
+        }
+        else if (delta > 0f)
+        {
+            float growth = delta * 0.5f;                       // 脚底将下伸的距离
+            F3 feetNow = _pos - _up * (_currentHeight * 0.5f);
+            bool feetOnGround = false;
+            if (_world != null &&
+                _world.Raycast(feetNow, -_up, growth + 0.01f, out _, out F3 gn))
+            {
+                feetOnGround = F3.Dot(gn, _up) >= _cfg.WalkableNormalDot;
+            }
+            // 脚底被地面挡住 ⇒ 脚底锚定（中心上移 growth），腿伸不穿地
+            if (feetOnGround) _pos += _up * growth;
+        }
 
         _currentHeight = newHeight;
     }
@@ -2452,8 +3090,13 @@ public sealed class ApexMovementCore
     }
 
     /// <summary>Source 谱系的摩擦公式。</summary>
-    private void ApplyFriction(float dt, float friction)
-    {        float speed = _vel.Length();
+    /// <summary>
+    /// 空中摩擦（默认 0，Apex 没有空气阻力）。保留粘性模型即可 ——
+    /// 空气阻力确实是 ∝ 速度的，和地面库仑摩擦不是一回事。
+    /// </summary>
+    private void ApplyAirFriction(float dt, float friction)
+    {
+        float speed = _vel.Length();
         if (speed < 0.1f) { _vel = F3.Zero; return; }
 
         float control = speed < _cfg.StopSpeed ? _cfg.StopSpeed : speed;
@@ -2464,6 +3107,292 @@ public sealed class ApexMovementCore
         _vel *= newSpeed / speed;
     }
 
+    /// <summary>
+    /// **地面驱动 + 摩擦**（v0.5.2 重做，需求 m01928 第 4 点）。
+    ///
+    /// 需求原话：「人行走奔跑起身是静摩擦力是做正功的，因为人不是滑动，所以摩擦力产生的
+    /// 加速度应该是浮动的，而且作用于玩家输入方向。当玩家达到最大速度时，静摩擦力会归零，
+    /// 如果玩家要转向，静摩擦力会将玩家的水平速度限制在上限……当玩家停止输入时，静摩擦力
+    /// 将会与玩家当前移动方向相反，然后缓慢增大到最大静摩擦变为滑动摩擦，直到停止
+    /// （类似汽车刹车，先降低轮胎滚动速度，最后抱死刹车）」
+    /// 「如果地面摩擦系数非常小，玩家可能无法达到正常行走的最大速度，可以真实模拟冰面
+    /// 难以行走，原地打滑的效果」。
+    ///
+    /// ## 三个工况
+    ///
+    /// **① 有输入 · 未超速（脚钉在地上 ⇒ 静摩擦做正功）**
+    /// 加速度方向 = **输入方向**（不是速度方向！），大小 = 驱动预算 + 重力沿坡分量：
+    /// <code>
+    ///   a_drive = accel·|input| + g·sinθ·(输入方向·下坡方向)
+    ///   a_drive = clamp(a_drive, 0, μs·g·cosθ)      ← 上限 = 最大静摩擦
+    ///   v += a_drive · dir(输入) · dt
+    /// </code>
+    /// **静摩擦不会沿速度反方向拖你** —— 那是打滑才有的行为。所以这一支里
+    /// **完全没有"摩擦减速"**，只有"驱动加速"。
+    /// 一旦 <c>a_drive</c> 被 μs 卡住（抓不住地），加速度就只剩 <c>μs·g·cosθ</c>：
+    /// 冰面（μk=0.05 ⇒ μs≈0.07）上按 W 只能拿到 0.69 m/s²，**永远走不到正常走速**，
+    /// 这就是需求要的"冰面难以行走、原地打滑"。
+    ///
+    /// **② 有输入 · 已超上限（转向 / 带着惯性落地）**
+    /// 需求：「静摩擦力会将玩家的水平速度限制在上限」。做法是：**只压超出的那一部分**，
+    /// 用滑动摩擦的减速度（μk·g·cosθ）收回来，收到上限为止。
+    /// 不一次性把速度砍到上限 —— 那会让"高速落地"瞬间变成"走路速度"，手感很假。
+    /// 于是：快落地 + 按住 W ⇒ 高速滑一段、慢慢降到跑速（真人在高速下也要用几步刹车）。
+    ///
+    /// **③ 无输入（刹车：静摩擦缓慢长到最大，再抱死成滑动摩擦）**
+    /// <code>
+    ///   μ_eff = μs·min(1, t/BrakeRampTime)      t &lt; BrakeRampTime（轮胎滚阻上升）
+    ///   μ_eff = μk                              t ≥ BrakeRampTime（抱死，纯滑动）
+    /// </code>
+    /// 正是需求说的"先降低轮胎滚动速度，最后抱死刹车"。
+    /// **主动急停**：输入与速度夹角 &gt; 120° 时按
+    /// <see cref="MovementConfig.ActiveBrakeMultiplier"/> 放大制动 —— 人想停会主动蹬地。
+    /// </summary>
+    private void ApplyGroundFrictionAndDrive(in MovementInput input, float dt,
+                                             float accel, float wishSpeed)
+    {
+        F3 planeVel = F3.ProjectOnPlane(_vel, _groundNormal);
+        F3 normalPart = _vel - planeVel;
+        float speed = planeVel.Length();
+
+        // ── 脚下材质的 μk（冰面等），μs 按同一比例缩放 ────────────────
+        float muK = _cfg.GroundFrictionCoefficient;
+        _effectiveMuS = _cfg.GroundStaticFrictionCoefficient;
+        if (_world is IFrictionWorld fw &&
+            fw.SampleFriction(FeetPosition + _up * 0.05f, out float materialMu) &&
+            materialMu >= 0f)
+        {
+            muK = materialMu;
+            // μs 与 μk 按默认配置的比例同步缩放；并保证物理上 μs ≥ μk
+            float ratio = _cfg.GroundFrictionCoefficient > 1e-6f
+                ? materialMu / _cfg.GroundFrictionCoefficient
+                : 1f;
+            _effectiveMuS = MathF.Max(materialMu, _cfg.GroundStaticFrictionCoefficient * ratio);
+        }
+
+        float cosT = Clamp(F3.Dot(_groundNormal, _up), 0f, 1f);
+        float sinT = MathF.Sqrt(MathF.Max(0f, 1f - cosT * cosT));
+
+        F3 wishDir = WishDirection(input);
+        float inputMag = MathF.Sqrt(input.MoveX * input.MoveX + input.MoveZ * input.MoveZ);
+        if (inputMag > 1f) inputMag = 1f;
+
+        // 移动是**沿坡面**的，所以驱动方向也要投影到地面平面
+        F3 driveDir = F3.Zero;
+        if (wishDir.LengthSq() > 1e-6f)
+        {
+            F3 p = F3.ProjectOnPlane(wishDir.Normalized(), _groundNormal);
+            float pl = p.Length();
+            if (pl > 1e-4f) driveDir = p / pl;
+        }
+
+        EffectiveKineticMu = muK;
+        float maxStaticAccel = _effectiveMuS * _cfg.Gravity * cosT;
+        float kineticAccel = muK * _cfg.Gravity * cosT;
+
+        if (driveDir.LengthSq() > 1e-8f)
+        {
+            // ── 上限 = 当前这一档的设计速度（走 / 跑 / 蹲走各自不同）──
+            //
+            //   需求：「奔跑时水平面移动速度永远无法高于上限」。
+            //   注意超速时**不是瞬移到上限**，而是按滑动摩擦一段一段收回来
+            //   （见下面 ②），所以"高速落地"会是"滑出去一小段再稳住"，
+            //   而不是"啪一下被砍到走速"。
+            float capSpeed = wishSpeed;
+
+            // ── ② 超速部分用滑动摩擦收回 ────────────────────────────
+            //
+            //   超速时（例如高速落地、或刚被滑铲 boost 弹出去）**这一 tick 不再推进**，
+            //   否则"摩擦减掉的量"会被"输入加速度加回来"，速度会永远停在 12 m/s
+            //   （实测就是如此：每 tick −0.114 摩擦 +0.167 驱动，再被上限夹住）。
+            //   玩家要跑得更快只有滑铲/外力；光按 W 会稳稳收回到设计顶速。
+            bool overspeed = speed > capSpeed + 1e-4f;
+            if (overspeed)
+            {
+                float newSpeed = MathF.Max(capSpeed, speed - kineticAccel * dt);
+                F3 before = planeVel;
+                planeVel = planeVel / speed * newSpeed;
+                _accFriction += (planeVel - before) / dt;
+                _isSliding = true;
+            }
+            else
+            {
+                _isSliding = false;
+            }
+
+            // ── ① 静摩擦驱动（作用于输入方向）──────────────────────
+            //
+            //   重力沿坡分量：下坡帮 +g·sinθ，上坡帮 −g·sinθ
+            //   （坡面重力方向 = ProjectOnPlane(-up, n)，归一化后与 driveDir 点乘）
+            F3 downhill = F3.ProjectOnPlane(-_up, _groundNormal);
+            float dl = downhill.Length();
+            float slopeAlong = dl > 1e-4f ? F3.Dot(driveDir, downhill / dl) : 0f;
+
+            float budget = accel * inputMag;
+
+            // 主动急停：输入与速度反向 ⇒ 乘主动制动倍率
+            if (speed > 0.5f)
+            {
+                float align = F3.Dot(planeVel / speed, driveDir);
+                if (align < -0.5f) budget *= _cfg.ActiveBrakeMultiplier;
+            }
+
+            // ── 抓地判定：推进需要的力 > 最大静摩擦 ⇒ 脚打滑 ────────
+            //
+            //   grip = min(1, μs·g·cosθ / 需要的推进加速度)
+            //   1 = 完全抓地；<1 = 打滑。冰面（μk=0.05 ⇒ grip≈0.095）几乎推不动，
+            //   这就是"冰面难以行走、原地打滑"的量化来源。
+            //
+            //   ★ 打滑时推进力按 grip **线性**衰减，另外再叠加一份**随滑移速度增大**
+            //     的耗散（见下面 drag）。只靠"截断推进"是压不住冰面的：实测线性
+            //     截断下冰面 5 秒仍能爬到 4.7 m/s（0.95 m/s² × 5 s），而只有耗散
+            //     没有推进又会把玩家永久钉在原地（软锁）。两者一起才得到
+            //     "起步打滑、能挪但挪不快"的稳定终端速度。
+            float need = MathF.Max(1e-4f, MathF.Abs(budget));
+            GripRatio = MathF.Min(1f, maxStaticAccel / need);
+            float grip = GripRatio;
+            float slip = 1f - grip;
+
+            // 推进部分（受抓地限制）；坡度重力部分不受摩擦限制（重力不是摩擦给的）
+            float pushAccel = MathF.Min(budget * grip, maxStaticAccel);
+            float driveAccel = pushAccel + slopeAlong * _cfg.Gravity * sinT;
+            if (driveAccel < 0f) driveAccel = 0f;
+
+            if (!overspeed && driveAccel > 1e-6f)
+            {
+                F3 before = planeVel;
+                planeVel += driveDir * (driveAccel * dt);
+
+                // ★ 上限：**不允许输入让合速度超过当前允许的最大速度**。
+                //   需求：「奔跑时水平面移动速度永远无法高于 7.6 m/s」。
+                //   做法是只限制"这一 tick 加进去的增量"，绝不回削已经合法的速度 ——
+                //   于是转向时速度不会越转越大，而"高速落地"的惯性也不受影响。
+                float limit = MathF.Max(capSpeed, speed);
+                float ns = planeVel.Length();
+                if (ns > limit && ns > 1e-5f)
+                    planeVel = planeVel / ns * limit;
+
+                _accInput += (planeVel - before) / dt;
+            }
+
+            // 打滑时额外消耗动能：滑动摩擦沿运动反方向，并且**随滑移速度增大**
+            //   drag = μk·g·cosθ·slip·(1 + v/vRef)
+            //
+            //   为什么带 (1 + v/vRef)：脚相对地面的滑移速度越大，耗散越强。
+            //   于是打滑地面上存在一个**稳定的终端速度**（推进 = 耗散），
+            //   而不是"慢慢加速到顶"或者"完全动不了"（后者会把玩家卡死在冰面上）。
+            //   冰面 μk=0.05 实测终端速度 ≈ 1.1 m/s —— 能挪，但挪不快。
+            if (slip > 1e-3f && speed > 1e-4f)
+            {
+                float dragAccel = kineticAccel * slip * (1f + speed / _cfg.SlipDragRefSpeed);
+                F3 before = planeVel;
+                float newSpeed = MathF.Max(0f, speed - dragAccel * dt);
+                planeVel = planeVel / speed * newSpeed;
+                _accFriction += (planeVel - before) / dt;
+                if (slip > 0.5f) _isSliding = true;
+            }
+
+            _brakeRamp = 0f;
+        }
+        else
+        {
+            // ── ③ 无输入：刹车（最大制动 → 衰减到滑动摩擦）────────────
+            //
+            // v0.5.3 需求（m02395 第 2 点）：「停止移动时先给一个速度反向的**最大制动**
+            // （比如刚刚的最大输入 10 m/s²），然后**逐渐降低至当前滑动摩擦**
+            // （6.86 m/s²），直到人物停下」。
+            //
+            // 所以刹车曲线是**从强到弱**：
+            //   a(t) = μk·g·cosθ + (a₀ − μk·g·cosθ)·(1 − min(1, t/T))
+            //   a₀   = min(μs·g·cosθ, GroundAccel)
+            //
+            // 为什么 a₀ 要跟 GroundAccel 挂钩：需求说的是"先给一个和最大输入相当的制动"，
+            // 而驱动加速度就是"腿能给出的最大推力"。同时它被静摩擦极限 μs·g·cosθ 夹住
+            // （鞋底抓不住的部分给不出来）—— 于是这条曲线既符合需求，也不会突破物理。
+            _brakeRamp += dt;
+            float ramp = _cfg.BrakeRampTime > 1e-4f
+                ? MathF.Min(1f, _brakeRamp / _cfg.BrakeRampTime)
+                : 1f;
+
+            float brakeMax = MathF.Min(maxStaticAccel, _cfg.GroundAccel);
+            float decel = kineticAccel + (brakeMax - kineticAccel) * (1f - ramp);
+            if (decel < kineticAccel) decel = kineticAccel;
+
+            if (speed > 1e-5f)
+            {
+                F3 before = planeVel;
+                float newSpeed = MathF.Max(0f, speed - decel * dt);
+                planeVel = planeVel / speed * newSpeed;
+                _accFriction += (planeVel - before) / dt;
+            }
+
+            //   ramp 未满 = 主动制动（静摩擦还在做负功）；ramp 满 = 已抱死成滑动摩擦
+            _isSliding = ramp >= 1f && speed > 1e-3f;
+            GripRatio = _isSliding ? 0f : 1f;
+            _brakeAccel = decel;
+        }
+
+        _vel = normalPart + planeVel;
+    }
+
+    /// <summary>
+    /// 补爬一步（贴着墙继续往上蹭，直到能进入扒墙姿态）。
+    ///
+    /// ★ v0.5.2：速度改用 <see cref="MovementConfig.ClimbSpeed"/>（与正常上爬同速）。
+    ///   原来用 <c>ClimbHangApproachDistance / ClimbHangApproachTime</c> = 2.9167 m/s，
+    ///   而正常上爬是 2.0 m/s —— 两段速度不一样，接缝处会看到一脚"加速蹿"。
+    ///   <see cref="MovementConfig.ClimbHangApproachTime"/> 因此降级为"最短时长"语义。
+    /// </summary>
+    private void StepClimbApproach(float dt)
+    {
+        float speed = _cfg.ClimbSpeed;
+        float stepUp = MathF.Min(_climbApproachRemaining, speed * dt);
+        _climbApproachRemaining -= stepUp;
+
+        _vel = _up * (stepUp / MathF.Max(1e-6f, dt));
+        _pos += _up * stepUp;
+
+        if (_climbApproachRemaining <= 1e-4f) EnterHangFromClimb();
+    }
+
+    /// <summary>无输入刹车已经持续多久（用于 <see cref="MovementConfig.BrakeRampTime"/> 的斜坡）。</summary>
+    private float _brakeRamp;
+
+    /// <summary>离地瞬间的水平速度。空中速度不允许超过它 + AirSteerSpeedAllowance。</summary>
+    private float _airEntrySpeed;
+
+    /// <summary>上一 tick 的状态（用于识别"刚进入空中"这类边沿）。</summary>
+    private MovementState _lastState;
+
+    /// <summary>本 tick 的等效静摩擦系数（材质覆盖时按比例缩放）。</summary>
+    private float _effectiveMuS = 1.9f;
+
+    /// <summary>
+    /// 本 tick 的制动加速度（m/s²）。只在**无输入**时有值：
+    /// 从"最大制动"（= min(μs·g·cosθ, GroundAccel)）线性衰减到滑动摩擦 μk·g·cosθ。
+    /// HUD / 调试渲染器用它显示"现在刹车有多狠"。
+    /// </summary>
+    private float _brakeAccel;
+
+    /// <summary>本 tick 的制动加速度（无输入刹车时从最大制动衰减到滑动摩擦）。</summary>
+    public float BrakeAccel => _brakeAccel;
+
+    /// <summary>本 tick 的等效滑动摩擦系数（材质覆盖后）。</summary>
+    public float EffectiveKineticMu { get; private set; }
+
+    /// <summary>
+    /// 本 tick 的**抓地力比值** = 最大静摩擦加速度 / 需要的驱动加速度，夹到 [0,1]。
+    ///
+    /// 1 = 完全抓地（正常路面）；&lt;1 = 打滑（脚在滑，推不动身体）；
+    /// 冰面 μk=0.05 时约 0.07 —— 这就是"冰面上按 W 原地打滑"的量化指标。
+    /// </summary>
+    public float GripRatio { get; private set; } = 1f;
+
+    /// <summary>当前是否在打滑：静摩擦顶到极限（原地打滑）或抱死刹车中。</summary>
+    public bool IsSlidingFriction => _isSliding;
+
+    private bool _isSliding;
+
     private void MoveWithCollision(float dt)
     {
         F3 delta = _vel * dt;
@@ -2472,6 +3401,7 @@ public sealed class ApexMovementCore
 
         F3 startPos = _pos;
         F3 startVel = _vel;
+        bool hitSteepFace = false;
 
         for (int iter = 0; iter < 4; iter++)
         {
@@ -2482,6 +3412,10 @@ public sealed class ApexMovementCore
                 _pos += delta;
                 break;
             }
+
+            // 撞到**陡面**（法线与 up 的夹角超过可行走阈值）时记一笔：
+            // 后面无论"被挡掉多少比例"，都要给上台阶一次机会（见下方 blocked 的判定）。
+            if (MathF.Abs(F3.Dot(normal, _up)) <= _cfg.WalkableNormalDot) hitSteepFace = true;
 
             _pos += delta * frac;
 
@@ -2504,8 +3438,15 @@ public sealed class ApexMovementCore
         {
             F3 intended = F3.ProjectOnPlane(startVel * dt, _up);
             F3 actual = F3.ProjectOnPlane(_pos - startPos, _up);
+
+            // 「被挡住」的两种口径，取并集：
+            //   ① 水平推进不足本 tick 应有位移的 25%（原来的判据）；
+            //   ② **撞到了陡面** —— 哪怕这一 tick 还蹭着滑了 80%，下一 tick 也会被完全挡住。
+            //      只靠 ① 会漏判：触墙那一 tick 的推进比例取决于"接触点落在 tick 内的哪一段"，
+            //      速度稍有变化（例如换了摩擦模型）就会从"放行上台阶"翻成"速度被投影清零"，
+            //      于是同一段上台阶逻辑时好时坏（v0.5 库仑摩擦落地时就撞上了这个脆性）。
             bool blocked = intended.LengthSq() > 1e-10f &&
-                           actual.LengthSq() < intended.LengthSq() * 0.25f;
+                           (hitSteepFace || actual.LengthSq() < intended.LengthSq() * 0.25f);
 
             if (blocked && TryStepUp(intended, startPos, hh))
             {
@@ -2551,33 +3492,63 @@ public sealed class ApexMovementCore
 
         // ② 水平推进（要走回"退后的距离" + 本 tick 的位移）
         //
-        // 位移取 `max(hLen, 0.75×半径)`：贴住台阶时速度已经被扫掠吃掉，
-        // 本 tick 的 hLen 只剩几毫米，照原样推进**根本走不上台阶**。
-        // 用一个与速度无关的最小推进量，才能把胶囊真正送到台阶面上。
-        float push = back + MathF.Max(hLen, _cfg.CapsuleRadius * 0.75f);
-        F3 forward = dir * push;
-        F3 moved;
-        if (_world.Sweep(lifted, _cfg.CapsuleRadius, hh, forward, out _, out float fH))
-        {
-            if (fH < 0.5f) return false;       // 水平仍被挡大半 → 这是墙，不是台阶
-            moved = lifted + forward * fH;
-        }
-        else
-        {
-            moved = lifted + forward;
-        }
-
-        // ③ 下落找可站立面
-        F3 down = -_up * (step + 0.10f);
-        if (!_world.Sweep(moved, _cfg.CapsuleRadius, hh, down, out F3 nD, out float fD))
-            return false;                       // 下方没东西 → 是往下跳，不该上台阶
-        if (F3.Dot(nD, _up) < _cfg.WalkableNormalDot) return false;
-
-        F3 landed = moved + down * fD;
+        // ★ v0.4.3 物理审计 P0-2：这里原来无条件推到 max(hLen, 0.75×半径)，
+        //   于是每上一级台阶**前向瞬移 0.3048 m**（冲刺一 tick 本该只走 0.1101 m，
+        //   多推 3.69 倍）—— 实测楼梯上水平速度在 6.604 / 5.925 / 0.988 / 0.000
+        //   之间跳，就是这个"多推"与随后的碰撞投影互相打架的结果。
+        //
+        //   为什么需要"多推"：胶囊底部是**半球**，贴住台阶立面时球面卡在棱的下侧，
+        //   而半球要搭到台阶面上，重心得越过棱一段距离（不是箱子那样 1 mm 就够）。
+        //   但"需要多少"取决于台阶高度与当前几何，**不该是一个与速度无关的常数**。
+        //
+        //   现在的做法：从**本 tick 应有的位移**开始，按 1/4 半径递增试，
+        //   取**第一个能站住**的推进量 ⇒ 绝大多数情况只推 hLen，只有真站不住时才多推。
         float startH = F3.Dot(fromPos, _up);
-        float landedH = F3.Dot(landed, _up);
-        if (landedH <= startH + 0.005f) return false;            // 没升高 → 不是台阶
-        if (landedH > startH + step + 0.05f) return false;       // 升太高 → 是攀爬，不是台阶
+        F3 down = -_up * (step + 0.10f);
+        F3 landed = F3.Zero;
+        F3 nD = F3.Zero;
+
+        float advanceMin = hLen;
+        float advanceMax = MathF.Max(hLen, _cfg.CapsuleRadius * 0.75f);
+        float advanceStep = MathF.Max(1e-3f, _cfg.CapsuleRadius * 0.25f);
+
+        bool found = false;
+        float advance = advanceMin;
+        while (true)
+        {
+            F3 forward = dir * (back + advance);
+            F3 moved;
+            if (_world.Sweep(lifted, _cfg.CapsuleRadius, hh, forward, out _, out float fH))
+            {
+                if (fH < 0.5f) return false;     // 水平仍被挡大半 → 这是墙，不是台阶
+                moved = lifted + forward * fH;
+            }
+            else
+            {
+                moved = lifted + forward;
+            }
+
+            // ③ 下落找可站立面
+            if (_world.Sweep(moved, _cfg.CapsuleRadius, hh, down, out F3 candN, out float fD))
+            {
+                F3 cand = moved + down * fD;
+                float candH = F3.Dot(cand, _up);
+                if (F3.Dot(candN, _up) >= _cfg.WalkableNormalDot &&
+                    candH > startH + 0.005f &&                 // 有升高 → 是台阶
+                    candH <= startH + step + 0.05f)            // 没升太高 → 不是攀爬
+                {
+                    landed = cand;
+                    nD = candN;
+                    found = true;
+                    break;
+                }
+            }
+
+            if (advance >= advanceMax) break;
+            advance = MathF.Min(advanceMax, advance + advanceStep);
+        }
+
+        if (!found) return false;
 
         _pos = landed + _up * 0.001f;
         _groundNormal = nD;
@@ -2591,7 +3562,7 @@ public sealed class ApexMovementCore
         // 只记录角度与时长，真正的速度旋转在 ApplyStepTilt 里做 —— 这样
         // `|v|` 严格不变，且倾角在 StepTiltTime 内线性衰减回 0。
         float a = _cfg.StepTiltFootRadius > 0f ? _cfg.StepTiltFootRadius : _cfg.CapsuleRadius;
-        float b = landedH - startH;
+        float b = F3.Dot(landed, _up) - startH;
         if (a > 1e-4f && b > 1e-4f)
         {
             _stepTiltAngle = MathF.Atan(b / a);
@@ -2641,6 +3612,24 @@ public sealed class ApexMovementCore
             return;
         }
 
+        // ── 反穿透：脚底若已陷进地面，先把胶囊抬回来 ──────────────────
+        //
+        //   v0.5 修复（用户 m01300 BUG 1）的安全网。历史事故：空中起身时脚底向下伸，
+        //   伸进地面 4 cm，而这里只会向下吸附 ⇒ 永久卡在地面以下，且站立检查误判被挡。
+        //   UpdateCrouch 已经从源头挡住"腿伸穿地"，这里再兜一层：任何原因造成的
+        //   穿透（台阶、坡面、贴墙位移、姿态插值）都在同一 tick 内被顶出来。
+        {
+            const float MaxPenetration = 0.10f;
+            F3 feetNow = _pos - _up * (_currentHeight * 0.5f);
+            if (_world!.Raycast(feetNow + _up * MaxPenetration, -_up, MaxPenetration + 0.02f,
+                                out F3 penHit, out F3 penNormal) &&
+                F3.Dot(penNormal, _up) >= _cfg.WalkableNormalDot)
+            {
+                float pen = F3.Dot(penHit - feetNow, _up);   // >0 ⇒ 地面在脚底之上
+                if (pen > 0.001f) _pos += _up * pen;
+            }
+        }
+
         F3 probe = -_up * _cfg.GroundSnapLength;
 
         bool grounded = _world!.Sweep(_pos, _cfg.CapsuleRadius, hh, probe,
@@ -2652,21 +3641,52 @@ public sealed class ApexMovementCore
             // ── 贴地吸附 ──────────────────────────────────────────
             // 只把 `_onGround` 置 true 是不够的：探测距离 0.20m 远大于单 tick 的
             // 向下位移，角色会停在离地几厘米处（实测 5.8cm）再也落不下去。
-            float snap = _cfg.GroundSnapLength * frac - 0.001f;
-            if (snap > 0f) _pos -= _up * snap;
-
+            //
+            // ★ v0.5 修复（需求 m01070）：「跳到落地时，即将落地瞬间被吸在地上、
+            //   突然大幅加速」。根因就在这里：0.20 m 的吸附距离是**一帧吃完**的，
+            //   于是落地前的最后 0.2 m 实际下落速度恒为 0.2/dt = 12 m/s，
+            //   与真实落速无关 —— 玩家看到的就是「到地面那一下突然猛加速」。
+            //
+            //   现在按物理量分两种情形：
+            //     · **已经在地面**（走下坡 / 下台阶）：照旧全量吸附，不掉帧、不弹跳；
+            //     · **空中 → 地面**（真正落地）：只允许吃掉「这一 tick 物理上本来
+            //       该走的距离」（|vy|·dt + 1 mm 皮肤），剩下的留到后续 tick。
+            //       落速越大触地越快，肉眼分辨不出差别，但不再有瞬移加速。
+            float gap = MathF.Max(0f, _cfg.GroundSnapLength * frac - 0.001f);
             bool wasAir = !_onGround;
+            if (wasAir && gap > 2e-3f)
+            {
+                // 空中 → 地面：**不做任何位移吸附**。
+                //
+                //   物理上这一 tick 该走多远，_vel 已经决定；探针剩下的 gap 是
+                //   「下一 tick 才该走」的距离，本 tick 把它吃掉就等于凭空多了
+                //   一段位移 —— 落地前最后一帧速度突变正是这么来的。
+                //   真正的触地由 MoveWithCollision 的扫掠自然停住（留在 1 mm 皮肤），
+                //   这里只负责判定「还差得多 ⇒ 继续下落」。
+                _onGround = false;
+                TrackAirborne();
+                return;
+            }
+            if (gap > 0f) _pos -= _up * gap;   // ≤2mm 的皮肤收尾
+
             _onGround = true;
             _groundNormal = normal;
+            _leftGroundByJump = false;
 
             if (_state == MovementState.Air || wasAir)
             {
                 // ── 落地 ──────────────────────────────────────────
-                float impact = -VerticalSpeed;
+                // 冲击强度 = 落地瞬间**沿地面法线**的接近速度（「砸多重」的物理量）。
+                float impact = MathF.Max(0f, -F3.Dot(_vel, normal));
 
-                // 落地保留水平速度，抹掉向下速度
-                float down = F3.Dot(_vel, _up);
-                if (down < 0f) _vel -= _up * down;
+                // ★ v0.5（需求 m00818 第 3 点）：落地按真实物理处理 ——
+                //   速度沿**地面法线**的分量清零（稳固地形不传导），切向分量**保留**。
+                //   例：10 m/s 垂直落在 30° 坡上 ⇒ 法向 −8.66 清零，
+                //   切向留下 5.0 m/s 顺着坡往下滑；玩家可以用输入抵消或加速。
+                //   原来是 `_vel -= _up * down`（只抹世界竖直分量），
+                //   在坡上会留下指向坡内的法向分量，下一 tick 又被投影掉，
+                //   等价于「坡面落地丢了一半速度」。
+                _vel = F3.ProjectOnPlane(_vel, normal);
 
                 if (_state == MovementState.Air)
                 {
@@ -2685,10 +3705,40 @@ public sealed class ApexMovementCore
             bool wasOnGround = _onGround;
             _onGround = false;
 
-            if (_state == MovementState.Ground)
+            // v0.4.2：这里原来只处理 Ground ⇒ 滑铲中滑出台沿时，状态会**多留一 tick 的 Slide**
+            // （本 tick 结束时已经是「离地 + Slide」），要等下一 tick 的 StepSlide 才被
+            // 离地保险丝打回 Air。
+            //
+            // ★ 那一 tick **不是**无害的：下一 tick 的 StepSlide 一进门就被保险丝
+            //   return 掉，于是**整整少积一次重力**（独立验证逐 tick 实测：
+            //   prev 在第 6 tick vy 恒 0.00000 / py 不动，new 为 vy −0.34634 = −g·dt、
+            //   py 少 0.005772 = g·dt²；之后每 tick 累加 g·dt²，
+            //   300 tick 的无跳滑出台沿轨迹累计到位置差 0.2275 m、速度差 5.5414 m/s）。
+            //
+            //   所以这不是"只改标签"的洁癖改动，而是补回一个真实漏掉的重力 tick。
+            //   现在离地当场就把 Slide 一并转成 Air，让「Slide 是纯地面状态」这条
+            //   不变量由状态机自己保证（StepSlide 开头的保险丝保留为第二道防线）。
+            //   注意：跳跃离地走的是 DoJump 已先置 Air 的路径，命中 _justJumped 早退，
+            //   因此「滑铲跳」那条轨迹完全不受影响（实测 420+485+40 tick 逐位相同）。
+            if (_state is MovementState.Ground or MovementState.Slide)
             {
+                if (_state == MovementState.Slide)
+                {
+                    // 与 StepSlide 的离地保险丝保持一致，别留下半截滑铲状态
+                    _slideTime = 0f;
+                    _slideBoostGranted = false;
+                }
+
                 _state = MovementState.Air;
                 _coyoteTimer = _cfg.CoyoteTime;
+                _airEntrySpeed = HorizontalSpeed;   // 空中速度增益的基准（见 StepAir）
+
+                // v0.5.3：离地立刻结束台阶倾斜。
+                //   倾斜会往速度里叠一个"向上"的分量，贴地时它被吸附吃掉、
+                //   无害；可一旦人在倾斜窗口内走出台沿，这个分量就会变成
+                //   一次莫名其妙的起跳（0.2 m 台阶 ≈ 1.95 m/s 的上抛）。
+                //   清掉它，倾斜就严格只在"还站在台阶上"时有效。
+                _stepTiltTimer = 0f;
 
                 // wiki：走下边缘（非跳跃离地）会**关闭**跳跃疲劳状态
                 if (wasOnGround) _jumpFatigueState = false;
@@ -2779,9 +3829,26 @@ public sealed class ApexMovementCore
 
         if (!onGaitState) return;
 
-        if (_gait.CadenceHz > 0.05f)
+        // 相位步频封顶（v0.4.2）：真实冲刺步频 3.4 Hz 直接拿来推相位，
+        // 画面上是"嗡嗡"的高频抖动。压到 BobCadenceMaxHz（3.0 Hz）后仍然
+        // 跟得上步点，但明显更稳。HUD 里的 CadenceHz 仍是真实值。
+        float camCadence = MathF.Min(_gait.CadenceHz, _cfg.Gait.BobCadenceMaxHz);
+        if (camCadence > 0.05f)
         {
-            _bobPhase += dt * _gait.CadenceHz * MathF.PI * 2f;
+            // ★ v0.4.3：这个相位**改口径**了 —— 现在是**步幅相位**（一个 2π = 一个
+            //   完整步幅 = 左右各一步），所以推进速率是步频的一半。
+            //
+            //   为什么必须改：v0.4.2 的相位是「步频相位」（一个 2π = 一步），而
+            //   波形里用 cos(φ/2) 去取"半步频"的横向摆动 —— 但 cos(φ/2) 的周期是
+            //   4π 而不是 2π，**不是 φ 的周期函数**。于是每次相位回绕
+            //   （φ: 2π⁻ → 0⁺）横向位移与侧倾都会从 −幅度 突跳到 +幅度，
+            //   频率 = 每步一次。这就是"缓慢向左倾斜一点点然后迅速回正"的根因，
+            //   与幅度参数完全无关，调 BobGaitScale 永远调不好。
+            //
+            //   改成步幅相位后，波形侧直接用 sin(φ)（横向，1 次/步幅）与
+            //   sin(2φ)（竖直，2 次/步幅 = 一步一次）—— 频率关系与物理一致，
+            //   且处处光滑，合起来就是屏幕平面上的 ∞（见 core/BobWaveform.cs）。
+            _bobPhase += dt * camCadence * 0.5f * MathF.PI * 2f;
             _bobPhase %= MathF.PI * 2f;
         }
     }

@@ -40,7 +40,25 @@ public partial class DeterminismTestRunner : Node
         (bool slipHangPass, string slipHangReport) = SlipHangTest.Run();
         GD.Print(slipHangReport);
 
-        bool all = detPass && featurePass && camPass && climbPass && gaitPass && slipHangPass;
+        GD.Print("=== v0.4.2 滑铲跳链 / 空中滑铲 / 抓墙方向 ===");
+        (bool slideJumpPass, string slideJumpReport) = SlideJumpTest.Run();
+        GD.Print(slideJumpReport);
+
+        GD.Print("=== v0.4.3 镜头摇晃波形（∞ / 无回绕跳变） ===");
+        (bool bobPass, string bobReport) = BobWaveformTest.Run();
+        GD.Print(bobReport);
+
+        GD.Print("=== v0.4.3 物理合规（重力 / 弹道 / 有限加速起跳 / 派生量） ===");
+        (bool physicsPass, string physicsReport) = PhysicsTest.Run();
+        GD.Print(physicsReport);
+
+        GD.Print("=== v0.5.2 摩擦模型（体重 / 静摩擦驱动 / 冰面 / 滑铲输入 / 空中控制） ===");
+        (bool frictionPass, string frictionReport) = FrictionTest.Run();
+        GD.Print(frictionReport);
+
+        bool all = detPass && featurePass && camPass && climbPass && gaitPass
+                   && slipHangPass && slideJumpPass && bobPass && physicsPass
+                   && frictionPass;
         GD.Print(all
             ? "=== APEX MOVEMENT SELFTEST PASS ==="
             : "=== APEX MOVEMENT SELFTEST FAIL ===");

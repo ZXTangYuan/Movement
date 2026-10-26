@@ -239,14 +239,19 @@ public sealed class AnalyticWorld : IMovementWorld, ISlipWorld, IFrictionWorld
         if (dir.Y < -1e-9f)
         {
             float t = (GroundY - origin.Y) / dir.Y;
-            if (t > 1e-6f && t < best) { best = t; found = true; hitNormal = F3.Up; }
+            // ★ v0.4.3 物理审计 P1-5：t == 0 必须算命中。
+            //   原来要求 t > 1e-6，于是"脚底恰好贴地"时向下射线返回**无命中**，
+            //   而 TryAttachWallGrab 的 WallGrabMinGroundClearance 守卫正是用
+            //   "脚下没地"来放行 ⇒ 站在原地会被墙吸走（实测 z 由 −5.2 拉到 −4.4264）。
+            //   射线起点就在表面上时，正确的语义是"距离 0 处有地"。
+            if (t > -1e-6f && t < best) { best = MathF.Max(0f, t); found = true; hitNormal = F3.Up; }
         }
 
         foreach ((F3 min, F3 max) in Boxes)
         {
-            if (RayAabb(origin, dir, min, max, out float t, out F3 n) && t > 1e-6f && t < best)
+            if (RayAabb(origin, dir, min, max, out float t, out F3 n) && t > -1e-6f && t < best)
             {
-                best = t; found = true; hitNormal = n;
+                best = MathF.Max(0f, t); found = true; hitNormal = n;
             }
         }
 

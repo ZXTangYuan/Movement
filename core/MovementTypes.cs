@@ -37,7 +37,7 @@ public enum MovementState
 ///
 /// **来源**：逆向在 `.rdata` 直接观测到 4 个时长字段
 /// `mantleDurationHigh / mantleDurationAbove / mantleDurationLevel / mantleDurationBelow`
-/// 与对应动画 `ACT_VM_MANTLE_HIGH / _ABOVE / _LEVEL / _BELOW`（见 docs/reverse-engineering-v0.2.md §5.5）。
+/// 与对应动画 `ACT_VM_MANTLE_HIGH / _ABOVE / _LEVEL / _BELOW`（见 docs/REVERSE-ENGINEERING.md §2.5.5）。
 /// 说明 Apex 按**台面相对角色的高度**分 4 档，每档一个时长。
 /// </summary>
 public enum MantleClass
@@ -68,7 +68,7 @@ public enum MantlePhase
 ///
 /// **来源**：逆向观测到 `landDistLow / landDistMedium / landDistHigh / hardFallDist`
 /// 与动画 `ACT_MP_JUMP_LAND_LOW / _MEDIUM / _HIGH / _SLAM`
-/// （见 docs/reverse-engineering-v0.2.md §4.2）。
+/// （见 docs/REVERSE-ENGINEERING.md §2.4.2）。
 /// </summary>
 public enum LandingTier
 {
@@ -265,7 +265,7 @@ public interface IFrictionWorld
 /// 与体积上的 <c>m_slipSpeed</c> / <c>m_slipAcceleration</c> / <c>m_defaultSlipDirection</c>；
 /// 玩家身上有 <c>m_touchingSlipTriggersCount</c> 及
 /// <c>m_touchingSlipTriggersSpeed[] / Acceleration[] / Direction[] / Origin[]</c>
-/// 与聚合值（见 docs/reverse-engineering-v0.2.md §5.10）。
+/// 与聚合值（见 docs/REVERSE-ENGINEERING.md §2.5.10）。
 /// 说明它是**世界里的体积**，不是"地面材质"。
 /// </summary>
 public struct SlipSample
