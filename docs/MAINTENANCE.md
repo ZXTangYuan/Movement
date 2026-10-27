@@ -64,3 +64,55 @@
 * 数值**不要四舍五入**（代码里是 `4.407f` 就写 4.407）。
 * 图放 `docs/images/`，引用用相对路径 `images/xxx.png`。
 * 每个"实测"数字后面尽量给出**断言编号或复现场景名**，否则三个月后无法复核。
+
+## 6. 发布到独立仓库（github.com/ZXTangYuan/Movement）
+
+本插件在宿主工程 `project-a` 里位于 `addons/apex_movement/`，
+独立仓库里则是**根目录**。两边的历史用 `git subtree` 保持同源。
+
+### 6.1 首次 / 一次性配置
+
+```bash
+cd <project-a 根目录>
+git remote add movement git@github.com:ZXTangYuan/Movement.git   # 已配好则跳过
+```
+
+> 认证走 SSH（`~/.ssh/id_ed25519_github` + `~/.ssh/config` 里 `Host github.com` 段）。
+> 用 `ssh -T git@github.com` 验证，应回 `Hi <用户名>! You've successfully authenticated`。
+
+### 6.2 每次发版后推送
+
+```bash
+cd <project-a 根目录>
+
+# ① 先把插件目录拆成独立历史（分支名固定，重复执行会更新该分支）
+git branch -D apex-movement-only 2>/dev/null
+git subtree split --prefix=addons/apex_movement -b apex-movement-only
+
+# ② 在远端历史之上合并（**不要 force push**，否则会丢掉独立仓库里的 LICENSE 等文件）
+rm -rf ../movement-push && git worktree add ../movement-push -b movement-sync movement/main
+cd ../movement-push
+git merge --allow-unrelated-histories --no-edit apex-movement-only
+git push movement movement-sync:main
+
+# ③ 清理
+cd - && git worktree remove --force ../movement-push && git branch -D movement-sync
+```
+
+**为什么不用 `git subtree push`**：它每次重新 split，产生的 SHA 与远端已有的
+merge commit 不同，会被判成 non-fast-forward。走上面这套「split → merge → push」
+可以保留远端的独立文件，也能持续累积历史。
+
+### 6.3 独立仓库里有什么
+
+```
+plugin.cfg  plugin.gd          插件入口
+core/  camera/  godot_bridge/  纯 C# 部分（不依赖宿主工程）
+player/  testbed/  tests/      节点层、测试场地、两套自检
+docs/                          本文档目录，自包含（images/ + selftest/）
+LICENSE                        独立仓库原有，**不要覆盖**
+```
+
+宿主工程特有的东西（`project.godot`、`.gitmodules`、其它 addon、`docs/design/`）
+**不**进独立仓库 —— 这正是用 subtree 而不是直接推整个仓库的原因。
+
