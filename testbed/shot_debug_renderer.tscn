@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://bp33rmsulq1ea"]
+
+[ext_resource type="Script" path="res://addons/apex_movement/testbed/shot_debug_renderer.gd" id="1_dbg"]
+
+[node name="ShotDebugRenderer" type="Node"]
+script = ExtResource("1_dbg")

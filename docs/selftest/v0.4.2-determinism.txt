@@ -1,0 +1,248 @@
+Godot Engine v4.7.stable.mono.official.5b4e0cb0f - https://godotengine.org
+
+=== 跨帧率确定性 ===
+=== 跨帧率确定性（同一输入脚本，不同 fps） ===
+  参考（60fps）tick 数 = 240
+  60fps vs 30fps: 一致（240 ticks，逐位相等），末位置 (0.0000, 0.9760, -21.1950)
+  60fps vs 90fps: 一致（239 ticks，逐位相等），末位置 (0.0000, 0.9760, -21.1950)
+  60fps vs 144fps: 一致（239 ticks，逐位相等），末位置 (0.0000, 0.9760, -21.1950)
+  60fps vs 240fps: 一致（240 ticks，逐位相等），末位置 (0.0000, 0.9760, -21.1950)
+  60fps vs 500fps: 一致（240 ticks，逐位相等），末位置 (0.0000, 0.9760, -21.1950)
+  轨迹有效性：末位置=(0.0000, 0.9760, -21.1950)  移动过=是
+  tick 数守恒：期望≈240  实际=240  OK
+
+=== 功能验证 ===
+  [PASS] 落地  （state=Ground onGround=True feetY=0.001）
+  [PASS] 行走速度（173.5 hu/s）  （实测 4.407，期望 4.407 ± 0.150）
+  [PASS] 冲刺速度（260 hu/s）  （实测 6.604，期望 6.604 ± 0.150）
+  [PASS] 收枪冲刺速度（299 hu/s）  （实测 7.595，期望 7.595 ± 0.150）
+  [PASS] 收枪冲刺标记 Sprinting
+  [PASS] 收枪行走速度（199 hu/s）  （实测 5.068，期望 5.055 ± 0.150）
+  [PASS] 收枪行走不标记 Sprinting
+  [PASS] 蹲行速度（80 hu/s）  （实测 2.032，期望 2.032 ± 0.150）
+  [PASS] 跳跃高度（56 hu）  （实测 1.487，期望 1.422 ± 0.100）
+  [PASS] 跳跃滞空时间（wiki 0.74s）  （实测 0.717，期望 0.740 ± 0.060）
+  [PASS] 蹲下身高（站立一半）  （实测 0.975，期望 0.975 ± 0.010）
+  [PASS] 地面蹲下脚底不下沉  （实测 0.001，期望 0.001 ± 0.030）
+  [PASS] 空中蹲下向中间收缩（脚底抬升）  （对照组 Δfeet=0.540，实验组 Δfeet=1.028，差=0.488（期望 ≈ +0.49））
+  [PASS] 空中无摩擦（水平速度不衰减）  （5 tick 后=6.6040，40 tick 后=6.6040（差 0.00E+000））
+  [PASS] Air strafe 加速  （转弯前=6.60 m/s，30 tick 后=7.43 m/s（+0.82））
+  [PASS] 滑铲触发（地面 200 hu/s）  （state=Slide，进入前 6.60 m/s（门槛 5.08））
+  [PASS] Slideboost 生效  （冲刺 7.59 → 滑铲 11.53 m/s（期望 +3.81 后夹到 10.16 上限））
+  [PASS] Slideboost 夹到 400 hu/s 上限（含收枪 ×1.15）  （实测 11.528，期望 11.684 ± 0.700）
+  [PASS] Slideboost 2s 冷却  （第二次滑铲：6.60 → 6.45 m/s（冷却中不应再 +3.81））
+  [PASS] Slidejump 时间窗（≥0.24s 允许保留速度）  （滑铲 8.72 → 跳后 8.57，slideHops=1）
+  [PASS] Deadslide（速度>350hu/s 且 <0.24s → 丢速度）  （滑铲 11.53 > 阈值 8.89，跳后掉到 6.60）
+  [PASS] 连续滑铲跳 ≥3 次  （slideHops=3，各次滑铲速度=9.35 / 5.26 / 9.35）
+  [PASS] 跳跃疲劳（连跳高度压到 30%）  （连跳高度 0.462m，期望≈0.427m（满高 1.422m））
+  [PASS] 跳跃疲劳 0.75s 后恢复满高  （实测 1.487，期望 1.422 ± 0.150）
+  [PASS] Bunnyhop 减速  （首跳 7.59 → bhop 6.60 m/s，bhops=1）
+  [PASS] 小障碍 0.8m：走近只撞停不自动翻 → W+Space 翻过去（Vault/Below）  （走到 z=-4.25 翻越=True/Below（障碍 z=-3.5..-3.0））
+  [PASS] 墙 2.5m：地面按 W 只撞停 → W+Space 抓墙 → 按住 W 爬到台面上  （撞停=True 抓到=True 站上台面时脚底=2.50（台面 2.5m））
+  [PASS] 高墙 6m：抓住后按住 W 每秒爬 ≈2m（ClimbSpeed 2.0，是状态不是瞬移）  （抓到=True Δy=2.00 m/s，state=Climb）
+  [PASS] 超高墙 7.5m：单段爬升不超过 ClimbAttachOffset（不是瞬移到顶）  （单段最大爬升=2.91m（ClimbAttachOffset=2.54m））
+  [PASS] 超高墙 7.5m：到顶脱手后能重新抓墙，分段爬到台面  （登顶=True，脚底=7.50（墙高 7.5m））
+  [PASS] 窗口翻越（W+Space 穿过开口）  （触发=True，穿过后 z=-4.21（墙 z=-3.5..-3.0））
+  [PASS] Fallstun 生效（15m 落下）  （stun=0.337s，期望≈0.338s（7.62m 起算，20.32m 满值 1s））
+  [PASS] 落地分档 Low/Medium/High/Hard  （3m→Medium，7m→High，12m→Hard，25m→Hard）
+  [PASS] 摩擦刹停  （3s 后 speed=0.0000）
+  [PASS] tick 计数  （37（期望 37））
+  [PASS] 卡顿保护（单帧最多 4 tick）  （消费 4 tick，丢弃 115）
+  [PASS] 重力与 wiki 双数据自洽  （由 56hu/0.74s 反解 g=20.7801，配置 20.7802）
+  [PASS] 滑铲坡度公式：15° 减速 / 30° 加速 / 临界角 tanθ=μ  （15°→-3.65 m/s²，30°→2.29 m/s²，临界角 24.23°（a=0.0000））
+  [PASS] 滑铲合加速度随坡角单调上升（越陡越不容易停）  （15°→-3.65 < 20°→-1.68 < 30°→2.29 m/s²）
+  [PASS] 滑铲默认 μ=0.45：减速度 ≈ μg（匀减速）  （实测 9.351，期望 9.351 ± 2.338）
+  [PASS] 冰面 μ=0.05：几乎不减速（减速度 ≈ 0.05g）  （实测 1.039，期望 1.039 ± 0.920）
+  [PASS] 粗糙地面 μ=0.90：减速明显更快（≈ 2 倍默认）  （μ=0.90 实测 18.35 m/s² vs 默认 9.35 m/s²）
+  [PASS] 三种材质下滑行距离排序：冰面 > 默认 > 粗糙  （0.4s 后速度：冰面 9.71 > 默认 6.11 > 粗糙 2.20 m/s）
+
+  合计 43 项断言，失败 0 项
+
+=== 相机子系统 ===
+  [PASS] 默认 FOV  （实测 90.000，期望 90.000 ± 0.500）
+  [PASS] 冲刺抬 FOV  （fov=93.00（基础 90 + 冲刺 3））
+  [PASS] 滑铲不抬 FOV（与下蹲一致）  （fov=90.00（基础 90；v0.4 已移除滑铲加宽））
+  [PASS] FOV 上限夹紧  （fov=120.00，上限 120）
+  [PASS] 玩家可调 FOV（cl_fovScale 语义）  （调 +4° 后 fov=94.00）
+  [PASS] FOV 调节夹到上限  （FovBase=120.0，上限 120）
+  [PASS] tan 空间插值与线性不同但收敛一致  （中途差 1.599°，终值差 0.0000°（目标 115°））
+  [PASS] 落地视角踢（瞬间低头）  （pitchOffset=-0.0182 rad）
+  [PASS] 视角踢自动回正  （峰值 0.0182 → 1.5s 后 -0.0000 rad）
+  [PASS] v0.3 落地砸镜头收敛到 5° 以内  （Hard=2.49° / Low=0.47°（上限 5.00°））
+  [PASS] v0.3 落地砸镜头未被压没（Hard 仍在 1°–5°）  （Hard=2.49°（要求 1.00°–5.00°））
+  [PASS] v0.3 MaxKickAngle 只作保险丝（未成为工作点）  （Hard 峰值 0.0435 < 上限 0.0750 × 0.9）
+  [PASS] 落地踢按档位单调增强  （Low=0.0082 < Medium=0.0180 < High=0.0294 < Hard=0.0435）
+  [PASS] 极端冲量下弹簧不发散  （最大偏移 0.0750 ≤ 上限 0.0750 rad）
+  [PASS] 滑铲不侧倾（与下蹲一致）  （5m/s→0.00°，10m/s→0.00°（v0.4 已移除滑铲侧倾））
+  [PASS] 冲刺侧倾（sprinttiltMaxRoll）  （roll=1.50°）
+  [PASS] 走路摇晃（静止无 / 移动有）  （静止 bob=0.00E+000，移动最大 bob=0.0038 m）
+  [PASS] 摇晃幅度落在 v0.4.2 舒适档（垂直峰到峰 ≤1.5 cm）  （峰到峰 = 2×3.79mm = 7.59mm（上限 15mm））
+  [PASS] 空中无走路摇晃  （空中最大 bob=0.00000 m）
+  [PASS] 翻越相机脱开→回贴  （翻越中 blend=0.997，结束后 blend=0.000）
+  [PASS] 翻越相机高度上限（traversal_mantle_cap_camera_height）  （相机被压低 0.650 m（眼位 1.85 > 上限 1.2））
+  [PASS] 蹲下时相机前倾  （前移 0.0300 m）
+  [PASS] FOV 收敛与帧率无关（2s 后）  （60fps=92.9999°，144fps=92.9999°，240fps=92.9997°）
+  [PASS] 冲刺眼位前移（sprintViewOffset）  （前移 0.0599 m）
+
+  合计 24 项断言，失败 0 项
+
+=== v0.4 贴墙（攀爬 / 扒墙） / 三档障碍 / tick / 探针 ===
+  [PASS] ① 地面贴墙按住 W 120 tick → 不攀爬不扒墙（只撞停）  （state=Ground onGround=True z=-1.594）
+  [PASS] ① 撞墙后停在墙面外侧（没穿模、也没被推远）  （z=-1.594（墙面 -2.00，期望 ≈ -1.594 = 半径 0.4064））
+  [PASS] ② 地面贴墙 + W + Space 起跳 → 抓住墙（Climb / WallHang）  （state=Climb feet=0.58（起跳前 0.00））
+  [PASS] ② 抓住后脚底已经离地上升  （feet=0.58（起跳前 0.00））
+  [PASS] ③ 空中上升 + 面向墙 + 不按 W → 不抓（上升不打断）  （state=Air vy=1.23（8 tick 内是否抓=False））
+  [PASS] ④ 空中下落 + 贴墙 + 不按任何键 → 自动抓住（扒墙默认化）  （state=WallHang（不按 W 时应停在 WallHang 而不是 Climb））
+  [PASS] ⑤ 离墙超过 reach → 挂不上  （state=Air z=0.50）
+  [PASS] ⑥ 按住 W 抓住 → 状态 = Climb（正在上爬）  （state=Climb）
+  [PASS] ⑦ 按住 W 上爬 ≈ ClimbSpeed（2 m/s）  （0.5s 爬升 1.00m（期望 ≈ 1.00））
+  [PASS] ⑧ 途中松开 W → 进入扒墙状态（WallHang）  （state=WallHang）
+  [PASS] ⑨ 挂住时对外速度恒为 0（HUD 上 speed=0 / vy=0）  （state=WallHang speed=0.0000 vy=0.0000）
+  [PASS] ⑨ 挂住时贴到墙面（离墙 ≈ 半径 + 0.02）  （z=-1.574（期望 ≈ -1.574））
+  [PASS] ⑩ 按 D 沿墙横移 ≈ WallHangShimmySpeed（0.8 m/s）  （0.5s 横移 0.40m（期望 ≈ +0.40））
+  [PASS] ⑩ 按 A 沿墙反向横移  （0.5s 横移 -0.40m（期望 ≈ -0.40））
+  [PASS] ⑪ 按 W+D → 向右上斜移（同时有 +X 与 +Y）  （Δx=0.40 Δy=1.00（期望两者都为正））
+  [PASS] ⑫ 挂住后完全无输入 → 一小段时间后自动掉落  （掉落用时 70 tick（1.17s，配置 WallHangIdleFallTime=1.20s））
+  [PASS] ⑬ 按 S → 立刻取消扒墙，回 Air  （state=Air）
+  [PASS] ⑬ 松手后垂直下落（12 tick 掉 >0.3m，且有向下速度）  （Δy=-0.45m vy=-4.16）
+  [PASS] ⑭ 下落过程中按 W → 重新扒住墙  （松手前 state=WallHang feet=4.02，现在 state=Climb）
+  [PASS] ⑮ 挂住时按 Space → 蹬墙跳（离墙 + 向上）  （state=Air vz=2.69 vy=6.15）
+  [PASS] ⑯ 视角偏离墙面法线超过 WallHangMaxViewAngle → 松手  （yaw 0.00→1.57，state=Air）
+  [PASS] ⑰ 半米高的坎不会被挂住（该直接迈过去）  （state=Ground（automantle_disable_hang：脚底 +0.6m 打不到墙））
+  [PASS] ⑰b 2.5m 墙（跳不上、必须攀爬）能挂住（v0.3 的 1.0…2.03m 死区已修）  （state=Climb，抓到=True）
+  [PASS] ⑱ 墙消失后自动脱手（不卡在挂墙状态）  （state=Air）
+  [PASS] ⑲ 0.20m 台阶：不触发任何动作（无 Vault / Climb / WallHang / Mantle）  （是否触发=False）
+  [PASS] ⑲ 0.20m 台阶：平滑踩上去（脚底到达 0.20m）  （峰值脚底 0.201m（台阶 0.20m））
+  [PASS] ⑲ 0.20m 台阶：上台阶瞬间速度出现斜向上分量（只改方向）  （最大向上速度 1.94 m/s（tan θ = b/a = 0.20/0.41 → θ≈26°））
+  [PASS] ⑲ 0.20m 台阶：速度**大小**基本不变（无衰减）  （上台阶前 4.41 m/s，途中 |v|∈[4.41, 4.41]）
+  [PASS] ⑳ 0.80m 小障碍：只按 W 不会自动翻越（撞住）  （state=Ground z=-3.59（障碍前脸 z=-4.0））
+  [PASS] ⑳ 0.80m 小障碍：W + Space → 进入 Vault 状态  （state=Ground）
+  [PASS] ⑳ 0.80m 小障碍：翻越后落到障碍上方（脚底 ≈ 0.80m）  （峰值脚底 0.800m（障碍 0.80m））
+  [PASS] ⑳ 0.80m 小障碍：翻越结束保留大部分水平速度（VaultSpeedRetention）  （翻完水平速度 3.75 m/s（保留率 0.85，行走 4.41））
+  [PASS] ㉑ 6m 高墙：只按 W 不会翻越（撞停）  （z=-1.59（墙面 -2.0））
+  [PASS] ㉑ 6m 高墙：W + Space → 走抓墙（Climb / WallHang），不是 Vault  （state=Climb）
+  [PASS] ㉒ 显式 TryTraversal：1.6m 台面 → 进入 Mantle / Level 档  （触发=True state=Mantle class=Level z=-3.59）
+  [PASS] ㉓ 显式 TryTraversal：7.5m > MantleMaxHeight(6.93) → 拒绝  （触发=False z=-3.59（已贴到台面 -3.59；上限 6.93m））
+  [PASS] ㉔ 档位边界：OverwalkableHeight = 0.25（台阶档上限）  （OverwalkableHeight=0.2500）
+  [PASS] ㉔ 档位边界：VaultMaxHeight = 1.00（小障碍档上限）  （VaultMaxHeight=1.0000）
+  [PASS] ㉔ 档位顺序自洽：台阶 < 小障碍 < 墙  （0.25 < 1.00 < 2.03）
+  [PASS] ㉕ tick 基准固定 60/s（配置）  （TickRate=60 MaxCatchUpTicks=4）
+  [PASS] ㉕ FixedDelta = 1/60  （FixedDelta=0.016667）
+  [PASS] ㉕ 30fps 下每帧消费 2 个 tick（60 tick/s 不漂移）  （1 帧 1/30s 消费 2 tick（期望 2））
+  [PASS] ㉕ 144fps 下 10 秒整好 600 个 tick（无累积漂移）  （1440 帧 × 1/144s → 599 tick（期望 599–600））
+  [PASS] ㉕ 卡顿时最多补 4 tick（其余丢弃，有计数）  （消费 4 tick，丢弃 55（上限 4））
+  [PASS] ㉖ 挂墙期间墙探针抽样间隔 2（60 tick ≈ 30 次）  （实测 30 次（期望 30 ± 2））
+  [PASS] ㉖ 附着探针每 tick 都跑（间隔 1）  （实测 40 次（期望 40））
+  [PASS] ㉗ 自动翻越探测已移除（地面 60 tick 探针数 = 0）  （实测 0 次（v0.3 是 30 次；v0.4 改为只在 W+Space 时显式触发））
+
+  合计 47 项断言，失败 0 项
+
+=== v0.4 步态模型 / 镜头抖动推导 ===
+=== v0.4 步态模型 / 镜头抖动推导 ===
+  [PASS] ① 腿长 = 0.53 × 身高（人体测量学）  （H=1.95 → 腿长 1.0335 m（0.53×H = 1.0335））
+  [PASS] ② Froude 偏好步速 ≈ 1.43 m/s（人类实测舒适步速 1.4）  （vPref = 0.45×√(9.81×腿长) = 1.433 m/s（人类 1.4 ± 0.15））
+  [PASS] ③ 走→跑切换阈值 ≈ 2.7 m/s（人类实测 2.0–2.7）  （vRunStart = 1.9 × vPref = 2.722 m/s）
+  [PASS] ④ 个子越高偏好步速越快（腿长 ∝ 摆腿周期）  （1.60m → 1.298 m/s；2.20m → 1.522 m/s）
+  [PASS] ⑤ 低于 MinSpeed(0.35 m/s) 完全不晃（全零，非 Running）  （speed=0.20 → cadence=0.00 vAmp=0.00mm）
+  [PASS] ⑥ 偏好步速处是「走」：步频 ≈1.9 Hz、腾空比 = 0、不是 Running  （cadence=1.90 Hz flight=0.000 running=False）
+  [PASS] ⑦ 步幅 = 速度 / 步频（由步频反推，不是独立拍的）  （v=4.407 / f=2.986 = 1.476 m（模型 1.476））
+  [PASS] ⑧ 行走速度 4.407 m/s 已是「跑」：步频 2.8–3.2 Hz、步幅 1.3–1.7 m、有腾空  （cadence=2.99 Hz stride=1.48 m flight=0.165）
+  [PASS] ⑨ 冲刺 6.604 m/s：步频 3.1–3.5 Hz、腾空比 ≈0.38（MaxFlightFraction）  （cadence=3.29 Hz flight=0.380（上限 0.38））
+  [PASS] ⑩ 步频随速度单调递增，且冲刺时 < 4 Hz（人类跑步上限约 3.5）  （1.0→1.53 / 4.41→2.99 / 6.60→3.29 Hz（单调=True））
+  [PASS] ⑪ 腾空比：走恒 0 → 跑随速度增长 → 冲刺到 MaxFlightFraction  （1.43m/s=0.000 4.41m/s=0.165 6.60m/s=0.380）
+  [PASS] ⑫ 垂直峰到峰：慢走 ∈[4,8]mm / 冲刺 ∈[8,15]mm / 跑 > 走×1.5  （1.43m/s=5.46mm（区间 4–8）/ 6.60m/s=12.40mm（区间 8–15）/ 跑÷走 = 2.27×）
+  [PASS] ⑬ 冲刺时垂直峰到峰 ≤ 1.5 cm（v0.4.2 收紧后的舒适档上限）  （峰到峰 = 2×6.20mm = 12.40mm（上限 15mm））
+  [PASS] ⑭ 冲刺点头：峰到峰 ≤0.30°（v0.4.2 舒适档）且半幅 ≥0.05°（存在、未被压没）  （冲刺点头半幅 0.124°（峰到峰 0.248°，上限 0.30°））
+  [PASS] ⑭b MaxPitchDeg 只作保险丝（未成为工作点，否则舒适档达标是被 clamp 掩盖的）  （半幅 0.124° < MaxPitchDeg 0.45° × 0.9 = 0.405°）
+  [PASS] ⑮ 侧向摆动：稳态 ∈[LateralMin 2.5mm, LateralMax 10mm]、起步带按 ramp 软起、全程 ≤LateralMax  （稳态区间 [3.01mm, 8.02mm]；起步带 0.5/0.8/1.0 m/s = 0.19/1.25/2.12mm（均 < LateralMin 2.5mm））
+  [PASS] ⑯ 走路侧倾半幅 ≤ MaxRollDeg(0.30°) 且未被 clamp 掩盖  （冲刺侧倾半幅 0.128°（上限 0.30°，保险丝未触发））
+  [PASS] ⑰ 同一速度下个子越高步频越低（1.60 > 1.95 > 2.20 m）  （1.60m=3.022 / 1.95m=2.986 / 2.20m=2.962 Hz）
+  [PASS] ⑱ 蹲行：步频 ×0.65、垂直幅度 ×0.80（重心低、步幅小）  （cadence 2.321→1.509（期望 1.509）、vAmp 3.61→2.89mm）
+  [PASS] ⑲ 兜底：身高 ≤0.1m 退回 1.95m、runSpeed ≤0 退回 1.5×speed（不出 NaN/Inf）  （height=0 → cadence=2.929 Hz；height=-1/runSpeed=-5 → cadence=2.929 Hz）
+  [PASS] ⑳ 模型常数都在文献 / 手感区间内（腿长比 0.53、Froude 0.45、腾空 ≤0.5、步频封顶 1.5–4 Hz …）  （legRatio=0.53 froude=0.45 runStart=1.9 flight≤0.38 pitch≤0.45° roll≤0.30° vScale=0.24 ramp=0.90 bobCap=3.0Hz lat=[2.5, 10.0]mm pitchPerCm=0.20 rollPerCm=0.16）
+  [PASS] ㉑ 快照里的 Gait 来自模型求值（静止为 0，走动后 cadence/vAmp > 0）  （静止 cadence=0；走动 v=4.41 → cadence=2.99 Hz (模型 2.99) vAmp=2.2mm）
+  [PASS] ㉒ 步态相位每秒推进 = min(步频, BobCadenceMaxHz) 周期数（相位在 tick 内推进，帧率无关）  （1 秒推进 3.000 个周期，min(3.29, 3.00) = 3.00 Hz（差 0.000；真实步频已超上限 ⇒ 封顶生效））
+  [PASS] ㉓ 滑铲时步态按蹲行速度算（步频 ≤2.0 Hz，不跟着 10 m/s 滑行速度飙）  （state=Slide speed=8.60 → cadence=1.52 Hz）
+  [PASS] ㉔ 收枪冲刺端到端：相机实测峰到峰 = 模型推导（≤5% 偏差），且垂直 ≤1.5cm / 点头 ≤0.30°  （speed=7.59 m/s → 垂直 12.05mm（模型 12.17）、侧向 17.65mm（模型 17.70）、点头 0.241°（模型 0.243）、侧倾 0.282°、相位 3.00 Hz（camCadence 3.00））
+  [PASS] ㉕ BobGaitScale 线性生效：0× 关掉摇晃、0.5× = 1× 的一半（默认 1.0，范围 0–2）  （k=0 → 0.000mm；k=1 → 12.36mm；k=0.5 → 6.18mm（比值 0.500））
+
+  合计 26 项断言，失败 0 项
+
+=== v0.4 打滑 / 扒墙（滑区与握力） ===
+  [PASS] 站进打滑球 → 状态变 Slip  （state=Slip）
+  [PASS] 打滑把水平速度拉到 slipSpeed（8 m/s）  （speed=8.00（目标 8.00））
+  [PASS] 打滑方向 = 体积方向（+X）  （vel=(8.00, 0.00)）
+  [PASS] HUD 快照标记 Slipping + 方向  （Slipping=True dir=(1.00)）
+  [PASS] 贴地滑道上仍然踩在地上（ground=True，不悬空）  （OnGround=True feet=0.001）
+  [PASS] 没配方向的打滑球：从球心往外推（+X）  （state=Slip vx=6.00）
+  [PASS] 站进小打滑球 → 进过 Slip 并滑出去  （曾 Slip=True，现在 state=Ground）
+  [PASS] 方向限制计时器会自行衰减到 0  （IsSlipAirRestricted=False remaining=0.000）
+  [PASS] 圆锥：方向已在圆锥内 → 原样返回  （结果=(1.000, 0.000)）
+  [PASS] 圆锥：90° 外的方向被压到 35° 边缘  （与轴夹角=35.00°（期望 35°），结果=(0.819, -0.574)）
+  [PASS] 圆锥：完全反向 → 退回轴本身  （结果=(1.000, 0.000)）
+  [PASS] 圆锥半角配置在合理区间（SlipAirRestrictConeDeg）  （SlipAirRestrictConeDeg=35（cos=0.819））
+  [PASS] 滑区里蹲下 → 优先转成 Slide（不被环境抢状态）  （state=Slide speed=8.76）
+  [PASS] 滑区里按跳 → 立刻离地（Air，且有向上速度）  （state=Air vy=7.69）
+  [PASS] 打滑探针抽样间隔为 2（60Hz → 30Hz）  （SlipProbeInterval=2）
+  [PASS] 60 个 tick 只采样约 30 次打滑体积  （实测 30 次（期望 30 ± 2））
+  [PASS] 空中下落贴墙 + 不按任何键 → 自动挂住（扒墙默认化）  （state=WallHang）
+  [PASS] 空中**上升**贴墙 + 不按 W → 不挂（上升不打断）  （state=Air vy=1.92）
+  [PASS] 空中贴墙 + 按住蹲 → 进入 WallHang  （state=WallHang）
+  [PASS] 挂住时速度恒为 0（speed=0.00 / vy=0.00）  （speed=0.00 vy=0.00）
+  [PASS] 挂住时贴到墙面上（离墙面 ≈ 半径 + 皮肤）  （z=-1.574（期望 ≈ -1.574））
+  [PASS] HUD 快照标记 WallHanging + 握力满  （WallHanging=True grip=0.96）
+  [PASS] 松开所有键 → 仍然挂在墙上（不会因为松键就掉）  （state=WallHang（无输入 WallHangIdleFallTime=1.2s 后掉落））
+  [PASS] 挂住时按 W → 沿墙上爬（ClimbSpeed 2.0 m/s），状态切 Climb  （Δy=2.00（期望 ≈ 2.00，state=Climb））
+  [PASS] 挂住时按 D → 沿墙横移（ACT_MP_WALLHANG_RIGHT）  （Δx=0.80（期望 ≈ 0.80，state=WallHang））
+  [PASS] 挂住不动 → 缓慢下滑（sound_wallHangSlip）  （Δy=0.22（期望 ≈ 0.22））
+  [PASS] 下滑期间握力 < 1  （grip=0.12）
+  [PASS] 握力耗尽 → 自动脱手  （state=Ground）
+  [PASS] 按 W 上爬会回补握力（m_wallDangleClimbProgressFloor）  （grip 0.12 → 0.32）
+  [PASS] 挂超过 WallHangMaxTime(6s) → 自动脱手  （state=Climb（上限 6.0s））
+  [PASS] 挂住时按跳 → 蹬墙跳（离墙 + 向上）  （state=Air vz=2.69 vy=6.15）
+  [PASS] 挂住时把视角甩开 90° → 松手  （state=Air）
+  [PASS] 矮墙（能自动翻越）不会被挂住（automantle_disable_hang）  （state=Ground（墙顶 1.5 < AutoMantleMaxHeight 2.03））
+  [PASS] 离墙超过 WallHangReach → 挂不上  （state=Air）
+  [PASS] 扒墙探针每 tick 都跑（ClimbProbeInterval=1，不额外抽样）  （实测 40 次（期望 40））
+
+  合计 35 项断言，失败 0 项
+
+=== v0.4.2 滑铲跳链 / 空中滑铲 / 抓墙方向 ===
+=== v0.4.2 滑铲跳链 / 空中滑铲 / 抓墙方向 ===
+[PASS] 1. 滑铲中滑出台沿：空中任何一个 tick 都不是 Slide（含离地那一 tick）
+[PASS] 1b. 这条用例确实测的是「滑铲中滑出台沿」（离地那一刻状态 = Slide）
+[PASS] 1c. 滑出台沿后确实进入 Air 并落回地面
+[PASS] 2. 空中按住蹲 + 高速下坠 → 不会转成滑铲（Air Slide 已删除）
+[PASS] 2b. 该场景确实构成「高速下坠」（下坠 >200hu/s = 5.08m/s），不是条件没满足而空过
+[PASS] 3. 空中按住蹲 → 仍是蹲姿体积（需求「空中依旧保持蹲下的体积」）
+[PASS] 4. 滑铲 → 跳 → 离地时是 Air（不是 Slide）
+[PASS] 4b. 落地那一 tick 就已经回到滑铲（不是先站一帧再起滑）
+[PASS] 4c. 整段滞空期间胶囊一直是蹲姿体积、且从不进入 Slide
+[PASS] 5. 连续滑铲跳 8 次全部成立（每一跳都「进滑铲 → 起跳 → 落地再进滑铲」）
+[PASS] 5b. 滑铲跳链中空中从不出现 Slide 状态
+[PASS] 5c. 每一跳的起跳初速都不超过设计 JumpVelocity（没有凭空叠加竖直能量）
+[PASS] 5d. 每次跳跃的**胶囊中心**峰值不高于第 0 跳（不再越跳越高）
+[PASS] 5e. 空中弹道不变量成立：只要在空中，竖直速度每 tick 只减 g·dt
+[PASS] 5f. 滑铲跳链不会掉速到滑不动（落地即滑铲，链条可持续）
+      · 胶囊中心峰值：2.327 0.951 0.951 0.951 0.951 0.951 0.951 0.951（判据已用这一列）
+      · 脚底峰值（含空中收腿，仅展示）：1.839 0.463 0.463 0.463 0.463 0.463 0.463 0.463
+      · 起跳初速（vy）：7.6887 4.2113 4.2113 4.2113 4.2113 4.2113 4.2113 4.2113
+[PASS] 6. 按住蹲+冲刺并每 tick 狂按跳 20 秒：空中从不出现 Slide
+[PASS] 6b. 同上：空中竖直速度从不**增加**（没有虚拟平台 / 空中二次起跳）
+[PASS] 6c. 同上：胶囊中心峰值始终不超过单次跳跃高度
+[PASS] 7. 空中穿过打滑体积 + 按住蹲 → 也不会变成滑铲（Slip→Slide 的空中入口已封）
+[PASS] 7b. 该场景确实让玩家在空中进入了 Slip（条件满足，不是空过）
+[PASS] 8. 倒退坠下高台不会被台子侧面吸住（不进入 Climb / WallHang）
+[PASS] 8b. 倒退坠台后确实掉到地面（不是被挂在半空）
+[PASS] 9a. 面朝墙且不按 W：沿法线 approach > 0（朝墙/静止）就抓、approach < 0（背离墙）就不抓
+      · 方向门分界：approach -0.125 不抓 → 0.000 抓（配置 WallGrabMaxRecedeSpeed=0.050，理论分界 = 0）
+[PASS] 9b. 高速背离墙（3.25 … 6 m/s）一律不抓
+[PASS] 9c. 扫描覆盖「旧核会误抓」的低速背离判别带（0.25–2.94 m/s）且全部不抓
+[PASS] 10. 面朝墙 + 纯垂直下落（不按任何键）→ 仍然自动扒住（扒墙默认化不回退）
+[PASS] 11. 面朝墙 + 水平速度朝向墙 → 抓住
+[PASS] 12. 面朝墙 + 背离墙但按着 W（明确前进意图）→ 抓住
+[PASS] 13. 面朝墙 + 按 S 下坠（意图就是「往下掉」）→ 不抓
+[PASS] 14. 抓墙方向门槛配置存在且非负
+合计 30 项断言，失败 0 项
+
+=== APEX MOVEMENT SELFTEST PASS ===
